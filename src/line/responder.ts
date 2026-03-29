@@ -156,6 +156,6 @@ export async function extractMemories(
     }
   } catch (err) {
     // 自動記憶の失敗は致命的ではないのでログだけ
-    logger.debug('自動記憶抽出スキップ', { err: err instanceof Error ? err.message : String(err) });
+    logger.warn('自動記憶抽出失敗', { err: err instanceof Error ? err.message : String(err) });
   }
 }

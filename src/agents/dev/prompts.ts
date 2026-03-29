@@ -127,14 +127,15 @@ export const PM_DECOMPOSE_PROMPT = `あなたはPM（プロジェクトマネー
 export const ENGINEER_PROMPT = `あなたはエンジニアです。
 PMから割り当てられたサブタスク1つを実装してください。
 
-## 出力形式（JSON）
-{
-  "file": {
-    "path": "src/xxx/yyy.ts",
-    "content": "ファイル内容全体",
-    "action": "create" or "update"
-  }
-}
+## 出力形式
+JSONのみを出力してください。説明文・マークダウン・コメントは一切含めないでください。
+
+{"file":{"path":"src/xxx/yyy.ts","content":"ファイル内容全体","action":"create"}}
+
+## 重要
+- 必ず上記のJSON形式"だけ"を出力すること
+- JSON以外のテキストを含めると処理が失敗します
+- content の中にはファイル全体の内容を含めること
 
 ## ルール
 - 1ファイルだけを出力（複数ファイル不可）

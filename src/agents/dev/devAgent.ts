@@ -35,6 +35,7 @@ import {
 const MAX_BUILD_RETRIES = 5;
 const MAX_HEARING_ROUNDS = 3;
 const MAX_REVIEW_RETRIES = 3;
+const MAX_ENGINEER_PARSE_RETRIES = 3;
 
 interface Subtask {
   index: number;
@@ -86,6 +87,9 @@ export class DevAgent implements Agent {
           break;
         case 'defining':
           await this.handleDefining(conv, text);
+          break;
+        case 'stuck':
+          await this.handleStuck(conv, text);
           break;
         case 'approved':
         case 'implementing':
@@ -238,46 +242,79 @@ export class DevAgent implements Agent {
   // Phase 3: 実装（チーム体制）
   // ========================================
 
-  private async runImplementation(conv: DevConversation): Promise<void> {
+  private async runImplementation(conv: DevConversation, resumeFrom?: { branchName: string; subtasks: Subtask[]; completedFiles: Array<{ path: string; content: string }>; startIndex: number }): Promise<void> {
     updateConversationStatus(conv.id, 'implementing');
     dbLog('info', 'dev-agent', '[チーム] 実装フェーズ開始', { convId: conv.id });
 
     const updatedConv = getConversation(conv.id);
     if (!updatedConv) return;
 
-    let branchName = '';
+    let branchName = resumeFrom?.branchName || '';
+    let subtasks: Subtask[] = resumeFrom?.subtasks || [];
+    const allFiles: FileToWrite[] = [];
+    const completedFiles: Array<{ path: string; content: string }> = resumeFrom?.completedFiles || [];
+    let startIndex = resumeFrom?.startIndex || 0;
 
     try {
-      // git安全策
-      branchName = await prepareGitBranch();
-      dbLog('info', 'dev-agent', `[チーム] ブランチ作成: ${branchName}`, { convId: conv.id });
-      await sendLineMessage(conv.user_id, `ブランチ: ${branchName}`);
+      // 新規開始の場合
+      if (!resumeFrom) {
+        branchName = await prepareGitBranch();
+        dbLog('info', 'dev-agent', `[チーム] ブランチ作成: ${branchName}`, { convId: conv.id });
+        await sendLineMessage(conv.user_id, `ブランチ: ${branchName}`);
 
-      // Step 1: PM がサブタスクに分解
-      const subtasks = await this.pmDecompose(updatedConv);
-      dbLog('info', 'dev-agent', `[PM] サブタスク分解完了: ${subtasks.length}件`, { convId: conv.id });
-      await sendLineMessage(conv.user_id, `📋 ${subtasks.length}個のサブタスクに分解しました:\n${subtasks.map(s => `${s.index}. ${s.path}`).join('\n')}`);
-
-      // Step 2: サブタスクごとに エンジニア→レビュアー のループ
-      const allFiles: FileToWrite[] = [];
-      const completedFiles: Array<{ path: string; content: string }> = [];
-
-      for (const subtask of subtasks) {
-        dbLog('info', 'dev-agent', `[エンジニア] サブタスク ${subtask.index}/${subtasks.length}: ${subtask.path}`, { convId: conv.id });
-
-        const file = await this.engineerAndReview(conv, subtask, subtasks, completedFiles);
-        allFiles.push(file);
-        completedFiles.push({ path: file.path, content: file.content });
-
-        // ファイル書き出し
-        await writeFiles([file]);
-
-        await sendLineMessage(conv.user_id, `📦 ${subtask.index}/${subtasks.length} 完了: ${subtask.path}`);
+        subtasks = await this.pmDecompose(updatedConv);
+        dbLog('info', 'dev-agent', `[PM] サブタスク分解完了: ${subtasks.length}件`, { convId: conv.id });
+        await sendLineMessage(conv.user_id, `📋 ${subtasks.length}個のサブタスクに分解しました:\n${subtasks.map(s => `${s.index}. ${s.path}`).join('\n')}`);
+      } else {
+        await sendLineMessage(conv.user_id, `サブタスク ${startIndex + 1} から再開します...`);
       }
 
-      setGeneratedFiles(conv.id, allFiles.map(f => f.path));
+      // サブタスクごとに エンジニア→レビュアー のループ
+      for (let i = startIndex; i < subtasks.length; i++) {
+        const subtask = subtasks[i];
+        dbLog('info', 'dev-agent', `[エンジニア] サブタスク ${subtask.index}/${subtasks.length}: ${subtask.path}`, { convId: conv.id });
 
-      // Step 3: ビルド → デプロイ
+        try {
+          const file = await this.engineerAndReview(conv, subtask, subtasks, completedFiles);
+          allFiles.push(file);
+          completedFiles.push({ path: file.path, content: file.content });
+
+          await writeFiles([file]);
+
+          // サブタスクごとにcommitして成果を保護
+          await commitAndStay(branchName, `feat: ${subtask.path} - ${subtask.description.slice(0, 50)}`);
+
+          await sendLineMessage(conv.user_id, `📦 ${subtask.index}/${subtasks.length} 完了: ${subtask.path}`);
+        } catch (subtaskErr) {
+          const errMsg = subtaskErr instanceof Error ? subtaskErr.message : String(subtaskErr);
+          dbLog('error', 'dev-agent', `[チーム] サブタスク失敗: ${errMsg.slice(0, 200)}`, { convId: conv.id, subtaskIndex: subtask.index });
+
+          // stuckモードに移行（ロールバックしない）
+          this.stuckContext = {
+            branchName,
+            subtasks,
+            completedFiles: [...completedFiles],
+            failedSubtaskIndex: i,
+            errorMessage: errMsg,
+          };
+          updateConversationStatus(conv.id, 'stuck');
+          await sendLineMessage(conv.user_id,
+            `⚠️ サブタスク ${subtask.index}/${subtasks.length} (${subtask.path}) で問題が発生しました:\n` +
+            `${errMsg.slice(0, 300)}\n\n` +
+            `完了済み: ${completedFiles.length}/${subtasks.length} ファイル（コミット済み）\n\n` +
+            `選択肢:\n` +
+            `・「リトライ」→ このサブタスクを再試行\n` +
+            `・「スキップ」→ このサブタスクを飛ばして次へ\n` +
+            `・指示を送る → 追加情報を元に再試行\n` +
+            `・「中止」→ 開発を中止（完了分はブランチに残ります）`
+          );
+          return; // stuckで一旦停止
+        }
+      }
+
+      setGeneratedFiles(conv.id, [...completedFiles.map(f => f.path), ...allFiles.map(f => f.path)]);
+
+      // ビルド → デプロイ
       updateConversationStatus(conv.id, 'testing');
       dbLog('info', 'dev-agent', '[チーム] 全サブタスク完了 → ビルド開始', { convId: conv.id });
       await sendLineMessage(conv.user_id, `全${subtasks.length}ファイル完了。ビルド開始...`);
@@ -287,16 +324,80 @@ export class DevAgent implements Agent {
       const errMsg = err instanceof Error ? err.message : String(err);
       dbLog('error', 'dev-agent', `[チーム] 実装失敗: ${errMsg.slice(0, 200)}`, { convId: conv.id });
 
-      if (branchName) {
+      // 完了済みサブタスクがある場合はブランチを残す
+      if (completedFiles.length > 0 && branchName) {
+        await commitAndStay(branchName, `partial: ${completedFiles.length} files completed before error`);
+        await sendLineMessage(conv.user_id,
+          `実装中にエラーが発生しました:\n${errMsg.slice(0, 400)}\n\n` +
+          `完了済み ${completedFiles.length} ファイルはブランチ ${branchName} に保存されています。`
+        );
+      } else if (branchName) {
         await rollbackGit(branchName);
         await sendLineMessage(conv.user_id, 'コードをロールバックしました。');
       }
 
       updateConversationStatus(conv.id, 'failed');
-      await sendLineMessage(conv.user_id,
-        `実装に失敗しました:\n${errMsg.slice(0, 500)}\n\n新しい依頼を送ってリトライできます。`
-      );
+      await sendLineMessage(conv.user_id, '新しい依頼を送ってリトライできます。');
     }
+  }
+
+  // stuckモードのコンテキスト保持
+  private stuckContext: {
+    branchName: string;
+    subtasks: Subtask[];
+    completedFiles: Array<{ path: string; content: string }>;
+    failedSubtaskIndex: number;
+    errorMessage: string;
+  } | null = null;
+
+  private async handleStuck(conv: DevConversation, userReply: string): Promise<void> {
+    const ctx = this.stuckContext;
+    if (!ctx) {
+      await sendLineMessage(conv.user_id, 'スタック情報が失われました。新しい開発依頼を送ってください。');
+      updateConversationStatus(conv.id, 'failed');
+      return;
+    }
+
+    const normalizedReply = userReply.trim().toLowerCase();
+
+    if (/^(中止|キャンセル|やめ)/.test(normalizedReply)) {
+      dbLog('info', 'dev-agent', '[stuck] ユーザーが中止を選択', { convId: conv.id });
+      this.stuckContext = null;
+      updateConversationStatus(conv.id, 'failed');
+      await sendLineMessage(conv.user_id,
+        `開発を中止しました。完了済みファイルはブランチ ${ctx.branchName} に残っています。`
+      );
+      return;
+    }
+
+    if (/^スキップ/.test(normalizedReply)) {
+      dbLog('info', 'dev-agent', `[stuck] サブタスク ${ctx.failedSubtaskIndex + 1} をスキップ`, { convId: conv.id });
+      this.stuckContext = null;
+      await this.runImplementation(conv, {
+        branchName: ctx.branchName,
+        subtasks: ctx.subtasks,
+        completedFiles: ctx.completedFiles,
+        startIndex: ctx.failedSubtaskIndex + 1,
+      });
+      return;
+    }
+
+    // リトライ or 追加指示付きリトライ
+    dbLog('info', 'dev-agent', `[stuck] リトライ（指示: ${userReply.slice(0, 50)}）`, { convId: conv.id });
+    const failedSubtask = ctx.subtasks[ctx.failedSubtaskIndex];
+
+    // ユーザーの追加指示をサブタスクのdescriptionに反映
+    if (!/^リトライ$/.test(normalizedReply)) {
+      failedSubtask.description += `\n\n追加指示: ${userReply}`;
+    }
+
+    this.stuckContext = null;
+    await this.runImplementation(conv, {
+      branchName: ctx.branchName,
+      subtasks: ctx.subtasks,
+      completedFiles: ctx.completedFiles,
+      startIndex: ctx.failedSubtaskIndex,
+    });
   }
 
   // ========================================
@@ -338,21 +439,47 @@ export class DevAgent implements Agent {
     let reviewFeedback = '';
 
     while (reviewRetry <= MAX_REVIEW_RETRIES) {
-      // --- エンジニア ---
+      // --- エンジニア（パースリトライ付き） ---
       const engineerContext = this.buildEngineerContext(conv, subtask, allSubtasks, completedFiles, reviewFeedback);
 
-      dbLog('info', 'dev-agent', `[エンジニア] コード生成 (試行 ${reviewRetry + 1})`, { convId: conv.id, path: subtask.path });
+      let engineerParsed: any = null;
+      let lastRawOutput = '';
 
-      const { text: engineerOutput } = await callClaude({
-        system: DEV_SYSTEM_PROMPT + '\n\n' + ENGINEER_PROMPT,
-        messages: [{ role: 'user', content: engineerContext }],
-        model: 'default',
-        maxTokens: 8192,
-      });
+      for (let parseRetry = 0; parseRetry < MAX_ENGINEER_PARSE_RETRIES; parseRetry++) {
+        dbLog('info', 'dev-agent', `[エンジニア] コード生成 (レビュー試行 ${reviewRetry + 1}, パース試行 ${parseRetry + 1})`, { convId: conv.id, path: subtask.path });
 
-      const engineerParsed = safeParseJson(engineerOutput);
+        const messages: Array<{ role: 'user' | 'assistant'; content: string }> = [
+          { role: 'user', content: engineerContext },
+        ];
+
+        // パースリトライ時は前回の出力をフィードバック
+        if (parseRetry > 0 && lastRawOutput) {
+          messages.push(
+            { role: 'assistant', content: lastRawOutput },
+            { role: 'user', content: `上記の出力はJSON形式として不正です。以下の形式で正確にJSON"のみ"を出力してください。説明文やマークダウンは不要です。\n\n{"file": {"path": "${subtask.path}", "content": "ファイル内容全体", "action": "${subtask.action}"}}` },
+          );
+        }
+
+        const { text: engineerOutput } = await callClaude({
+          system: DEV_SYSTEM_PROMPT + '\n\n' + ENGINEER_PROMPT,
+          messages,
+          model: 'default',
+          maxTokens: 16384,
+        });
+
+        lastRawOutput = engineerOutput;
+        engineerParsed = safeParseJson(engineerOutput);
+
+        if (engineerParsed?.file?.path && engineerParsed?.file?.content) {
+          break; // パース成功
+        }
+
+        dbLog('warn', 'dev-agent', `[エンジニア] パース失敗 (${parseRetry + 1}/${MAX_ENGINEER_PARSE_RETRIES}): ${engineerOutput.slice(0, 100)}`, { convId: conv.id });
+        engineerParsed = null;
+      }
+
       if (!engineerParsed || !engineerParsed.file || !engineerParsed.file.path || !engineerParsed.file.content) {
-        throw new Error(`エンジニア: ${subtask.path} のパースに失敗`);
+        throw new Error(`エンジニア: ${subtask.path} のパースに${MAX_ENGINEER_PARSE_RETRIES}回失敗\n最後の出力: ${lastRawOutput.slice(0, 200)}`);
       }
 
       lastCode = {
@@ -549,13 +676,31 @@ export class DevAgent implements Agent {
 
 function safeParseJson(text: string): any {
   let jsonStr = text.trim();
-  const jsonMatch = jsonStr.match(/```(?:json)?\s*\n?([\s\S]*?)```/);
-  if (jsonMatch) {
-    jsonStr = jsonMatch[1].trim();
+
+  // 1. マークダウンコードブロック除去
+  const codeBlockMatch = jsonStr.match(/```(?:json)?\s*\n?([\s\S]*?)```/);
+  if (codeBlockMatch) {
+    jsonStr = codeBlockMatch[1].trim();
   }
-  try {
-    return JSON.parse(jsonStr);
-  } catch {
-    return null;
+
+  // 2. そのまま試す
+  try { return JSON.parse(jsonStr); } catch { /* continue */ }
+
+  // 3. 最初の { ... } または [ ... ] ブロックを抽出
+  const objMatch = jsonStr.match(/(\{[\s\S]*\})/);
+  if (objMatch) {
+    try { return JSON.parse(objMatch[1]); } catch { /* continue */ }
   }
+  const arrMatch = jsonStr.match(/(\[[\s\S]*\])/);
+  if (arrMatch) {
+    try { return JSON.parse(arrMatch[1]); } catch { /* continue */ }
+  }
+
+  // 4. 末尾のカンマ除去して再試行
+  if (objMatch) {
+    const cleaned = objMatch[1].replace(/,\s*([\]}])/g, '$1');
+    try { return JSON.parse(cleaned); } catch { /* continue */ }
+  }
+
+  return null;
 }

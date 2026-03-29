@@ -73,6 +73,13 @@ async function handleMessage(userId: string, text: string): Promise<void> {
     return;
   }
 
+  // ★ stuck フェーズ: ユーザーの指示を直接devへ
+  if (activeDevConv && activeDevConv.status === 'stuck') {
+    dbLog('info', 'webhook', `ルーティング → stuck応答: "${text.slice(0, 20)}"`);
+    await devAgent.handleMessage(userId, text);
+    return;
+  }
+
   // ★ defining フェーズ: OKか修正指示のみdevへ
   if (activeDevConv && activeDevConv.status === 'defining') {
     if (isDefiningResponse(text)) {
@@ -161,7 +168,7 @@ async function handleMessage(userId: string, text: string): Promise<void> {
       await sendLineMessage(userId, response);
       saveMessage(userId, 'assistant', response);
       // バックグラウンドで自動記憶抽出（応答を遅延させない）
-      extractMemories(userId, text, response).catch(() => {});
+      extractMemories(userId, text, response).catch(err => logger.warn('extractMemories失敗', { err: err instanceof Error ? err.message : String(err) }));
     }
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);

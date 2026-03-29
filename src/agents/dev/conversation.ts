@@ -7,6 +7,7 @@ export type ConversationStatus =
   | 'approved'
   | 'implementing'
   | 'testing'
+  | 'stuck'
   | 'deployed'
   | 'failed';
 

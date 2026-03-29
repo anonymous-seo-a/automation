@@ -32,6 +32,7 @@ function layout(title: string, content: string): string {
   .badge-failed { background: #3d1418; color: #f85149; }
   .badge-hearing { background: #2d1b4e; color: #bc8cff; }
   .badge-defining { background: #2d1b4e; color: #bc8cff; }
+  .badge-stuck { background: #4a3000; color: #ffb347; }
   .badge-deployed { background: #1b4332; color: #2dd4bf; }
   .badge-implementing { background: #0c2d48; color: #58a6ff; }
   .log-info { color: #58a6ff; }
@@ -74,6 +75,7 @@ function badge(status: string): string {
     : status === 'pending' ? 'pending'
     : status === 'running' || status === 'implementing' ? 'running'
     : status === 'failed' ? 'failed'
+    : status === 'stuck' ? 'stuck'
     : status === 'hearing' || status === 'defining' ? 'hearing'
     : 'pending';
   return `<span class="badge badge-${cls}">${status}</span>`;
