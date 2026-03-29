@@ -88,5 +88,18 @@ export function runMigrations(): void {
     );
 
     CREATE INDEX IF NOT EXISTS idx_message_history_user ON message_history(user_id, created_at);
+
+    CREATE TABLE IF NOT EXISTS memories (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id TEXT NOT NULL,
+      type TEXT NOT NULL,
+      key TEXT NOT NULL,
+      content TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_memories_user ON memories(user_id, type);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_key ON memories(user_id, type, key);
   `);
 }

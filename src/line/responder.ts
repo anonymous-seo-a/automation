@@ -2,6 +2,7 @@ import { callClaude } from '../claude/client';
 import { getStatusReport } from '../queue/taskQueue';
 import { getBudgetReport } from '../claude/budgetTracker';
 import { getRecentHistory } from './messageHistory';
+import { buildMemoryContext } from './memory';
 import { config } from '../config';
 import { logger } from '../utils/logger';
 
@@ -79,8 +80,14 @@ export async function generateResponse(
     // 現在のメッセージを追加
     messages.push({ role: 'user', content: userMessage });
 
+    // 記憶コンテキストを追加
+    let memoryBlock = '';
+    if (userId) {
+      memoryBlock = buildMemoryContext(userId);
+    }
+
     const { text } = await callClaude({
-      system: RESPONDER_PROMPT + contextBlock,
+      system: RESPONDER_PROMPT + memoryBlock + contextBlock,
       messages,
       model: 'default',
     });
@@ -97,4 +104,49 @@ export async function gatherSystemContext(): Promise<string> {
   const status = getStatusReport();
   const budget = await getBudgetReport();
   return `${status}\n\n${budget}`;
+}
+
+/** 会話から自動で記憶すべき情報を抽出 */
+export async function extractMemories(
+  userId: string,
+  userMessage: string,
+  assistantResponse: string
+): Promise<void> {
+  try {
+    const { saveMemory } = await import('./memory');
+
+    const { text } = await callClaude({
+      system: `あなたは会話から重要な情報を抽出するアナリストです。
+以下のJSON形式で、記憶すべき情報があれば返してください。なければ空配列を返してください。
+
+[{"type": "profile"|"project", "key": "簡潔なキー名", "content": "記憶する内容"}]
+
+## 抽出基準
+- profile: ユーザーの名前、職業、好み、スキル、関心事など個人情報
+- project: 進行中のプロジェクト、目標、締切、技術的な決定事項
+
+## ルール
+- 雑談や挨拶からは抽出しない
+- 既に明らかな事実（「はい」「了解」等）は記憶しない
+- JSON配列のみ返す。説明文は不要`,
+      messages: [
+        { role: 'user', content: `ユーザー: ${userMessage}\nアシスタント: ${assistantResponse}` },
+      ],
+      model: 'default',
+      maxTokens: 500,
+    });
+
+    const memories = JSON.parse(text) as Array<{ type: 'profile' | 'project'; key: string; content: string }>;
+    if (!Array.isArray(memories)) return;
+
+    for (const mem of memories) {
+      if (mem.type && mem.key && mem.content) {
+        saveMemory(userId, mem.type, mem.key, mem.content);
+        logger.info('自動記憶保存', { userId, type: mem.type, key: mem.key });
+      }
+    }
+  } catch (err) {
+    // 自動記憶の失敗は致命的ではないのでログだけ
+    logger.debug('自動記憶抽出スキップ', { err: err instanceof Error ? err.message : String(err) });
+  }
 }
