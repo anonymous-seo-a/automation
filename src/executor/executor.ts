@@ -1,7 +1,8 @@
 import { getNextTask, updateTaskStatus, TaskRow } from '../queue/taskQueue';
-import { callClaude } from '../claude/client';
 import { runInSandbox } from './sandbox';
 import { sendLineMessage } from '../line/sender';
+import { getAgent } from '../agents/router';
+import { Task } from '../agents/baseAgent';
 import { config } from '../config';
 import { logger, dbLog } from '../utils/logger';
 
@@ -38,60 +39,53 @@ async function executeTask(task: TaskRow): Promise<void> {
   updateTaskStatus(task.id, 'running');
   dbLog('info', 'executor', `タスク開始: ${task.description}`, { taskId: task.id });
 
-  const useOpus = task.requires_opus === 1 || task.retry_count >= 2;
-  const model = useOpus ? 'opus' as const : 'default' as const;
-
   try {
-    const errorContext = task.error_log && task.error_log !== '[]'
-      ? `\n\n## 前回のエラー（リトライ ${task.retry_count}回目）\n${task.error_log}\n上記のエラーを踏まえ、アプローチを変更してください。`
-      : '';
+    // エージェントをルーター経由で取得
+    const agent = getAgent(task.agent);
+    if (!agent) {
+      await handleFailure(task, `未知のエージェント: ${task.agent}`);
+      return;
+    }
 
-    const systemPrompt = `あなたは自律実行エージェントです。
-タスクを実行し、必要であれば実行可能なコードを生成してください。
+    // TaskRow → Agent用Task に変換
+    const agentTask: Task = {
+      id: task.id,
+      agent: task.agent,
+      description: task.description,
+      priority: task.priority,
+      retry_count: task.retry_count,
+      requires_opus: task.requires_opus,
+      input_data: task.input_data || undefined,
+      error_log: task.error_log || undefined,
+    };
 
-## コード生成ルール
-- コードを生成する場合は以下の形式で囲んでください:
-\`\`\`executable:node
-// ここにNode.jsコード
-\`\`\`
-- python や bash も使用可能です: \`\`\`executable:python または \`\`\`executable:bash
-- コードが不要な場合（分析・提案・レポート等）はテキストで結果を返してください
+    logger.info(`エージェント実行: ${agent.name}`, { taskId: task.id });
+    const result = await agent.execute(agentTask);
 
-## 現在のタスク
-${task.description}
+    if (!result.success) {
+      await handleFailure(task, result.output);
+      return;
+    }
 
-${task.input_data ? `## 追加情報\n${task.input_data}` : ''}${errorContext}`;
+    // エージェントがコード実行を要求した場合
+    if (result.needsExecution && result.code && result.language) {
+      const execResult = await runInSandbox(result.code, result.language);
 
-    const { text } = await callClaude({
-      system: systemPrompt,
-      messages: [{ role: 'user', content: `実行してください: ${task.description}` }],
-      model,
-      taskId: task.id,
-    });
-
-    // コードブロックの抽出
-    const codeMatch = text.match(/```executable:(node|python|bash)\n([\s\S]*?)```/);
-
-    if (codeMatch) {
-      const lang = codeMatch[1] as 'node' | 'python' | 'bash';
-      const code = codeMatch[2];
-      const result = await runInSandbox(code, lang);
-
-      if (result.success) {
+      if (execResult.success) {
         updateTaskStatus(task.id, 'success', {
           output: JSON.stringify({
-            aiResponse: text.slice(0, 3000),
-            execResult: result.stdout,
+            aiResponse: result.output.slice(0, 3000),
+            execResult: execResult.stdout,
           }),
         });
-        await notifySuccess(task, text, result.stdout);
+        await notifySuccess(task, result.output, execResult.stdout);
       } else {
-        await handleFailure(task, `実行エラー: ${result.stderr}`);
+        await handleFailure(task, `実行エラー: ${execResult.stderr}`);
       }
     } else {
       // コード不要のタスク（分析・レポート等）
-      updateTaskStatus(task.id, 'success', { output: text });
-      await notifySuccess(task, text);
+      updateTaskStatus(task.id, 'success', { output: result.output });
+      await notifySuccess(task, result.output);
     }
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
