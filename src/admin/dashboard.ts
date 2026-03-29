@@ -103,6 +103,25 @@ adminRouter.get('/dev/:id', (req: Request, res: Response) => {
   res.send(renderPage('dev-detail', { conv }));
 });
 
+// 開発会話の強制キャンセル
+adminRouter.post('/dev/:id/cancel', (req: Request, res: Response) => {
+  const db = getDB();
+  const conv = db.prepare('SELECT * FROM dev_conversations WHERE id = ?').get(req.params.id) as Record<string, unknown> | undefined;
+  if (!conv) {
+    res.status(404).send('会話が見つかりません');
+    return;
+  }
+  db.prepare("UPDATE dev_conversations SET status = 'failed', updated_at = datetime('now') WHERE id = ?").run(req.params.id);
+  res.redirect('/admin');
+});
+
+// 全開発会話の強制リセット
+adminRouter.post('/dev/reset-all', (_req: Request, res: Response) => {
+  const db = getDB();
+  db.prepare("UPDATE dev_conversations SET status = 'failed', updated_at = datetime('now') WHERE status NOT IN ('deployed', 'failed')").run();
+  res.redirect('/admin');
+});
+
 // ナレッジ一覧
 adminRouter.get('/knowledge', (_req: Request, res: Response) => {
   const db = getDB();

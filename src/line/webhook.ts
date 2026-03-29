@@ -53,85 +53,99 @@ async function handleMessage(userId: string, text: string): Promise<void> {
     return;
   }
 
-  // --- 開発エージェントのルーティング ---
+  // 強制リセット（どの状態でも効く）
+  if (/^(リセット|reset)$/i.test(text)) {
+    const conv = getActiveConversation(userId);
+    if (conv) {
+      cancelConversation(conv.id);
+      dbLog('info', 'webhook', `強制リセット: ${conv.id}`);
+      await sendLineMessage(userId, '開発会話をリセットしました。');
+    } else {
+      await sendLineMessage(userId, 'リセット対象はありません。');
+    }
+    return;
+  }
+
+  // --- 開発エージェント判定 ---
   const activeDevConv = getActiveConversation(userId);
 
   if (activeDevConv) {
-    // 古い会話を自動期限切れ（30分）
-    const updatedAt = new Date(activeDevConv.updated_at + 'Z').getTime();
-    const now = Date.now();
-    const staleMinutes = Math.floor((now - updatedAt) / 60000);
+    const createdAt = new Date(activeDevConv.created_at + 'Z').getTime();
+    const staleMinutes = Math.floor((Date.now() - createdAt) / 60000);
 
-    if (staleMinutes > 30 && (activeDevConv.status === 'hearing' || activeDevConv.status === 'defining')) {
-      dbLog('info', 'webhook', `開発会話を自動期限切れ: ${activeDevConv.id} (${staleMinutes}分経過)`, { convId: activeDevConv.id });
+    // 10分経過した hearing/defining は自動期限切れ
+    if (staleMinutes > 10 && (activeDevConv.status === 'hearing' || activeDevConv.status === 'defining')) {
       cancelConversation(activeDevConv.id);
-      // フォールスルーして通常応答
+      dbLog('info', 'webhook', `自動期限切れ: ${activeDevConv.id} (${staleMinutes}分経過)`);
+      // フォールスルー → 通常応答
     } else {
-      dbLog('info', 'webhook', `開発会話あり: status=${activeDevConv.status}, topic=${activeDevConv.topic.slice(0, 30)}`, { convId: activeDevConv.id });
+      dbLog('info', 'webhook', `開発会話あり: status=${activeDevConv.status}, topic=${activeDevConv.topic.slice(0, 30)}`);
 
-      // キャンセル（自然な表現に対応）
-      if (/開発(キャンセル|中止|やめ)|やめて|やめる|キャンセル|別の話/.test(text)) {
-        dbLog('info', 'webhook', 'ルーティング → 開発キャンセル');
-        await devAgent.handleMessage(userId, text);
+      // キャンセル意図の検出
+      if (isCancelIntent(text)) {
+        cancelConversation(activeDevConv.id);
+        dbLog('info', 'webhook', '開発キャンセル');
+        await sendLineMessage(userId, '開発を中止しました。');
         return;
       }
 
-      switch (activeDevConv.status) {
-        case 'hearing':
-          // ヒアリング中: 基本的に開発への返答として扱う
+      // フェーズ別ルーティング
+      if (activeDevConv.status === 'hearing') {
+        // 明らかに無関係なメッセージは通常応答にフォールスルー
+        if (isOffTopic(text)) {
+          dbLog('info', 'webhook', 'hearing中だが無関係 → 通常応答');
+          // フォールスルー
+        } else {
           dbLog('info', 'webhook', 'ルーティング → 開発ヒアリング');
           await devAgent.handleMessage(userId, text);
           return;
-
-        case 'defining':
-          // 要件定義中: OKか修正指示のみ開発へルーティング
-          if (isDefiningResponse(text)) {
-            dbLog('info', 'webhook', `ルーティング → 開発要件定義 (${text.slice(0, 20)})`);
-            await devAgent.handleMessage(userId, text);
-            return;
-          }
-          dbLog('info', 'webhook', 'defining中だが開発と無関係 → 通常応答');
-          // フォールスルー
-          break;
-
-        case 'approved':
-        case 'implementing':
-        case 'testing':
-          // 実装中: 通常応答にフォールスルー（ブロックしない）
-          dbLog('info', 'webhook', `実装中(${activeDevConv.status}) → 通常応答にフォールスルー`);
-          break;
+        }
+      } else if (activeDevConv.status === 'defining') {
+        if (isDefiningResponse(text)) {
+          dbLog('info', 'webhook', 'ルーティング → 開発要件定義');
+          await devAgent.handleMessage(userId, text);
+          return;
+        }
+        dbLog('info', 'webhook', 'defining中だが無関係 → 通常応答');
+        // フォールスルー
+      } else {
+        // implementing/testing/approved → 通常応答にフォールスルー
+        dbLog('info', 'webhook', `${activeDevConv.status}中 → 通常応答`);
       }
     }
   }
 
-  // 新規開発依頼の検出
-  const isDevRequest = /開発して|実装して|母艦に.*追加して|新しいエージェントを作って|機能を追加して/.test(text);
-  if (isDevRequest) {
+  // 新規開発依頼
+  if (/開発して|実装して|母艦に.*追加して|新しいエージェントを作って|機能を追加して/.test(text)) {
     dbLog('info', 'webhook', 'ルーティング → 新規開発依頼');
     await devAgent.handleMessage(userId, text);
     return;
   }
 
-  // --- 通常の会話処理 ---
+  // --- 通常の会話 ---
   saveMessage(userId, 'user', text);
   dbLog('info', 'webhook', 'ルーティング → 通常応答');
 
   try {
     const systemContext = await gatherSystemContext();
 
+    // 開発進行中ならその情報も渡す
+    const devInfo = activeDevConv
+      ? `\n## 進行中の開発\nトピック: ${activeDevConv.topic}\n状態: ${activeDevConv.status}`
+      : '';
+
     const response = await generateResponse(text, {
       systemStatus: systemContext,
+      rawContext: devInfo || undefined,
     }, userId);
 
-    // DEV_AGENT トリガー
     if (response.trim() === 'DEV_AGENT') {
-      dbLog('info', 'webhook', 'Claude判定 → DEV_AGENT トリガー');
+      dbLog('info', 'webhook', 'Claude判定 → DEV_AGENT');
       await devAgent.handleMessage(userId, text);
       return;
     }
 
-    // タスク実行が必要か判定
-    const needsTask = await shouldCreateTask(text, response);
+    const needsTask = await shouldCreateTask(text);
 
     if (needsTask) {
       dbLog('info', 'webhook', 'タスクキューへ投入');
@@ -180,20 +194,27 @@ async function handleMessage(userId: string, text: string): Promise<void> {
   }
 }
 
-/** defining フェーズへのメッセージかどうかを判定（Claude不使用） */
-function isDefiningResponse(text: string): boolean {
-  // 承認パターン
-  if (/^(ok|OK|Ok|おk|はい|いいよ|お願い|問題ない|大丈夫|進めて|実装して|それで)$/i.test(text.trim())) {
-    return true;
-  }
-  // 明示的な修正指示（「〜に変えて」「〜を追加して」「〜は不要」等）
-  if (/変えて|修正して|追加して|削除して|不要|変更して|直して|ここを|要件/.test(text)) {
-    return true;
-  }
+/** キャンセル意図の検出（広めに） */
+function isCancelIntent(text: string): boolean {
+  return /開発(キャンセル|中止|やめ)|やめて|やめる|キャンセル|別の話|もういい|いらない|中断|ストップ|stop/i.test(text);
+}
+
+/** 開発と明らかに無関係なメッセージ */
+function isOffTopic(text: string): boolean {
+  // 挨拶・雑談・システム状況確認
+  if (/^(おはよう|こんにちは|こんばんは|お疲れ|ありがとう|おつかれ|ただいま|hi|hello)/i.test(text)) return true;
+  if (/予算|コスト|ダッシュボード|タスク(状況|一覧)|ログ|状態|ステータス/.test(text)) return true;
+  if (/天気|ニュース|今日|明日/.test(text)) return true;
   return false;
 }
 
-async function shouldCreateTask(userMessage: string, aiResponse: string): Promise<boolean> {
-  const actionKeywords = /分析して|最適化して|チェックして|レポート|調べて|改善して|提案して|比較して|監査して|スクリプト|自動化/;
-  return actionKeywords.test(userMessage);
+/** defining フェーズへの応答か */
+function isDefiningResponse(text: string): boolean {
+  if (/^(ok|OK|Ok|おk|はい|いいよ|お願い|問題ない|大丈夫|進めて|実装して|それで)$/i.test(text.trim())) return true;
+  if (/変えて|修正して|追加して|削除して|不要|変更して|直して|ここを|要件/.test(text)) return true;
+  return false;
+}
+
+function shouldCreateTask(userMessage: string): boolean {
+  return /分析して|最適化して|チェックして|レポート|調べて|改善して|提案して|比較して|監査して|スクリプト|自動化/.test(userMessage);
 }

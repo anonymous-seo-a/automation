@@ -157,15 +157,16 @@ ${recentTasks.map(t => `<tr>
 </tr>`).join('\n')}
 </table></div>
 
-<h2>開発会話</h2>
+<h2>開発会話 <form method="POST" action="/admin/dev/reset-all" style="display:inline"><button type="submit" style="background:#3d1418;color:#f85149;border:1px solid #f85149;border-radius:4px;padding:2px 10px;font-size:12px;cursor:pointer">全リセット</button></form></h2>
 <div class="table-wrap"><table>
-<tr><th>ID</th><th>トピック</th><th>状態</th><th>作成</th><th>更新</th></tr>
+<tr><th>ID</th><th>トピック</th><th>状態</th><th>作成</th><th>更新</th><th></th></tr>
 ${devConvs.map(c => `<tr>
   <td><a href="/admin/dev/${c.id}">${(c.id as string).slice(0, 8)}</a></td>
   <td class="truncate">${escapeHtml((c.topic as string).slice(0, 60))}</td>
   <td>${badge(c.status as string)}</td>
   <td>${c.created_at}</td>
   <td>${c.updated_at}</td>
+  <td>${!['deployed', 'failed'].includes(c.status as string) ? `<form method="POST" action="/admin/dev/${c.id}/cancel" style="display:inline"><button type="submit" style="background:none;color:#f85149;border:none;cursor:pointer;font-size:12px">✕</button></form>` : ''}</td>
 </tr>`).join('\n')}
 </table></div>
 
