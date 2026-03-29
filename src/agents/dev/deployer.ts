@@ -176,6 +176,16 @@ export async function deployWithHealthCheck(branchName: string): Promise<DeployR
 
   if (healthy) {
     logger.info('ヘルスチェック成功');
+
+    // GitHubにpush
+    try {
+      await execAsync(`git push origin ${branchName}`, 30000);
+      logger.info(`GitHub push 完了: ${branchName}`);
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      logger.warn('GitHub push 失敗（デプロイ自体は成功）', { err: errMsg });
+    }
+
     return { success: true, message: 'デプロイ成功（ヘルスチェック通過）', branch: branchName };
   }
 
