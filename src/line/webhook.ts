@@ -5,12 +5,11 @@ import { isAuthorizedUser } from './auth';
 import { sendLineMessage } from './sender';
 import { interpretTask } from '../interpreter/taskInterpreter';
 import { enqueueTask } from '../queue/taskQueue';
-import { getActiveConversation } from '../agents/dev/conversation';
+import { getActiveConversation, cancelConversation } from '../agents/dev/conversation';
 import { DevAgent } from '../agents/dev/devAgent';
 import { generateResponse, gatherSystemContext } from './responder';
 import { saveMessage } from './messageHistory';
-import { callClaude } from '../claude/client';
-import { logger } from '../utils/logger';
+import { logger, dbLog } from '../utils/logger';
 
 const devAgent = new DevAgent();
 
@@ -24,7 +23,6 @@ webhookRouter.post(
   '/',
   line.middleware(lineMiddlewareConfig) as any,
   async (req: Request, res: Response) => {
-    // LINE には即座に200を返す
     res.status(200).end();
 
     try {
@@ -40,6 +38,7 @@ webhookRouter.post(
         }
 
         const text = event.message.text.trim();
+        dbLog('info', 'webhook', `受信: ${text.slice(0, 100)}`, { userId });
         await handleMessage(userId, text);
       }
     } catch (err) {
@@ -48,58 +47,85 @@ webhookRouter.post(
   }
 );
 
-// ping だけはAPI不要のヘルスチェックとして残す
 async function handleMessage(userId: string, text: string): Promise<void> {
   if (text === 'ping') {
-    await sendLineMessage(userId, 'pong 🏓');
+    await sendLineMessage(userId, 'pong');
     return;
   }
 
-  // 開発エージェントへの分岐
+  // --- 開発エージェントのルーティング ---
   const activeDevConv = getActiveConversation(userId);
 
   if (activeDevConv) {
-    // 開発キャンセル（自然な表現にも対応）
-    if (/開発(キャンセル|中止|やめ)|やめて|やめる|キャンセル/.test(text)) {
-      await devAgent.handleMessage(userId, text);
-      return;
-    }
+    // 古い会話を自動期限切れ（30分）
+    const updatedAt = new Date(activeDevConv.updated_at + 'Z').getTime();
+    const now = Date.now();
+    const staleMinutes = Math.floor((now - updatedAt) / 60000);
 
-    // hearing/defining フェーズ: メッセージが開発の文脈かどうかをClaudeに判定させる
-    if (activeDevConv.status === 'hearing' || activeDevConv.status === 'defining') {
-      const isDevRelated = await isRelatedToDevConversation(text, activeDevConv.topic);
-      if (isDevRelated) {
+    if (staleMinutes > 30 && (activeDevConv.status === 'hearing' || activeDevConv.status === 'defining')) {
+      dbLog('info', 'webhook', `開発会話を自動期限切れ: ${activeDevConv.id} (${staleMinutes}分経過)`, { convId: activeDevConv.id });
+      cancelConversation(activeDevConv.id);
+      // フォールスルーして通常応答
+    } else {
+      dbLog('info', 'webhook', `開発会話あり: status=${activeDevConv.status}, topic=${activeDevConv.topic.slice(0, 30)}`, { convId: activeDevConv.id });
+
+      // キャンセル（自然な表現に対応）
+      if (/開発(キャンセル|中止|やめ)|やめて|やめる|キャンセル|別の話/.test(text)) {
+        dbLog('info', 'webhook', 'ルーティング → 開発キャンセル');
         await devAgent.handleMessage(userId, text);
         return;
       }
-      // 開発と無関係 → 通常応答にフォールスルー
-    } else if (activeDevConv.status === 'implementing' || activeDevConv.status === 'testing' || activeDevConv.status === 'approved') {
-      // 実装中は状況を伝えつつ、通常応答にもフォールスルー
-      // devAgentに渡すと「実装中です」しか返さないので、通常応答で柔軟に対応
+
+      switch (activeDevConv.status) {
+        case 'hearing':
+          // ヒアリング中: 基本的に開発への返答として扱う
+          dbLog('info', 'webhook', 'ルーティング → 開発ヒアリング');
+          await devAgent.handleMessage(userId, text);
+          return;
+
+        case 'defining':
+          // 要件定義中: OKか修正指示のみ開発へルーティング
+          if (isDefiningResponse(text)) {
+            dbLog('info', 'webhook', `ルーティング → 開発要件定義 (${text.slice(0, 20)})`);
+            await devAgent.handleMessage(userId, text);
+            return;
+          }
+          dbLog('info', 'webhook', 'defining中だが開発と無関係 → 通常応答');
+          // フォールスルー
+          break;
+
+        case 'approved':
+        case 'implementing':
+        case 'testing':
+          // 実装中: 通常応答にフォールスルー（ブロックしない）
+          dbLog('info', 'webhook', `実装中(${activeDevConv.status}) → 通常応答にフォールスルー`);
+          break;
+      }
     }
   }
 
+  // 新規開発依頼の検出
   const isDevRequest = /開発して|実装して|母艦に.*追加して|新しいエージェントを作って|機能を追加して/.test(text);
   if (isDevRequest) {
+    dbLog('info', 'webhook', 'ルーティング → 新規開発依頼');
     await devAgent.handleMessage(userId, text);
     return;
   }
 
-  // ユーザーのメッセージを履歴に保存
+  // --- 通常の会話処理 ---
   saveMessage(userId, 'user', text);
+  dbLog('info', 'webhook', 'ルーティング → 通常応答');
 
-  // 全てのメッセージをClaude経由で処理
   try {
-    // システム状況を収集
     const systemContext = await gatherSystemContext();
 
-    // Claudeで意図を判定しつつ自然な応答を生成（会話履歴付き）
     const response = await generateResponse(text, {
       systemStatus: systemContext,
     }, userId);
 
-    // DEV_AGENT トリガーの場合（Claudeが開発依頼と判断）
+    // DEV_AGENT トリガー
     if (response.trim() === 'DEV_AGENT') {
+      dbLog('info', 'webhook', 'Claude判定 → DEV_AGENT トリガー');
       await devAgent.handleMessage(userId, text);
       return;
     }
@@ -108,6 +134,7 @@ async function handleMessage(userId: string, text: string): Promise<void> {
     const needsTask = await shouldCreateTask(text, response);
 
     if (needsTask) {
+      dbLog('info', 'webhook', 'タスクキューへ投入');
       const interpreted = await interpretTask(text);
 
       if (interpreted.confirmation_needed) {
@@ -134,42 +161,39 @@ async function handleMessage(userId: string, text: string): Promise<void> {
       await sendLineMessage(userId, queueResponse);
       saveMessage(userId, 'assistant', queueResponse);
     } else {
-      // タスク不要 → そのまま応答
       await sendLineMessage(userId, response);
       saveMessage(userId, 'assistant', response);
     }
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
     logger.error('メッセージ処理エラー', { err: errMsg, text });
+    dbLog('error', 'webhook', `処理エラー: ${errMsg.slice(0, 200)}`, { text });
 
     const errorResponse = await generateResponse(
       `エラーが発生しました: ${errMsg.slice(0, 200)}`,
       { rawContext: 'エラーをユーザーに伝え、次に何をすべきか提案してください。' },
       userId,
-    ).catch(() => `エラーが発生しました。ダッシュボードで詳細を確認してください: ${config.admin.baseUrl}/admin`);
+    ).catch(() => `エラーが発生しました。ダッシュボードで確認してください: ${config.admin.baseUrl}/admin`);
 
     await sendLineMessage(userId, errorResponse);
     saveMessage(userId, 'assistant', errorResponse);
   }
 }
 
+/** defining フェーズへのメッセージかどうかを判定（Claude不使用） */
+function isDefiningResponse(text: string): boolean {
+  // 承認パターン
+  if (/^(ok|OK|Ok|おk|はい|いいよ|お願い|問題ない|大丈夫|進めて|実装して|それで)$/i.test(text.trim())) {
+    return true;
+  }
+  // 明示的な修正指示（「〜に変えて」「〜を追加して」「〜は不要」等）
+  if (/変えて|修正して|追加して|削除して|不要|変更して|直して|ここを|要件/.test(text)) {
+    return true;
+  }
+  return false;
+}
+
 async function shouldCreateTask(userMessage: string, aiResponse: string): Promise<boolean> {
   const actionKeywords = /分析して|最適化して|チェックして|レポート|調べて|改善して|提案して|比較して|監査して|スクリプト|自動化/;
   return actionKeywords.test(userMessage);
-}
-
-async function isRelatedToDevConversation(message: string, topic: string): Promise<boolean> {
-  try {
-    const { text } = await callClaude({
-      system: `ユーザーのメッセージが、進行中の開発会話（トピック: 「${topic}」）への返答かどうか判定してください。
-開発への返答・質問・指示なら "YES"、全く別の話題なら "NO" とだけ返してください。`,
-      messages: [{ role: 'user', content: message }],
-      model: 'default',
-      maxTokens: 8,
-    });
-    return text.trim().toUpperCase().includes('YES');
-  } catch {
-    // 判定失敗時は開発会話として扱う（安全側）
-    return true;
-  }
 }

@@ -36,7 +36,6 @@ const MAX_HEARING_ROUNDS = 3;
 export class DevAgent implements Agent {
   name = 'dev';
 
-  // タスクキュー経由の実行（互換性のため）
   async execute(task: Task): Promise<TaskResult> {
     return {
       success: true,
@@ -45,15 +44,15 @@ export class DevAgent implements Agent {
     };
   }
 
-  // LINE会話経由のメイン処理
   async handleMessage(userId: string, text: string): Promise<void> {
     try {
       // キャンセル処理
-      if (/開発(キャンセル|中止|やめ)|やめて|やめる|キャンセル/.test(text.trim())) {
+      if (/開発(キャンセル|中止|やめ)|やめて|やめる|キャンセル|別の話/.test(text.trim())) {
         const conv = getActiveConversation(userId);
         if (conv) {
           cancelConversation(conv.id);
-          await sendLineMessage(userId, '🛑 開発を中止しました。');
+          dbLog('info', 'dev-agent', `開発キャンセル: ${conv.topic}`, { convId: conv.id });
+          await sendLineMessage(userId, '開発を中止しました。');
         } else {
           await sendLineMessage(userId, '進行中の開発はありません。');
         }
@@ -64,10 +63,13 @@ export class DevAgent implements Agent {
 
       if (!conv) {
         conv = createConversation(userId, text);
-        await sendLineMessage(userId, `🔧 開発モード起動\n「${text}」を承りました。\nいくつか確認させてください。`);
+        dbLog('info', 'dev-agent', `新規開発会話: ${text.slice(0, 60)}`, { convId: conv.id });
+        await sendLineMessage(userId, `「${text}」について、いくつか確認させてください。`);
         await this.runHearing(conv, text);
         return;
       }
+
+      dbLog('info', 'dev-agent', `handleMessage: status=${conv.status}`, { convId: conv.id, text: text.slice(0, 60) });
 
       switch (conv.status) {
         case 'hearing':
@@ -79,25 +81,24 @@ export class DevAgent implements Agent {
         case 'approved':
         case 'implementing':
         case 'testing':
-          await sendLineMessage(userId, '⏳ 現在実装中です。完了次第ご報告します。');
+          dbLog('info', 'dev-agent', `実装中メッセージ受信（無視）: ${text.slice(0, 30)}`, { convId: conv.id });
+          await sendLineMessage(userId, '現在実装中です。完了次第ご報告します。');
           break;
-        case 'deployed':
-          await sendLineMessage(userId, '✅ 前回の開発は完了済みです。新しい依頼を送ってください。');
-          break;
-        case 'failed':
-          await sendLineMessage(userId, '❌ 前回の開発は失敗しています。新しい依頼を送ってください。');
+        default:
+          dbLog('warn', 'dev-agent', `想定外ステータス: ${conv.status}`, { convId: conv.id });
           break;
       }
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       logger.error('DevAgent処理エラー', { err: errMsg, userId });
-      await sendLineMessage(userId, `❌ 開発エージェントエラー:\n${errMsg.slice(0, 300)}`);
+      dbLog('error', 'dev-agent', `処理エラー: ${errMsg.slice(0, 200)}`, { userId });
+      await sendLineMessage(userId, `開発エージェントエラー:\n${errMsg.slice(0, 300)}`);
     }
   }
 
-  // Phase 1: ヒアリング（初回）
   private async runHearing(conv: DevConversation, initialMessage: string): Promise<void> {
     appendHearingLog(conv.id, 'user', initialMessage);
+    dbLog('info', 'dev-agent', `ヒアリング開始: round 1/${MAX_HEARING_ROUNDS}`, { convId: conv.id });
 
     const updatedConv = getConversation(conv.id);
     if (!updatedConv) return;
@@ -111,21 +112,23 @@ export class DevAgent implements Agent {
       model: 'default',
     });
 
+    dbLog('info', 'dev-agent', `ヒアリング応答: ${text.slice(0, 100)}`, { convId: conv.id });
     await this.processHearingResponse(conv, text);
   }
 
-  // Phase 1: ヒアリング（2回目以降）
   private async handleHearing(conv: DevConversation, userReply: string): Promise<void> {
     appendHearingLog(conv.id, 'user', userReply);
 
     const round = getHearingRound(conv.id);
+    dbLog('info', 'dev-agent', `ヒアリング回答受信: round ${round}/${MAX_HEARING_ROUNDS}`, { convId: conv.id });
+
     const updatedConv = getConversation(conv.id);
     if (!updatedConv) return;
     const hearingLog = JSON.parse(updatedConv.hearing_log);
 
-    // 最大回数に達したら強制的に要件定義へ
     if (round >= MAX_HEARING_ROUNDS) {
-      appendHearingLog(conv.id, 'agent', 'ヒアリング最大回数到達。収集済み情報で要件定義に進みます。');
+      dbLog('info', 'dev-agent', 'ヒアリング最大回数到達 → 要件定義へ', { convId: conv.id });
+      appendHearingLog(conv.id, 'agent', 'ヒアリング最大回数到達。要件定義に進みます。');
       await this.transitionToDefining(conv);
       return;
     }
@@ -138,6 +141,7 @@ export class DevAgent implements Agent {
       model: 'default',
     });
 
+    dbLog('info', 'dev-agent', `ヒアリング応答: ${text.slice(0, 100)}`, { convId: conv.id });
     await this.processHearingResponse(conv, text);
   }
 
@@ -145,28 +149,31 @@ export class DevAgent implements Agent {
     const parsed = safeParseJson(text);
 
     if (parsed && parsed.hearing_complete) {
+      dbLog('info', 'dev-agent', 'ヒアリング完了 → 要件定義へ', { convId: conv.id });
       appendHearingLog(conv.id, 'agent', parsed.summary || 'ヒアリング完了');
       await this.transitionToDefining(conv);
     } else if (parsed && parsed.questions && parsed.questions.length > 0) {
       const questions = (parsed.questions as string[]).slice(0, 3);
-      const msg = `📝 確認事項:\n${questions.map((q: string, i: number) => `${i + 1}. ${q}`).join('\n')}`;
+      const msg = questions.map((q: string, i: number) => `${i + 1}. ${q}`).join('\n');
       appendHearingLog(conv.id, 'agent', msg);
       await sendLineMessage(conv.user_id, msg);
     } else {
+      // JSONパース失敗時はそのまま送信
+      dbLog('warn', 'dev-agent', `ヒアリング応答がJSON外: ${text.slice(0, 80)}`, { convId: conv.id });
       appendHearingLog(conv.id, 'agent', text);
       await sendLineMessage(conv.user_id, text);
     }
   }
 
-  // Phase 2: 要件定義
   private async transitionToDefining(conv: DevConversation): Promise<void> {
     updateConversationStatus(conv.id, 'defining');
+    dbLog('info', 'dev-agent', '要件定義書作成開始', { convId: conv.id });
 
     const updatedConv = getConversation(conv.id);
     if (!updatedConv) return;
     const hearingLog = JSON.parse(updatedConv.hearing_log);
 
-    await sendLineMessage(conv.user_id, '📋 ヒアリング完了。要件定義書を作成中...');
+    await sendLineMessage(conv.user_id, 'ヒアリング完了。要件定義書を作成中...');
 
     const { text } = await callClaude({
       system: DEV_SYSTEM_PROMPT + '\n\n' + REQUIREMENTS_PROMPT,
@@ -177,19 +184,23 @@ export class DevAgent implements Agent {
     });
 
     setRequirements(conv.id, text);
+    dbLog('info', 'dev-agent', `要件定義書作成完了 (${text.length}文字)`, { convId: conv.id });
     await sendLineMessage(conv.user_id, text);
-    await sendLineMessage(conv.user_id, '「OK」で実装開始、修正指示があれば伝えてください。');
+    await sendLineMessage(conv.user_id, '「OK」で実装開始。修正があれば具体的に指示してください。\n別の話題を送れば通常会話に戻ります。');
   }
 
   private async handleDefining(conv: DevConversation, userReply: string): Promise<void> {
     const normalized = userReply.trim().toLowerCase();
+    dbLog('info', 'dev-agent', `要件定義フェーズ応答: ${userReply.slice(0, 40)}`, { convId: conv.id });
 
-    if (/^(ok|おk|はい|いいよ|お願い|問題ない|大丈夫)$/.test(normalized)) {
+    if (/^(ok|OK|Ok|おk|はい|いいよ|お願い|問題ない|大丈夫|進めて|実装して|それで)$/i.test(normalized)) {
       updateConversationStatus(conv.id, 'approved');
-      await sendLineMessage(conv.user_id, '🚀 実装を開始します。完了まで数分お待ちください...');
+      dbLog('info', 'dev-agent', '要件承認 → 実装開始', { convId: conv.id });
+      await sendLineMessage(conv.user_id, '実装を開始します。完了まで数分お待ちください...');
       await this.runImplementation(conv);
     } else {
-      await sendLineMessage(conv.user_id, '📝 要件を修正中...');
+      dbLog('info', 'dev-agent', '要件修正指示を受信', { convId: conv.id });
+      await sendLineMessage(conv.user_id, '要件を修正中...');
 
       const updatedConv = getConversation(conv.id);
       const { text } = await callClaude({
@@ -201,14 +212,15 @@ export class DevAgent implements Agent {
       });
 
       setRequirements(conv.id, text);
+      dbLog('info', 'dev-agent', `要件修正完了 (${text.length}文字)`, { convId: conv.id });
       await sendLineMessage(conv.user_id, text);
-      await sendLineMessage(conv.user_id, '「OK」で実装開始、修正指示があれば伝えてください。');
+      await sendLineMessage(conv.user_id, '「OK」で実装開始。修正があれば具体的に指示してください。\n別の話題を送れば通常会話に戻ります。');
     }
   }
 
-  // Phase 3: 実装（git安全策付き）
   private async runImplementation(conv: DevConversation): Promise<void> {
     updateConversationStatus(conv.id, 'implementing');
+    dbLog('info', 'dev-agent', '実装フェーズ開始', { convId: conv.id });
 
     const updatedConv = getConversation(conv.id);
     if (!updatedConv) return;
@@ -216,9 +228,9 @@ export class DevAgent implements Agent {
     let branchName = '';
 
     try {
-      // git安全策: ブランチ作成
       branchName = await prepareGitBranch();
-      await sendLineMessage(conv.user_id, `🌿 ブランチ作成: ${branchName}`);
+      dbLog('info', 'dev-agent', `ブランチ作成: ${branchName}`, { convId: conv.id });
+      await sendLineMessage(conv.user_id, `ブランチ作成: ${branchName}`);
 
       const { text } = await callClaude({
         system: DEV_SYSTEM_PROMPT + '\n\n' + IMPLEMENTATION_PROMPT,
@@ -235,70 +247,70 @@ export class DevAgent implements Agent {
       }
 
       const files = parsed.files as FileToWrite[];
+      dbLog('info', 'dev-agent', `コード生成: ${files.length}ファイル`, { convId: conv.id, files: files.map(f => f.path) });
       const writtenFiles = await writeFiles(files);
       setGeneratedFiles(conv.id, writtenFiles);
 
-      // Phase 4: ビルド & デプロイ
       updateConversationStatus(conv.id, 'testing');
       await this.runBuildAndDeploy(conv, files, 0, branchName);
 
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
+      dbLog('error', 'dev-agent', `実装失敗: ${errMsg.slice(0, 200)}`, { convId: conv.id });
 
-      // ビルド失敗 → ロールバック
       if (branchName) {
         await rollbackGit(branchName);
-        await sendLineMessage(conv.user_id, '🔙 コードをロールバックしました。');
+        await sendLineMessage(conv.user_id, 'コードをロールバックしました。');
       }
 
       updateConversationStatus(conv.id, 'failed');
-      dbLog('error', 'dev-agent', '実装失敗', { convId: conv.id, error: errMsg });
       await sendLineMessage(conv.user_id,
-        `❌ 実装に失敗しました:\n${errMsg.slice(0, 500)}\n\n新しい依頼を送ってリトライできます。`
+        `実装に失敗しました:\n${errMsg.slice(0, 500)}\n\n新しい依頼を送ってリトライできます。`
       );
     }
   }
 
-  // Phase 4: ビルド＆デプロイ（git安全策付き）
   private async runBuildAndDeploy(
     conv: DevConversation,
     lastFiles: FileToWrite[],
     retryCount: number,
     branchName: string,
   ): Promise<void> {
+    dbLog('info', 'dev-agent', `ビルド開始 (試行 ${retryCount + 1})`, { convId: conv.id });
     const buildResult = await runBuild();
 
     if (buildResult.success) {
-      // コミット
+      dbLog('info', 'dev-agent', 'ビルド成功 → デプロイ開始', { convId: conv.id });
       await commitAndStay(branchName, `feat(dev-agent): ${conv.topic}`);
 
-      // デプロイ（ヘルスチェック付き）
       const deployResult = await deployWithHealthCheck(branchName);
       if (deployResult.success) {
         updateConversationStatus(conv.id, 'deployed');
         const updatedConv = getConversation(conv.id) || conv;
         const generatedFiles = JSON.parse(updatedConv.generated_files || '[]') as string[];
 
+        dbLog('info', 'dev-agent', `デプロイ成功: ${branchName}`, { convId: conv.id, files: generatedFiles });
         await sendLineMessage(conv.user_id,
-          `✅ 開発完了！\n\n` +
-          `📋 ${conv.topic}\n` +
-          `🌿 ブランチ: ${branchName}\n\n` +
-          `📁 ファイル一覧:\n${generatedFiles.map(f => `  - ${f}`).join('\n')}\n\n` +
-          `🔨 ビルド: 成功\n` +
-          `🚀 デプロイ: 完了（ヘルスチェック通過）\n\n` +
-          `正常に反映されました。`
+          `開発完了!\n\n` +
+          `${conv.topic}\n` +
+          `ブランチ: ${branchName}\n` +
+          `ファイル: ${generatedFiles.join(', ')}\n\n` +
+          `ビルド・デプロイ・ヘルスチェック全て通過。`
         );
-        dbLog('info', 'dev-agent', '開発完了・デプロイ成功', { convId: conv.id, branch: branchName });
       } else {
         updateConversationStatus(conv.id, 'failed');
+        dbLog('error', 'dev-agent', `デプロイ失敗: ${deployResult.message}`, { convId: conv.id });
         await sendLineMessage(conv.user_id,
-          `❌ ${deployResult.message}\n前の状態に復帰済みです。`
+          `${deployResult.message}\n前の状態に復帰済みです。`
         );
       }
     } else if (retryCount < MAX_BUILD_RETRIES) {
-      // ビルドエラー自己修正
+      dbLog('warn', 'dev-agent', `ビルドエラー → 自動修正 (${retryCount + 1}/${MAX_BUILD_RETRIES})`, {
+        convId: conv.id,
+        buildOutput: buildResult.buildOutput?.slice(0, 300),
+      });
       await sendLineMessage(conv.user_id,
-        `🔧 ビルドエラー検出。自動修正中... (${retryCount + 1}/${MAX_BUILD_RETRIES})`
+        `ビルドエラー検出。自動修正中... (${retryCount + 1}/${MAX_BUILD_RETRIES})`
       );
 
       try {
@@ -326,21 +338,21 @@ export class DevAgent implements Agent {
         }
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
-        // ロールバック
+        dbLog('error', 'dev-agent', `自動修正失敗: ${errMsg.slice(0, 200)}`, { convId: conv.id });
         await rollbackGit(branchName);
-        await sendLineMessage(conv.user_id, '🔙 コードをロールバックしました。');
+        await sendLineMessage(conv.user_id, 'コードをロールバックしました。');
         updateConversationStatus(conv.id, 'failed');
         await sendLineMessage(conv.user_id,
-          `❌ ビルドエラーの自動修正に失敗しました:\n${errMsg.slice(0, 300)}`
+          `ビルドエラーの自動修正に失敗しました:\n${errMsg.slice(0, 300)}`
         );
       }
     } else {
-      // 最大リトライ超過 → ロールバック
+      dbLog('error', 'dev-agent', `ビルド修正${MAX_BUILD_RETRIES}回失敗`, { convId: conv.id });
       await rollbackGit(branchName);
-      await sendLineMessage(conv.user_id, '🔙 コードをロールバックしました。');
+      await sendLineMessage(conv.user_id, 'コードをロールバックしました。');
       updateConversationStatus(conv.id, 'failed');
       await sendLineMessage(conv.user_id,
-        `❌ ビルドエラーを${MAX_BUILD_RETRIES}回修正しましたが解決できませんでした:\n${buildResult.buildOutput?.slice(0, 500)}\n\n手動での修正が必要です。`
+        `ビルドエラーを${MAX_BUILD_RETRIES}回修正しましたが解決できませんでした:\n${buildResult.buildOutput?.slice(0, 500)}\n\n手動での修正が必要です。`
       );
     }
   }
