@@ -15,8 +15,8 @@ export const config = {
   },
   claude: {
     apiKey: required('CLAUDE_API_KEY'),
-    defaultModel: process.env.CLAUDE_MODEL_DEFAULT || 'claude-sonnet-4-6-20260312',
-    opusModel: process.env.CLAUDE_MODEL_OPUS || 'claude-opus-4-6-20260312',
+    defaultModel: process.env.CLAUDE_MODEL_DEFAULT || 'claude-sonnet-4-6',
+    opusModel: process.env.CLAUDE_MODEL_OPUS || 'claude-opus-4-6',
     dailyBudgetUsd: parseFloat(process.env.CLAUDE_DAILY_BUDGET_USD || '1.50'),
     monthlyBudgetUsd: parseFloat(process.env.CLAUDE_MONTHLY_BUDGET_USD || '30.00'),
   },

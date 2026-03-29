@@ -15,7 +15,7 @@ const lineMiddlewareConfig = {
 export const webhookRouter = Router();
 
 webhookRouter.post(
-  '/webhook',
+  '/',
   line.middleware(lineMiddlewareConfig) as any,
   async (req: Request, res: Response) => {
     // LINE には即座に200を返す

@@ -52,7 +52,7 @@ export async function callClaude(params: {
     throw new Error(`Claude API ${response.status}: ${err}`);
   }
 
-  const data: ClaudeResponse = await response.json();
+  const data = await response.json() as ClaudeResponse;
 
   const text = data.content
     .filter(c => c.type === 'text' && c.text)
