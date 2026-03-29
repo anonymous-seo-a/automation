@@ -7,6 +7,8 @@ import { startWorker } from './executor/executor';
 import { loadKnowledgeFiles } from './knowledge/loader';
 import { interpretTask } from './interpreter/taskInterpreter';
 import { enqueueTask } from './queue/taskQueue';
+import { checkIdleSessions } from './memory/session';
+import { runDailyConsolidation } from './memory/consolidation';
 import { logger } from './utils/logger';
 import path from 'path';
 
@@ -85,7 +87,44 @@ async function main(): Promise<void> {
   startWorker();
   logger.info('ワーカー起動完了');
 
+  // アイドルセッション定期チェック（5分間隔）
+  setInterval(() => {
+    checkIdleSessions().catch(err =>
+      logger.warn('アイドルセッションチェック失敗', { err: err instanceof Error ? err.message : String(err) })
+    );
+  }, 5 * 60 * 1000);
+  logger.info('セッション監視起動完了');
+
+  // 日次記憶統合（毎日3:00 AM に実行）
+  scheduleDailyConsolidation();
+  logger.info('日次記憶統合スケジュール設定完了');
+
   logger.info('🚀 母艦システム起動完了');
+}
+
+function scheduleDailyConsolidation(): void {
+  const run = () => {
+    const now = new Date();
+    // 次の3:00 AMまでのミリ秒を計算
+    const next = new Date(now);
+    next.setHours(3, 0, 0, 0);
+    if (next.getTime() <= now.getTime()) {
+      next.setDate(next.getDate() + 1);
+    }
+    const delay = next.getTime() - now.getTime();
+
+    setTimeout(async () => {
+      try {
+        await runDailyConsolidation();
+      } catch (err) {
+        logger.error('日次記憶統合失敗', { err: err instanceof Error ? err.message : String(err) });
+      }
+      run(); // 次の日もスケジュール
+    }, delay);
+
+    logger.info(`次回記憶統合: ${next.toISOString()}`);
+  };
+  run();
 }
 
 main().catch((err) => {

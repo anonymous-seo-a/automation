@@ -95,11 +95,30 @@ export function runMigrations(): void {
       type TEXT NOT NULL,
       key TEXT NOT NULL,
       content TEXT NOT NULL,
+      embedding BLOB,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
     CREATE INDEX IF NOT EXISTS idx_memories_user ON memories(user_id, type);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_key ON memories(user_id, type, key);
+
+    CREATE TABLE IF NOT EXISTS conversation_sessions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id TEXT NOT NULL,
+      started_at TEXT NOT NULL DEFAULT (datetime('now')),
+      ended_at TEXT,
+      message_count INTEGER NOT NULL DEFAULT 0,
+      summary TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_sessions_user ON conversation_sessions(user_id, ended_at);
   `);
+
+  // 既存テーブルに embedding 列がなければ追加（マイグレーション互換）
+  try {
+    db.prepare("SELECT embedding FROM memories LIMIT 1").get();
+  } catch {
+    db.exec("ALTER TABLE memories ADD COLUMN embedding BLOB");
+  }
 }

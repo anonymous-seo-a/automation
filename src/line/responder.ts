@@ -2,7 +2,7 @@ import { callClaude } from '../claude/client';
 import { getStatusReport } from '../queue/taskQueue';
 import { getBudgetReport } from '../claude/budgetTracker';
 import { getRecentHistory } from './messageHistory';
-import { buildMemoryContext } from './memory';
+import { buildSmartContext } from '../memory/store';
 import { config } from '../config';
 import { logger } from '../utils/logger';
 
@@ -88,10 +88,14 @@ export async function generateResponse(
     // 現在のメッセージを追加
     messages.push({ role: 'user', content: userMessage });
 
-    // 記憶コンテキストを追加
+    // 記憶コンテキストを追加（意味検索で関連記憶のみ注入）
     let memoryBlock = '';
     if (userId) {
-      memoryBlock = buildMemoryContext(userId);
+      try {
+        memoryBlock = await buildSmartContext(userId, userMessage);
+      } catch (err) {
+        logger.warn('スマートコンテキスト構築失敗', { err: err instanceof Error ? err.message : String(err) });
+      }
     }
 
     const { text } = await callClaude({
@@ -121,7 +125,7 @@ export async function extractMemories(
   assistantResponse: string
 ): Promise<void> {
   try {
-    const { saveMemory } = await import('./memory');
+    const { saveMemoryWithEmbedding } = await import('../memory/store');
 
     const { text } = await callClaude({
       system: `会話からユーザーに関する情報を抽出してJSON配列で返してください。
@@ -159,7 +163,7 @@ type:
 
     for (const mem of memories) {
       if (mem.type && mem.key && mem.content) {
-        saveMemory(userId, mem.type, mem.key, mem.content);
+        await saveMemoryWithEmbedding(userId, mem.type, mem.key, mem.content);
         logger.info('自動記憶保存', { userId, type: mem.type, key: mem.key });
       }
     }

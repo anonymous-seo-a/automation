@@ -9,7 +9,8 @@ import { getActiveConversation, cancelConversation, getConversation } from '../a
 import { DevAgent } from '../agents/dev/devAgent';
 import { generateResponse, gatherSystemContext, extractMemories } from './responder';
 import { saveMessage } from './messageHistory';
-import { saveMemory, getMemories, searchMemories, deleteMemory, MemoryType } from './memory';
+import { saveMemoryWithEmbedding, getAllMemories, searchByMeaning, deleteMemory, MemoryType } from '../memory/store';
+import { trackMessage, isEndSignal, endSession } from '../memory/session';
 import { logger, dbLog } from '../utils/logger';
 
 const devAgent = new DevAgent();
@@ -54,8 +55,21 @@ function wantsToExit(text: string): boolean {
 }
 
 async function handleMessage(userId: string, text: string): Promise<void> {
+  // セッション追跡
+  trackMessage(userId);
+
   if (text === 'ping') {
     await sendLineMessage(userId, 'pong');
+    return;
+  }
+
+  // 終了合図 → セッション要約保存
+  if (isEndSignal(text)) {
+    saveMessage(userId, 'user', text);
+    const response = await generateResponse(text, undefined, userId);
+    await sendLineMessage(userId, response);
+    saveMessage(userId, 'assistant', response);
+    endSession(userId).catch(err => logger.warn('セッション終了失敗', { err: err instanceof Error ? err.message : String(err) }));
     return;
   }
 
@@ -203,7 +217,7 @@ async function handleMemoryCommand(userId: string, text: string): Promise<boolea
 
   // 「何覚えてる？」「覚えてる？」「記憶一覧」→ 記憶の一覧表示
   if (/^(何.{0,2}覚えてる|覚えてる[？?]?$|記憶一覧|メモ一覧|覚えてること)/.test(text)) {
-    const memories = getMemories(userId);
+    const memories = getAllMemories(userId);
     if (memories.length === 0) {
       await sendLineMessage(userId, 'まだ何も覚えていません。\n「覚えて 〇〇」で記憶を追加できます。');
     } else {
@@ -211,6 +225,10 @@ async function handleMemoryCommand(userId: string, text: string): Promise<boolea
       const byType: Record<string, typeof memories> = {};
       for (const m of memories) {
         (byType[m.type] ||= []).push(m);
+      }
+      if (byType.consolidated) {
+        lines.push('🧠 統合プロフィール');
+        for (const m of byType.consolidated) lines.push(`  ${m.key}: ${m.content.slice(0, 80)}`);
       }
       if (byType.profile) {
         lines.push('👤 プロフィール');
@@ -224,35 +242,43 @@ async function handleMemoryCommand(userId: string, text: string): Promise<boolea
         lines.push('📝 メモ');
         for (const m of byType.memo) lines.push(`  ${m.key}: ${m.content}`);
       }
+      if (byType.session_summary) {
+        lines.push(`💬 会話要約 (${byType.session_summary.length}件)`);
+        for (const m of byType.session_summary.slice(0, 3)) lines.push(`  ${m.key}: ${m.content.slice(0, 60)}`);
+        if (byType.session_summary.length > 3) lines.push(`  ...他${byType.session_summary.length - 3}件`);
+      }
       await sendLineMessage(userId, lines.join('\n'));
     }
     saveMessage(userId, 'user', text);
     return true;
   }
 
-  // 「〇〇について覚えてる？」→ 記憶検索
+  // 「〇〇について覚えてる？」→ 意味検索
   const recallMatch = text.match(/^(.+?)(について|のこと).*(覚えてる|記憶|知ってる)/);
   if (recallMatch) {
     const query = recallMatch[1].trim();
-    const found = searchMemories(userId, query);
-    if (found.length > 0) {
-      const lines = found.map(m => `[${m.type}] ${m.key}: ${m.content}`);
-      await sendLineMessage(userId, `「${query}」に関する記憶:\n${lines.join('\n')}`);
-    } else {
-      await sendLineMessage(userId, `「${query}」に関する記憶はありません。`);
+    try {
+      const found = await searchByMeaning(userId, query, 5);
+      if (found.length > 0) {
+        const lines = found.map(r => `[${r.memory.type}] ${r.memory.key}: ${r.memory.content.slice(0, 80)}`);
+        await sendLineMessage(userId, `「${query}」に関する記憶:\n${lines.join('\n')}`);
+      } else {
+        await sendLineMessage(userId, `「${query}」に関する記憶はありません。`);
+      }
+    } catch {
+      await sendLineMessage(userId, `記憶検索でエラーが発生しました。`);
     }
     saveMessage(userId, 'user', text);
     return true;
   }
 
-  // 「覚えて 〇〇」「覚えて: 〇〇」→ メモ保存
-  // 「覚えてる」「覚えてること」等を除外するために、覚えての後にコロンorスペース+内容が必須
+  // 「覚えて 〇〇」「覚えて: 〇〇」→ メモ保存（embedding付き）
   const memoMatch = text.match(/^覚えて[：:]\s*(.+)/s) || text.match(/^覚えて\s+(.+)/s);
   if (memoMatch) {
     const content = memoMatch[1].trim();
-    if (!content) return false; // 空なら通常応答に回す
+    if (!content) return false;
     const key = content.slice(0, 20).replace(/\s+/g, '_');
-    saveMemory(userId, 'memo', key, content);
+    await saveMemoryWithEmbedding(userId, 'memo', key, content);
     dbLog('info', 'webhook', `記憶保存: key=${key}`, { userId });
     await sendLineMessage(userId, `覚えました 📝\n「${content.slice(0, 50)}${content.length > 50 ? '...' : ''}」`);
     saveMessage(userId, 'user', text);
@@ -265,12 +291,16 @@ async function handleMemoryCommand(userId: string, text: string): Promise<boolea
   if (forgetMatch) {
     const query = forgetMatch[1].trim();
     if (!query) return false;
-    const found = searchMemories(userId, query);
-    if (found.length > 0) {
-      deleteMemory(userId, found[0].type as MemoryType, found[0].key);
-      await sendLineMessage(userId, `「${found[0].key}」の記憶を削除しました。`);
-    } else {
-      await sendLineMessage(userId, `「${query}」に関する記憶は見つかりませんでした。`);
+    try {
+      const found = await searchByMeaning(userId, query, 1);
+      if (found.length > 0) {
+        deleteMemory(userId, found[0].memory.type as MemoryType, found[0].memory.key);
+        await sendLineMessage(userId, `「${found[0].memory.key}」の記憶を削除しました。`);
+      } else {
+        await sendLineMessage(userId, `「${query}」に関する記憶は見つかりませんでした。`);
+      }
+    } catch {
+      await sendLineMessage(userId, `記憶削除でエラーが発生しました。`);
     }
     saveMessage(userId, 'user', text);
     return true;
