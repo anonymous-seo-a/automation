@@ -9,6 +9,7 @@ import { logger, dbLog } from '../utils/logger';
 
 const POLL_INTERVAL_MS = 5000;
 let isRunning = false;
+let isProcessing = false;
 
 export function startWorker(): void {
   if (isRunning) return;
@@ -25,11 +26,19 @@ export function stopWorker(): void {
 async function poll(): Promise<void> {
   while (isRunning) {
     try {
-      const task = getNextTask();
-      if (task) {
-        await executeTask(task);
+      if (!isProcessing) {
+        const task = getNextTask();
+        if (task) {
+          isProcessing = true;
+          try {
+            await executeTask(task);
+          } finally {
+            isProcessing = false;
+          }
+        }
       }
     } catch (err) {
+      isProcessing = false;
       logger.error('Worker poll error', { err });
     }
     await sleep(POLL_INTERVAL_MS);

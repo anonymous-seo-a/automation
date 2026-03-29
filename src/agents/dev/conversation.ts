@@ -71,7 +71,12 @@ export function appendHearingLog(id: string, role: 'user' | 'agent', message: st
   const conv = getConversation(id);
   if (!conv) return;
 
-  const log = JSON.parse(conv.hearing_log) as Array<{ role: string; message: string }>;
+  let log: Array<{ role: string; message: string }> = [];
+  try {
+    log = JSON.parse(conv.hearing_log);
+  } catch {
+    log = [];
+  }
   log.push({ role, message });
 
   db.prepare(`
@@ -111,6 +116,10 @@ export function cancelConversation(id: string): void {
 export function getHearingRound(id: string): number {
   const conv = getConversation(id);
   if (!conv) return 0;
-  const log = JSON.parse(conv.hearing_log) as Array<{ role: string }>;
-  return log.filter(e => e.role === 'user').length;
+  try {
+    const log = JSON.parse(conv.hearing_log) as Array<{ role: string }>;
+    return log.filter(e => e.role === 'user').length;
+  } catch {
+    return 0;
+  }
 }

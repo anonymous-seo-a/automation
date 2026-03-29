@@ -1,3 +1,5 @@
+import { config } from '../config';
+
 function layout(title: string, content: string): string {
   return `<!DOCTYPE html>
 <html lang="ja">
@@ -248,5 +250,3 @@ ${items.map(k => `<tr>
 </table>`;
 }
 
-// Re-export config for views
-import { config } from '../config';

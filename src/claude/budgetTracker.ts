@@ -22,12 +22,16 @@ export async function trackUsage(
   outputTokens: number,
   taskId?: string
 ): Promise<void> {
-  const cost = calcCost(model, inputTokens, outputTokens);
-  const db = getDB();
-  db.prepare(`
-    INSERT INTO api_usage (model, input_tokens, output_tokens, cost_usd, task_id)
-    VALUES (?, ?, ?, ?, ?)
-  `).run(model, inputTokens, outputTokens, cost, taskId || null);
+  try {
+    const cost = calcCost(model, inputTokens, outputTokens);
+    const db = getDB();
+    db.prepare(`
+      INSERT INTO api_usage (model, input_tokens, output_tokens, cost_usd, task_id)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(model, inputTokens, outputTokens, cost, taskId || null);
+  } catch (err) {
+    logger.error('API使用量記録失敗', { model, err });
+  }
 }
 
 export async function getDailySpend(): Promise<number> {

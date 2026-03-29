@@ -22,7 +22,7 @@ function execAsync(cmd: string, timeoutMs = 30000): Promise<{ stdout: string; st
   return new Promise((resolve, reject) => {
     exec(cmd, { cwd: PROJECT_ROOT, timeout: timeoutMs }, (error, stdout, stderr) => {
       if (error) {
-        reject(new Error(`${cmd} failed: ${stderr || error.message}`));
+        reject(new Error(`${cmd} failed: ${error.message}\n${stderr}`));
       } else {
         resolve({ stdout: stdout.toString(), stderr: stderr.toString() });
       }
@@ -157,7 +157,10 @@ function sleep(ms: number): Promise<void> {
 
 export async function healthCheck(): Promise<boolean> {
   try {
-    const res = await fetch('http://localhost:3000/health');
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000);
+    const res = await fetch('http://localhost:3000/health', { signal: controller.signal });
+    clearTimeout(timeoutId);
     return res.status === 200;
   } catch {
     return false;

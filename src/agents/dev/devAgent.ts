@@ -115,7 +115,7 @@ export class DevAgent implements Agent {
 
     const updatedConv = getConversation(conv.id);
     if (!updatedConv) return;
-    const hearingLog = JSON.parse(updatedConv.hearing_log);
+    const hearingLog = safeParseJson(updatedConv.hearing_log) || [];
 
     const { text } = await callClaude({
       system: DEV_SYSTEM_PROMPT + '\n\n' + PM_HEARING_PROMPT,
@@ -137,7 +137,7 @@ export class DevAgent implements Agent {
 
     const updatedConv = getConversation(conv.id);
     if (!updatedConv) return;
-    const hearingLog = JSON.parse(updatedConv.hearing_log);
+    const hearingLog = safeParseJson(updatedConv.hearing_log) || [];
 
     if (round >= MAX_HEARING_ROUNDS) {
       dbLog('info', 'dev-agent', '[PM] ヒアリング最大回数到達 → 要件定義へ', { convId: conv.id });
@@ -187,7 +187,7 @@ export class DevAgent implements Agent {
 
     const updatedConv = getConversation(conv.id);
     if (!updatedConv) return;
-    const hearingLog = JSON.parse(updatedConv.hearing_log);
+    const hearingLog = safeParseJson(updatedConv.hearing_log) || [];
 
     await sendLineMessage(conv.user_id, 'ヒアリング完了。要件定義書を作成中...');
 
@@ -218,10 +218,11 @@ export class DevAgent implements Agent {
       await sendLineMessage(conv.user_id, '要件を修正中...');
 
       const updatedConv = getConversation(conv.id);
+      const requirements = updatedConv?.requirements || conv.requirements || '(要件未記録)';
       const { text } = await callClaude({
         system: DEV_SYSTEM_PROMPT + '\n\n' + PM_REQUIREMENTS_PROMPT,
         messages: [
-          { role: 'user', content: `元の要件:\n${updatedConv?.requirements || conv.requirements}\n\n修正指示: ${userReply}` },
+          { role: 'user', content: `元の要件:\n${requirements}\n\n修正指示: ${userReply}` },
         ],
         model: 'opus',
       });
@@ -350,11 +351,15 @@ export class DevAgent implements Agent {
       });
 
       const engineerParsed = safeParseJson(engineerOutput);
-      if (!engineerParsed || !engineerParsed.file) {
+      if (!engineerParsed || !engineerParsed.file || !engineerParsed.file.path || !engineerParsed.file.content) {
         throw new Error(`エンジニア: ${subtask.path} のパースに失敗`);
       }
 
-      lastCode = engineerParsed.file as FileToWrite;
+      lastCode = {
+        path: engineerParsed.file.path,
+        content: engineerParsed.file.content,
+        action: engineerParsed.file.action || subtask.action,
+      };
 
       // --- レビュアー ---
       dbLog('info', 'dev-agent', `[レビュアー] レビュー開始: ${subtask.path}`, { convId: conv.id });

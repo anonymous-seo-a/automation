@@ -48,7 +48,8 @@ export async function generateResponse(
       contextBlock += `\n## 予算状況\n${context.budgetReport}`;
     }
     if (context?.taskResult) {
-      contextBlock += `\n## タスク実行結果\nタスク: ${context.taskResult.description}\n出力:\n${context.taskResult.output.slice(0, 2000)}`;
+      const output = (context.taskResult.output || '').slice(0, 2000);
+      contextBlock += `\n## タスク実行結果\nタスク: ${context.taskResult.description}\n出力:\n${output}`;
       if (context.taskResult.execResult) {
         contextBlock += `\n実行結果:\n${context.taskResult.execResult.slice(0, 500)}`;
       }
@@ -69,7 +70,9 @@ export async function generateResponse(
     if (userId) {
       const history = getRecentHistory(userId);
       for (const msg of history) {
-        messages.push({ role: msg.role, content: msg.content });
+        if (msg.role === 'user' || msg.role === 'assistant') {
+          messages.push({ role: msg.role, content: msg.content });
+        }
       }
     }
 

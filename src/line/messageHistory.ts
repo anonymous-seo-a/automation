@@ -1,4 +1,5 @@
 import { getDB } from '../db/database';
+import { logger } from '../utils/logger';
 
 interface HistoryMessage {
   role: 'user' | 'assistant';
@@ -7,10 +8,14 @@ interface HistoryMessage {
 
 /** ユーザーまたはアシスタントのメッセージを保存 */
 export function saveMessage(userId: string, role: 'user' | 'assistant', content: string): void {
-  const db = getDB();
-  db.prepare(
-    'INSERT INTO message_history (user_id, role, content) VALUES (?, ?, ?)'
-  ).run(userId, role, content);
+  try {
+    const db = getDB();
+    db.prepare(
+      'INSERT INTO message_history (user_id, role, content) VALUES (?, ?, ?)'
+    ).run(userId, role, content);
+  } catch (err) {
+    logger.error('メッセージ履歴保存失敗', { userId, role, err });
+  }
 }
 
 /** 直近N件の会話履歴を取得（Claude messages形式で返す） */
