@@ -113,6 +113,15 @@ export function runMigrations(): void {
     );
 
     CREATE INDEX IF NOT EXISTS idx_sessions_user ON conversation_sessions(user_id, ended_at);
+
+    CREATE TABLE IF NOT EXISTS pending_updates (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      update_type TEXT NOT NULL,
+      content TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
   `);
 
   // 既存テーブルに embedding 列がなければ追加（マイグレーション互換）

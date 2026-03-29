@@ -9,6 +9,7 @@ import { interpretTask } from './interpreter/taskInterpreter';
 import { enqueueTask } from './queue/taskQueue';
 import { checkIdleSessions } from './memory/session';
 import { runDailyConsolidation } from './memory/consolidation';
+import { loadKnowledgeCache } from './line/bunshinPrompt';
 import { logger } from './utils/logger';
 import path from 'path';
 
@@ -19,9 +20,10 @@ async function main(): Promise<void> {
   runMigrations();
   logger.info('DBマイグレーション完了');
 
-  // ナレッジファイルロード
+  // ナレッジファイルロード（DB + 分身プロンプトキャッシュ）
   const knowledgeDir = path.join(__dirname, '..', 'knowledge');
   await loadKnowledgeFiles(knowledgeDir);
+  await loadKnowledgeCache();
   logger.info('ナレッジファイルロード完了');
 
   // Expressサーバー起動

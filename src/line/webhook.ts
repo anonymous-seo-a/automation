@@ -7,10 +7,12 @@ import { interpretTask } from '../interpreter/taskInterpreter';
 import { enqueueTask } from '../queue/taskQueue';
 import { getActiveConversation, cancelConversation, getConversation } from '../agents/dev/conversation';
 import { DevAgent } from '../agents/dev/devAgent';
-import { generateResponse, gatherSystemContext, extractMemories } from './responder';
+import { generateResponse, gatherSystemContext } from './responder';
+import { extractAndSaveMemories } from './autoExtract';
 import { saveMessage } from './messageHistory';
 import { saveMemoryWithEmbedding, getAllMemories, searchByMeaning, deleteMemory, MemoryType } from '../memory/store';
 import { trackMessage, isEndSignal, endSession } from '../memory/session';
+import { consolidateKnowledge, applyPendingUpdate } from '../knowledge/consolidator';
 import { logger, dbLog } from '../utils/logger';
 
 const devAgent = new DevAgent();
@@ -76,6 +78,39 @@ async function handleMessage(userId: string, text: string): Promise<void> {
   // ★ 記憶コマンド
   const memoryResult = await handleMemoryCommand(userId, text);
   if (memoryResult) return;
+
+  // ★ ナレッジ統合コマンド
+  if (/^ナレッジ(更新|統合)$/.test(text)) {
+    saveMessage(userId, 'user', text);
+    await sendLineMessage(userId, 'ナレッジ統合を開始します...');
+    try {
+      const result = await consolidateKnowledge(userId);
+      for (const diff of result.diffs) {
+        await sendLineMessage(userId, diff);
+      }
+      if (result.updatedFiles.length > 0) {
+        await sendLineMessage(userId, '上記の変更を反映しますか？「反映」で確定。');
+      }
+    } catch (err) {
+      logger.error('ナレッジ統合エラー', { err: err instanceof Error ? err.message : String(err) });
+      await sendLineMessage(userId, 'ナレッジ統合でエラーが発生しました。');
+    }
+    return;
+  }
+
+  // ★ ナレッジ反映承認
+  if (/^反映$/.test(text)) {
+    saveMessage(userId, 'user', text);
+    try {
+      const result = await applyPendingUpdate(userId);
+      await sendLineMessage(userId, result);
+      saveMessage(userId, 'assistant', result);
+    } catch (err) {
+      logger.error('ナレッジ反映エラー', { err: err instanceof Error ? err.message : String(err) });
+      await sendLineMessage(userId, 'ナレッジ反映でエラーが発生しました。');
+    }
+    return;
+  }
 
   const activeDevConv = getActiveConversation(userId);
 
@@ -178,12 +213,12 @@ async function handleMessage(userId: string, text: string): Promise<void> {
       );
       await sendLineMessage(userId, queueResponse);
       saveMessage(userId, 'assistant', queueResponse);
-      extractMemories(userId, text, queueResponse).catch(err => logger.warn('extractMemories失敗', { err: err instanceof Error ? err.message : String(err) }));
+      extractAndSaveMemories(userId, text, queueResponse).catch(err => logger.warn('自動記憶抽出失敗', { err }));
     } else {
       await sendLineMessage(userId, response);
       saveMessage(userId, 'assistant', response);
       // バックグラウンドで自動記憶抽出（応答を遅延させない）
-      extractMemories(userId, text, response).catch(err => logger.warn('extractMemories失敗', { err: err instanceof Error ? err.message : String(err) }));
+      extractAndSaveMemories(userId, text, response).catch(err => logger.warn('自動記憶抽出失敗', { err }));
     }
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
