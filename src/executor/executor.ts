@@ -1,6 +1,7 @@
 import { getNextTask, updateTaskStatus, TaskRow } from '../queue/taskQueue';
 import { runInSandbox } from './sandbox';
 import { sendLineMessage } from '../line/sender';
+import { generateResponse } from '../line/responder';
 import { getAgent } from '../agents/router';
 import { Task } from '../agents/baseAgent';
 import { config } from '../config';
@@ -93,9 +94,11 @@ async function executeTask(task: TaskRow): Promise<void> {
     // 予算超過は即通知（リトライしない）
     if (errMsg.includes('BUDGET_EXCEEDED')) {
       updateTaskStatus(task.id, 'failed', { error: errMsg });
-      await sendLineMessage(config.line.allowedUserId,
-        `⚠️ 予算上限に達しました。\n${errMsg}\n全エージェントを一時停止します。`
+      const msg = await generateResponse(
+        `予算上限に達しました: ${errMsg}`,
+        { rawContext: '予算超過でタスクが停止したことをユーザーに伝え、ダッシュボードで予算を確認するよう促してください。' }
       );
+      await sendLineMessage(config.line.allowedUserId, msg);
       return;
     }
 
@@ -108,12 +111,21 @@ async function handleFailure(task: TaskRow, errorMsg: string): Promise<void> {
 
   if (currentRetry >= task.max_retries) {
     updateTaskStatus(task.id, 'failed', { error: errorMsg });
-    await sendLineMessage(config.line.allowedUserId,
-      `❌ タスク失敗（${task.max_retries}回リトライ後）:\n` +
-      `📋 ${task.description}\n` +
-      `🔴 最終エラー: ${errorMsg.slice(0, 500)}\n\n` +
-      `修正指示をお願いします。`
+
+    const msg = await generateResponse(
+      `タスクが最終的に失敗しました`,
+      {
+        errorInfo: {
+          description: task.description,
+          error: errorMsg,
+          retryCount: currentRetry,
+          maxRetries: task.max_retries,
+        },
+        rawContext: `タスクID: ${task.id}\nダッシュボードで詳細を確認できます: ${config.admin.baseUrl}/admin/tasks/${task.id}`,
+      }
     );
+    await sendLineMessage(config.line.allowedUserId, msg);
+
     dbLog('error', 'executor', 'タスク最終失敗', {
       taskId: task.id,
       error: errorMsg,
@@ -132,18 +144,17 @@ async function notifySuccess(
   aiResponse: string,
   execOutput?: string
 ): Promise<void> {
-  let msg = `✅ タスク完了:\n📋 ${task.description}\n\n`;
-
-  if (aiResponse.length > 1500) {
-    msg += aiResponse.slice(0, 1500) + '\n...(省略)';
-  } else {
-    msg += aiResponse;
-  }
-
-  if (execOutput && execOutput.trim()) {
-    msg += `\n\n📤 実行結果:\n${execOutput.slice(0, 500)}`;
-  }
-
+  const msg = await generateResponse(
+    `タスクが完了しました`,
+    {
+      taskResult: {
+        description: task.description,
+        output: aiResponse,
+        execResult: execOutput,
+      },
+      rawContext: `タスクID: ${task.id}\n詳細: ${config.admin.baseUrl}/admin/tasks/${task.id}`,
+    }
+  );
   await sendLineMessage(config.line.allowedUserId, msg);
 }
 

@@ -34,4 +34,8 @@ export const config = {
     dir: process.env.SANDBOX_DIR || '/tmp/mothership/sandbox',
     timeoutMs: 30000,
   },
+  admin: {
+    password: process.env.ADMIN_PASSWORD || 'mothership2026',
+    baseUrl: process.env.ADMIN_BASE_URL || 'https://bot.anonymous-seo.jp',
+  },
 } as const;

@@ -4,10 +4,10 @@ import { config } from '../config';
 import { isAuthorizedUser } from './auth';
 import { sendLineMessage } from './sender';
 import { interpretTask } from '../interpreter/taskInterpreter';
-import { enqueueTask, getStatusReport } from '../queue/taskQueue';
-import { getBudgetReport } from '../claude/budgetTracker';
+import { enqueueTask } from '../queue/taskQueue';
 import { getActiveConversation } from '../agents/dev/conversation';
 import { DevAgent } from '../agents/dev/devAgent';
+import { generateResponse, gatherSystemContext } from './responder';
 import { logger } from '../utils/logger';
 
 const devAgent = new DevAgent();
@@ -46,22 +46,10 @@ webhookRouter.post(
   }
 );
 
+// ping だけはAPI不要のヘルスチェックとして残す
 async function handleMessage(userId: string, text: string): Promise<void> {
-  // 特殊コマンド
-  if (text === '状況' || text === 'status') {
-    const report = getStatusReport();
-    await sendLineMessage(userId, report);
-    return;
-  }
-
-  if (text === '予算' || text === 'budget') {
-    const report = await getBudgetReport();
-    await sendLineMessage(userId, report);
-    return;
-  }
-
   if (text === 'ping') {
-    await sendLineMessage(userId, 'pong 🏓 母艦稼働中');
+    await sendLineMessage(userId, 'pong 🏓');
     return;
   }
 
@@ -71,10 +59,9 @@ async function handleMessage(userId: string, text: string): Promise<void> {
     return;
   }
 
-  // 開発エージェントへの分岐
+  // 開発エージェントへの分岐（進行中会話 or 開発系キーワード）
   const activeDevConv = getActiveConversation(userId);
   if (activeDevConv) {
-    // 進行中の開発会話がある場合は全メッセージをdevAgentに転送
     await devAgent.handleMessage(userId, text);
     return;
   }
@@ -85,40 +72,66 @@ async function handleMessage(userId: string, text: string): Promise<void> {
     return;
   }
 
-  // 通常の指示 → タスク解釈
-  await sendLineMessage(userId, '📋 指示を受け付けました。解析中...');
-
+  // 全てのメッセージをClaude経由で処理
   try {
-    const interpreted = await interpretTask(text);
+    // システム状況を収集
+    const systemContext = await gatherSystemContext();
 
-    if (interpreted.confirmation_needed) {
-      await sendLineMessage(userId,
-        `❓ 確認が必要です:\n${interpreted.clarification_question}`
-      );
+    // Claudeで意図を判定しつつ自然な応答を生成
+    const response = await generateResponse(text, {
+      systemStatus: systemContext,
+    });
+
+    // DEV_AGENT トリガーの場合（Claudeが開発依頼と判断）
+    if (response.trim() === 'DEV_AGENT') {
+      await devAgent.handleMessage(userId, text);
       return;
     }
 
-    if (interpreted.estimated_api_calls > 50) {
-      await sendLineMessage(userId,
-        `⚠️ 推定API呼び出し: ${interpreted.estimated_api_calls}回\n` +
-        `コスト増の可能性があります。実行しますか？（「実行」と送信）`
+    // タスク実行が必要か判定
+    const needsTask = await shouldCreateTask(text, response);
+
+    if (needsTask) {
+      const interpreted = await interpretTask(text);
+
+      if (interpreted.confirmation_needed) {
+        const clarifyResponse = await generateResponse(
+          `ユーザーの指示「${text}」について確認が必要です: ${interpreted.clarification_question}`,
+          { rawContext: '確認事項をユーザーに自然に質問してください。' }
+        );
+        await sendLineMessage(userId, clarifyResponse);
+        return;
+      }
+
+      for (const task of interpreted.tasks) {
+        enqueueTask(task);
+      }
+
+      const taskNames = interpreted.tasks.map(t => t.description).join('\n');
+      const queueResponse = await generateResponse(
+        `「${text}」を受けて以下のタスクをキューに追加しました:\n${taskNames}\n\n推定API呼び出し: ${interpreted.estimated_api_calls}回`,
+        { rawContext: 'タスクが正常にキューに入ったことをユーザーに伝えてください。' }
       );
-      return;
+      await sendLineMessage(userId, queueResponse);
+    } else {
+      // タスク不要 → そのまま応答
+      await sendLineMessage(userId, response);
     }
-
-    for (const task of interpreted.tasks) {
-      enqueueTask(task);
-    }
-
-    await sendLineMessage(userId,
-      `✅ ${interpreted.tasks.length}件のタスクをキューに追加しました。\n` +
-      `完了次第LINEで報告します。`
-    );
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
-    logger.error('タスク解釈エラー', { err: errMsg, text });
-    await sendLineMessage(userId,
-      `❌ 指示の解析に失敗しました:\n${errMsg.slice(0, 300)}`
-    );
+    logger.error('メッセージ処理エラー', { err: errMsg, text });
+
+    const errorResponse = await generateResponse(
+      `エラーが発生しました: ${errMsg.slice(0, 200)}`,
+      { rawContext: 'エラーをユーザーに伝え、次に何をすべきか提案してください。' }
+    ).catch(() => `エラーが発生しました。ダッシュボードで詳細を確認してください: ${config.admin.baseUrl}/admin`);
+
+    await sendLineMessage(userId, errorResponse);
   }
+}
+
+async function shouldCreateTask(userMessage: string, aiResponse: string): Promise<boolean> {
+  // 明示的な実行依頼のキーワード
+  const actionKeywords = /分析して|最適化して|チェックして|レポート|調べて|改善して|提案して|比較して|監査して|スクリプト|自動化/;
+  return actionKeywords.test(userMessage);
 }

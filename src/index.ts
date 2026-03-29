@@ -2,6 +2,7 @@ import express, { Request, Response } from 'express';
 import { config } from './config';
 import { runMigrations } from './db/migrations';
 import { webhookRouter } from './line/webhook';
+import { adminRouter } from './admin/dashboard';
 import { startWorker } from './executor/executor';
 import { loadKnowledgeFiles } from './knowledge/loader';
 import { interpretTask } from './interpreter/taskInterpreter';
@@ -32,6 +33,9 @@ async function main(): Promise<void> {
       env: config.server.env,
     });
   });
+
+  // 管理ダッシュボード（BASIC認証付き）
+  app.use('/admin', adminRouter);
 
   // LINE Webhook（line.middleware が独自にbodyをパースするため express.json() は使わない）
   // /webhook でも / でもLINEからのリクエストを受け付ける
