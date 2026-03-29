@@ -5,7 +5,7 @@ import { isAuthorizedUser } from './auth';
 import { sendLineMessage } from './sender';
 import { interpretTask } from '../interpreter/taskInterpreter';
 import { enqueueTask } from '../queue/taskQueue';
-import { getActiveConversation, cancelConversation } from '../agents/dev/conversation';
+import { getActiveConversation, cancelConversation, getConversation } from '../agents/dev/conversation';
 import { DevAgent } from '../agents/dev/devAgent';
 import { generateResponse, gatherSystemContext } from './responder';
 import { saveMessage } from './messageHistory';
@@ -47,107 +47,85 @@ webhookRouter.post(
   }
 );
 
+/** 脱出意図の検出（最優先で処理） */
+function wantsToExit(text: string): boolean {
+  return /リセット|reset|キャンセル|やめ|中止|中断|ストップ|stop|もういい|いらない|別の話|終わり|終了/i.test(text);
+}
+
 async function handleMessage(userId: string, text: string): Promise<void> {
   if (text === 'ping') {
     await sendLineMessage(userId, 'pong');
     return;
   }
 
-  // 強制リセット（どの状態でも効く）
-  if (/^(リセット|reset)$/i.test(text)) {
-    const conv = getActiveConversation(userId);
-    if (conv) {
-      cancelConversation(conv.id);
-      dbLog('info', 'webhook', `強制リセット: ${conv.id}`);
-      await sendLineMessage(userId, '開発会話をリセットしました。');
-    } else {
-      await sendLineMessage(userId, 'リセット対象はありません。');
-    }
+  const activeDevConv = getActiveConversation(userId);
+
+  // ★ 脱出チェック（最優先）
+  if (activeDevConv && wantsToExit(text)) {
+    cancelConversation(activeDevConv.id);
+    dbLog('info', 'webhook', `開発脱出: "${text}" → conv ${activeDevConv.id} をキャンセル`);
+    await sendLineMessage(userId, '開発を中止しました。何でも聞いてください。');
     return;
   }
 
-  // --- 開発エージェント判定 ---
-  const activeDevConv = getActiveConversation(userId);
-
-  if (activeDevConv) {
-    const createdAt = new Date(activeDevConv.created_at + 'Z').getTime();
-    const staleMinutes = Math.floor((Date.now() - createdAt) / 60000);
-
-    // 10分経過した hearing/defining は自動期限切れ
-    if (staleMinutes > 10 && (activeDevConv.status === 'hearing' || activeDevConv.status === 'defining')) {
-      cancelConversation(activeDevConv.id);
-      dbLog('info', 'webhook', `自動期限切れ: ${activeDevConv.id} (${staleMinutes}分経過)`);
-      // フォールスルー → 通常応答
-    } else {
-      dbLog('info', 'webhook', `開発会話あり: status=${activeDevConv.status}, topic=${activeDevConv.topic.slice(0, 30)}`);
-
-      // キャンセル意図の検出
-      if (isCancelIntent(text)) {
-        cancelConversation(activeDevConv.id);
-        dbLog('info', 'webhook', '開発キャンセル');
-        await sendLineMessage(userId, '開発を中止しました。');
-        return;
-      }
-
-      // フェーズ別ルーティング
-      if (activeDevConv.status === 'hearing') {
-        // 明らかに無関係なメッセージは通常応答にフォールスルー
-        if (isOffTopic(text)) {
-          dbLog('info', 'webhook', 'hearing中だが無関係 → 通常応答');
-          // フォールスルー
-        } else {
-          dbLog('info', 'webhook', 'ルーティング → 開発ヒアリング');
-          await devAgent.handleMessage(userId, text);
-          return;
-        }
-      } else if (activeDevConv.status === 'defining') {
-        if (isDefiningResponse(text)) {
-          dbLog('info', 'webhook', 'ルーティング → 開発要件定義');
-          await devAgent.handleMessage(userId, text);
-          return;
-        }
-        dbLog('info', 'webhook', 'defining中だが無関係 → 通常応答');
-        // フォールスルー
-      } else {
-        // implementing/testing/approved → 通常応答にフォールスルー
-        dbLog('info', 'webhook', `${activeDevConv.status}中 → 通常応答`);
-      }
+  // ★ defining フェーズ: OKか修正指示のみdevへ
+  if (activeDevConv && activeDevConv.status === 'defining') {
+    if (isDefiningResponse(text)) {
+      dbLog('info', 'webhook', `ルーティング → defining応答: "${text.slice(0, 20)}"`);
+      await devAgent.handleMessage(userId, text);
+      return;
     }
+    dbLog('info', 'webhook', 'defining中だが無関係 → 通常応答');
   }
 
-  // 新規開発依頼
-  if (/開発して|実装して|母艦に.*追加して|新しいエージェントを作って|機能を追加して/.test(text)) {
+  // ★ hearing フェーズ: responderに判断を委ねる（後述のDEV_AGENTトリガー経由）
+  // hearing中のメッセージはauto-captureしない。代わりにresponderが文脈を見て判断。
+
+  // ★ 新規開発依頼
+  if (!activeDevConv && /開発して|実装して|母艦に.*追加して|新しいエージェントを作って|機能を追加して/.test(text)) {
     dbLog('info', 'webhook', 'ルーティング → 新規開発依頼');
     await devAgent.handleMessage(userId, text);
     return;
   }
 
-  // --- 通常の会話 ---
+  // --- 通常応答（hearing中もここを通る） ---
   saveMessage(userId, 'user', text);
   dbLog('info', 'webhook', 'ルーティング → 通常応答');
 
   try {
     const systemContext = await gatherSystemContext();
 
-    // 開発進行中ならその情報も渡す
-    const devInfo = activeDevConv
-      ? `\n## 進行中の開発\nトピック: ${activeDevConv.topic}\n状態: ${activeDevConv.status}`
-      : '';
+    // 進行中の開発情報をコンテキストに含める
+    let devContext = '';
+    if (activeDevConv) {
+      devContext = `\n## 進行中の開発\nトピック: ${activeDevConv.topic}\n状態: ${activeDevConv.status}`;
+      if (activeDevConv.status === 'hearing') {
+        // 直近のエージェントの質問を含めてresponderに判断材料を与える
+        try {
+          const log = JSON.parse(activeDevConv.hearing_log) as Array<{ role: string; message: string }>;
+          const lastAgentMsg = [...log].reverse().find(e => e.role === 'agent');
+          if (lastAgentMsg) {
+            devContext += `\nエージェントの最後の質問:\n${lastAgentMsg.message}`;
+          }
+        } catch { /* ignore */ }
+        devContext += '\n\nユーザーのメッセージがこの開発への回答であれば "DEV_AGENT" と返してください。無関係な話題なら普通に回答してください。';
+      }
+    }
 
     const response = await generateResponse(text, {
       systemStatus: systemContext,
-      rawContext: devInfo || undefined,
+      rawContext: devContext || undefined,
     }, userId);
 
+    // DEV_AGENT トリガー
     if (response.trim() === 'DEV_AGENT') {
-      dbLog('info', 'webhook', 'Claude判定 → DEV_AGENT');
+      dbLog('info', 'webhook', 'responder判定 → DEV_AGENT');
       await devAgent.handleMessage(userId, text);
       return;
     }
 
-    const needsTask = await shouldCreateTask(text);
-
-    if (needsTask) {
+    // タスク実行判定
+    if (shouldCreateTask(text)) {
       dbLog('info', 'webhook', 'タスクキューへ投入');
       const interpreted = await interpretTask(text);
 
@@ -194,23 +172,8 @@ async function handleMessage(userId: string, text: string): Promise<void> {
   }
 }
 
-/** キャンセル意図の検出（広めに） */
-function isCancelIntent(text: string): boolean {
-  return /開発(キャンセル|中止|やめ)|やめて|やめる|キャンセル|別の話|もういい|いらない|中断|ストップ|stop/i.test(text);
-}
-
-/** 開発と明らかに無関係なメッセージ */
-function isOffTopic(text: string): boolean {
-  // 挨拶・雑談・システム状況確認
-  if (/^(おはよう|こんにちは|こんばんは|お疲れ|ありがとう|おつかれ|ただいま|hi|hello)/i.test(text)) return true;
-  if (/予算|コスト|ダッシュボード|タスク(状況|一覧)|ログ|状態|ステータス/.test(text)) return true;
-  if (/天気|ニュース|今日|明日/.test(text)) return true;
-  return false;
-}
-
-/** defining フェーズへの応答か */
 function isDefiningResponse(text: string): boolean {
-  if (/^(ok|OK|Ok|おk|はい|いいよ|お願い|問題ない|大丈夫|進めて|実装して|それで)$/i.test(text.trim())) return true;
+  if (/^(ok|おk|はい|いいよ|お願い|問題ない|大丈夫|進めて|実装して|それで)$/i.test(text.trim())) return true;
   if (/変えて|修正して|追加して|削除して|不要|変更して|直して|ここを|要件/.test(text)) return true;
   return false;
 }

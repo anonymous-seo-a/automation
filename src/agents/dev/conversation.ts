@@ -24,9 +24,15 @@ export interface DevConversation {
 
 export function getActiveConversation(userId: string): DevConversation | null {
   const db = getDB();
+  // hearing/defining は10分で自動期限切れ（SQLレベルで除外）
   const row = db.prepare(`
     SELECT * FROM dev_conversations
-    WHERE user_id = ? AND status NOT IN ('deployed', 'failed')
+    WHERE user_id = ?
+      AND status NOT IN ('deployed', 'failed')
+      AND NOT (
+        status IN ('hearing', 'defining')
+        AND updated_at < datetime('now', '-10 minutes')
+      )
     ORDER BY created_at DESC
     LIMIT 1
   `).get(userId) as DevConversation | undefined;

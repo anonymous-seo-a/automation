@@ -154,7 +154,7 @@ export class DevAgent implements Agent {
       await this.transitionToDefining(conv);
     } else if (parsed && parsed.questions && parsed.questions.length > 0) {
       const questions = (parsed.questions as string[]).slice(0, 3);
-      const msg = questions.map((q: string, i: number) => `${i + 1}. ${q}`).join('\n');
+      const msg = questions.map((q: string, i: number) => `${i + 1}. ${q}`).join('\n') + '\n\n（「やめる」で中止できます）';
       appendHearingLog(conv.id, 'agent', msg);
       await sendLineMessage(conv.user_id, msg);
     } else {
@@ -186,14 +186,13 @@ export class DevAgent implements Agent {
     setRequirements(conv.id, text);
     dbLog('info', 'dev-agent', `要件定義書作成完了 (${text.length}文字)`, { convId: conv.id });
     await sendLineMessage(conv.user_id, text);
-    await sendLineMessage(conv.user_id, '「OK」で実装開始。修正があれば具体的に指示してください。\n別の話題を送れば通常会話に戻ります。');
+    await sendLineMessage(conv.user_id, '「OK」で実装開始。修正指示も可。\n（「やめる」で中止、別の話題はそのまま送れます）');
   }
 
   private async handleDefining(conv: DevConversation, userReply: string): Promise<void> {
-    const normalized = userReply.trim().toLowerCase();
     dbLog('info', 'dev-agent', `要件定義フェーズ応答: ${userReply.slice(0, 40)}`, { convId: conv.id });
 
-    if (/^(ok|OK|Ok|おk|はい|いいよ|お願い|問題ない|大丈夫|進めて|実装して|それで)$/i.test(normalized)) {
+    if (/^(ok|おk|はい|いいよ|お願い|問題ない|大丈夫|進めて|実装して|それで)$/i.test(userReply.trim())) {
       updateConversationStatus(conv.id, 'approved');
       dbLog('info', 'dev-agent', '要件承認 → 実装開始', { convId: conv.id });
       await sendLineMessage(conv.user_id, '実装を開始します。完了まで数分お待ちください...');
@@ -214,7 +213,7 @@ export class DevAgent implements Agent {
       setRequirements(conv.id, text);
       dbLog('info', 'dev-agent', `要件修正完了 (${text.length}文字)`, { convId: conv.id });
       await sendLineMessage(conv.user_id, text);
-      await sendLineMessage(conv.user_id, '「OK」で実装開始。修正があれば具体的に指示してください。\n別の話題を送れば通常会話に戻ります。');
+      await sendLineMessage(conv.user_id, '「OK」で実装開始。修正指示も可。\n（「やめる」で中止、別の話題はそのまま送れます）');
     }
   }
 
