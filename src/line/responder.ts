@@ -124,19 +124,20 @@ export async function extractMemories(
     const { saveMemory } = await import('./memory');
 
     const { text } = await callClaude({
-      system: `あなたは会話から重要な情報を抽出するアナリストです。
-以下のJSON形式で、記憶すべき情報があれば返してください。なければ空配列を返してください。
+      system: `会話からユーザーに関する情報を抽出してJSON配列で返してください。
 
-[{"type": "profile"|"project", "key": "簡潔なキー名", "content": "記憶する内容"}]
+出力形式（JSON配列のみ。説明文不要）:
+[{"type":"profile","key":"キー名","content":"内容"}]
 
-## 抽出基準
-- profile: ユーザーの名前、職業、好み、スキル、関心事など個人情報
-- project: 進行中のプロジェクト、目標、締切、技術的な決定事項
+type:
+- profile: 名前、職業、スキル、好み、関心事、性格
+- project: 取り組んでいるプロジェクト、目標、技術スタック、サービス名
 
-## ルール
-- 雑談や挨拶からは抽出しない
-- 既に明らかな事実（「はい」「了解」等）は記憶しない
-- JSON配列のみ返す。説明文は不要`,
+抽出ルール:
+- 少しでもユーザーの人物像やプロジェクトに関する情報があれば積極的に抽出する
+- 「こんにちは」だけ等、本当に何も情報がない場合のみ [] を返す
+- keyは日本語で短く（例: "職業", "関心事", "プロジェクト名"）
+- 1つの会話から複数抽出してよい`,
       messages: [
         { role: 'user', content: `ユーザー: ${userMessage}\nアシスタント: ${assistantResponse}` },
       ],
@@ -144,7 +145,16 @@ export async function extractMemories(
       maxTokens: 500,
     });
 
-    const memories = JSON.parse(text) as Array<{ type: 'profile' | 'project'; key: string; content: string }>;
+    logger.info('自動記憶抽出結果', { raw: text.slice(0, 200) });
+
+    // JSONパース（マークダウンコードブロック対応）
+    let jsonStr = text.trim();
+    const codeBlock = jsonStr.match(/```(?:json)?\s*\n?([\s\S]*?)```/);
+    if (codeBlock) jsonStr = codeBlock[1].trim();
+    const arrMatch = jsonStr.match(/\[[\s\S]*\]/);
+    if (arrMatch) jsonStr = arrMatch[0];
+
+    const memories = JSON.parse(jsonStr) as Array<{ type: 'profile' | 'project'; key: string; content: string }>;
     if (!Array.isArray(memories)) return;
 
     for (const mem of memories) {
@@ -154,7 +164,6 @@ export async function extractMemories(
       }
     }
   } catch (err) {
-    // 自動記憶の失敗は致命的ではないのでログだけ
     logger.warn('自動記憶抽出失敗', { err: err instanceof Error ? err.message : String(err) });
   }
 }

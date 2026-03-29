@@ -164,6 +164,7 @@ async function handleMessage(userId: string, text: string): Promise<void> {
       );
       await sendLineMessage(userId, queueResponse);
       saveMessage(userId, 'assistant', queueResponse);
+      extractMemories(userId, text, queueResponse).catch(err => logger.warn('extractMemories失敗', { err: err instanceof Error ? err.message : String(err) }));
     } else {
       await sendLineMessage(userId, response);
       saveMessage(userId, 'assistant', response);
@@ -198,39 +199,13 @@ function shouldCreateTask(userMessage: string): boolean {
 
 /** 記憶関連コマンドの処理。処理したらtrue */
 async function handleMemoryCommand(userId: string, text: string): Promise<boolean> {
-  // 「覚えて: 〇〇」→ メモ保存
-  const memoMatch = text.match(/^覚えて[：:]?\s*(.+)/s);
-  if (memoMatch) {
-    const content = memoMatch[1].trim();
-    // keyはcontentの先頭20文字
-    const key = content.slice(0, 20).replace(/\s+/g, '_');
-    saveMemory(userId, 'memo', key, content);
-    await sendLineMessage(userId, `覚えました 📝\n「${content.slice(0, 50)}${content.length > 50 ? '...' : ''}」`);
-    saveMessage(userId, 'user', text);
-    saveMessage(userId, 'assistant', '覚えました');
-    return true;
-  }
+  // ★ 順番が重要: 一覧/検索チェック → 保存 → 削除
 
-  // 「忘れて: 〇〇」→ 記憶削除
-  const forgetMatch = text.match(/^忘れて[：:]?\s*(.+)/s);
-  if (forgetMatch) {
-    const query = forgetMatch[1].trim();
-    const found = searchMemories(userId, query);
-    if (found.length > 0) {
-      deleteMemory(userId, found[0].type as MemoryType, found[0].key);
-      await sendLineMessage(userId, `「${found[0].key}」の記憶を削除しました。`);
-    } else {
-      await sendLineMessage(userId, `「${query}」に関する記憶は見つかりませんでした。`);
-    }
-    saveMessage(userId, 'user', text);
-    return true;
-  }
-
-  // 「何覚えてる？」「記憶一覧」→ 記憶の一覧表示
-  if (/^(何(を?)覚えてる|記憶一覧|メモ一覧|覚えてること)/.test(text)) {
+  // 「何覚えてる？」「覚えてる？」「記憶一覧」→ 記憶の一覧表示
+  if (/^(何.{0,2}覚えてる|覚えてる[？?]?$|記憶一覧|メモ一覧|覚えてること)/.test(text)) {
     const memories = getMemories(userId);
     if (memories.length === 0) {
-      await sendLineMessage(userId, 'まだ何も覚えていません。\n「覚えて: 〇〇」で記憶を追加できます。');
+      await sendLineMessage(userId, 'まだ何も覚えていません。\n「覚えて 〇〇」で記憶を追加できます。');
     } else {
       const lines: string[] = [];
       const byType: Record<string, typeof memories> = {};
@@ -256,7 +231,7 @@ async function handleMemoryCommand(userId: string, text: string): Promise<boolea
   }
 
   // 「〇〇について覚えてる？」→ 記憶検索
-  const recallMatch = text.match(/(.+)(について|の?こと).*(覚えてる|記憶|知ってる)/);
+  const recallMatch = text.match(/^(.+?)(について|のこと).*(覚えてる|記憶|知ってる)/);
   if (recallMatch) {
     const query = recallMatch[1].trim();
     const found = searchMemories(userId, query);
@@ -265,6 +240,37 @@ async function handleMemoryCommand(userId: string, text: string): Promise<boolea
       await sendLineMessage(userId, `「${query}」に関する記憶:\n${lines.join('\n')}`);
     } else {
       await sendLineMessage(userId, `「${query}」に関する記憶はありません。`);
+    }
+    saveMessage(userId, 'user', text);
+    return true;
+  }
+
+  // 「覚えて 〇〇」「覚えて: 〇〇」→ メモ保存
+  // 「覚えてる」「覚えてること」等を除外するために、覚えての後にコロンorスペース+内容が必須
+  const memoMatch = text.match(/^覚えて[：:]\s*(.+)/s) || text.match(/^覚えて\s+(.+)/s);
+  if (memoMatch) {
+    const content = memoMatch[1].trim();
+    if (!content) return false; // 空なら通常応答に回す
+    const key = content.slice(0, 20).replace(/\s+/g, '_');
+    saveMemory(userId, 'memo', key, content);
+    dbLog('info', 'webhook', `記憶保存: key=${key}`, { userId });
+    await sendLineMessage(userId, `覚えました 📝\n「${content.slice(0, 50)}${content.length > 50 ? '...' : ''}」`);
+    saveMessage(userId, 'user', text);
+    saveMessage(userId, 'assistant', '覚えました');
+    return true;
+  }
+
+  // 「忘れて 〇〇」「忘れて: 〇〇」→ 記憶削除
+  const forgetMatch = text.match(/^忘れて[：:]\s*(.+)/s) || text.match(/^忘れて\s+(.+)/s);
+  if (forgetMatch) {
+    const query = forgetMatch[1].trim();
+    if (!query) return false;
+    const found = searchMemories(userId, query);
+    if (found.length > 0) {
+      deleteMemory(userId, found[0].type as MemoryType, found[0].key);
+      await sendLineMessage(userId, `「${found[0].key}」の記憶を削除しました。`);
+    } else {
+      await sendLineMessage(userId, `「${query}」に関する記憶は見つかりませんでした。`);
     }
     saveMessage(userId, 'user', text);
     return true;
