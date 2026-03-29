@@ -39,6 +39,19 @@ function layout(title: string, content: string): string {
   a { color: #58a6ff; text-decoration: none; }
   a:hover { text-decoration: underline; }
   .truncate { max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  @media (max-width: 768px) {
+    .container { padding: 12px; }
+    .grid { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }
+    .card .value { font-size: 18px; }
+    nav { padding: 10px 12px; display: flex; flex-wrap: wrap; gap: 8px; }
+    nav a { margin-right: 12px; font-size: 13px; }
+    nav .brand { margin-right: 16px; font-size: 15px; width: 100%; }
+    h1 { font-size: 18px; }
+    th, td { padding: 6px 8px; font-size: 12px; }
+    .truncate { max-width: 150px; }
+    pre { font-size: 11px; padding: 8px; }
+  }
 </style>
 </head>
 <body>
@@ -132,7 +145,7 @@ function renderDashboard(data: Record<string, unknown>): string {
 </div>
 
 <h2>直近のタスク</h2>
-<table>
+<div class="table-wrap"><table>
 <tr><th>ID</th><th>エージェント</th><th>内容</th><th>状態</th><th>優先度</th><th>作成日時</th></tr>
 ${recentTasks.map(t => `<tr>
   <td><a href="/admin/tasks/${t.id}">${(t.id as string).slice(0, 8)}</a></td>
@@ -142,10 +155,10 @@ ${recentTasks.map(t => `<tr>
   <td>${t.priority}</td>
   <td>${t.created_at}</td>
 </tr>`).join('\n')}
-</table>
+</table></div>
 
 <h2>開発会話</h2>
-<table>
+<div class="table-wrap"><table>
 <tr><th>ID</th><th>トピック</th><th>状態</th><th>作成</th><th>更新</th></tr>
 ${devConvs.map(c => `<tr>
   <td><a href="/admin/dev/${c.id}">${(c.id as string).slice(0, 8)}</a></td>
@@ -154,10 +167,10 @@ ${devConvs.map(c => `<tr>
   <td>${c.created_at}</td>
   <td>${c.updated_at}</td>
 </tr>`).join('\n')}
-</table>
+</table></div>
 
 <h2>直近のログ</h2>
-<table>
+<div class="table-wrap"><table>
 <tr><th>レベル</th><th>ソース</th><th>メッセージ</th><th>日時</th></tr>
 ${(data.recentLogs as Array<Record<string, unknown>>).map(l => `<tr>
   <td class="log-${l.level}">${l.level}</td>
@@ -165,7 +178,7 @@ ${(data.recentLogs as Array<Record<string, unknown>>).map(l => `<tr>
   <td class="truncate">${escapeHtml((l.message as string).slice(0, 80))}</td>
   <td>${l.created_at}</td>
 </tr>`).join('\n')}
-</table>`;
+</table></div>`;
 }
 
 function renderTaskDetail(data: Record<string, unknown>): string {
