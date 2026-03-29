@@ -9,6 +9,7 @@ import { getActiveConversation } from '../agents/dev/conversation';
 import { DevAgent } from '../agents/dev/devAgent';
 import { generateResponse, gatherSystemContext } from './responder';
 import { saveMessage } from './messageHistory';
+import { callClaude } from '../claude/client';
 import { logger } from '../utils/logger';
 
 const devAgent = new DevAgent();
@@ -54,17 +55,28 @@ async function handleMessage(userId: string, text: string): Promise<void> {
     return;
   }
 
-  // 開発キャンセル
-  if (/^(開発キャンセル|開発中止)$/.test(text)) {
-    await devAgent.handleMessage(userId, text);
-    return;
-  }
-
-  // 開発エージェントへの分岐（進行中会話 or 開発系キーワード）
+  // 開発エージェントへの分岐
   const activeDevConv = getActiveConversation(userId);
+
   if (activeDevConv) {
-    await devAgent.handleMessage(userId, text);
-    return;
+    // 開発キャンセル（自然な表現にも対応）
+    if (/開発(キャンセル|中止|やめ)|やめて|やめる|キャンセル/.test(text)) {
+      await devAgent.handleMessage(userId, text);
+      return;
+    }
+
+    // hearing/defining フェーズ: メッセージが開発の文脈かどうかをClaudeに判定させる
+    if (activeDevConv.status === 'hearing' || activeDevConv.status === 'defining') {
+      const isDevRelated = await isRelatedToDevConversation(text, activeDevConv.topic);
+      if (isDevRelated) {
+        await devAgent.handleMessage(userId, text);
+        return;
+      }
+      // 開発と無関係 → 通常応答にフォールスルー
+    } else if (activeDevConv.status === 'implementing' || activeDevConv.status === 'testing' || activeDevConv.status === 'approved') {
+      // 実装中は状況を伝えつつ、通常応答にもフォールスルー
+      // devAgentに渡すと「実装中です」しか返さないので、通常応答で柔軟に対応
+    }
   }
 
   const isDevRequest = /開発して|実装して|母艦に.*追加して|新しいエージェントを作って|機能を追加して/.test(text);
@@ -142,7 +154,22 @@ async function handleMessage(userId: string, text: string): Promise<void> {
 }
 
 async function shouldCreateTask(userMessage: string, aiResponse: string): Promise<boolean> {
-  // 明示的な実行依頼のキーワード
   const actionKeywords = /分析して|最適化して|チェックして|レポート|調べて|改善して|提案して|比較して|監査して|スクリプト|自動化/;
   return actionKeywords.test(userMessage);
+}
+
+async function isRelatedToDevConversation(message: string, topic: string): Promise<boolean> {
+  try {
+    const { text } = await callClaude({
+      system: `ユーザーのメッセージが、進行中の開発会話（トピック: 「${topic}」）への返答かどうか判定してください。
+開発への返答・質問・指示なら "YES"、全く別の話題なら "NO" とだけ返してください。`,
+      messages: [{ role: 'user', content: message }],
+      model: 'default',
+      maxTokens: 8,
+    });
+    return text.trim().toUpperCase().includes('YES');
+  } catch {
+    // 判定失敗時は開発会話として扱う（安全側）
+    return true;
+  }
 }

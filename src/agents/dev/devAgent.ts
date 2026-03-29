@@ -49,7 +49,7 @@ export class DevAgent implements Agent {
   async handleMessage(userId: string, text: string): Promise<void> {
     try {
       // キャンセル処理
-      if (/^(開発キャンセル|開発中止)$/.test(text.trim())) {
+      if (/開発(キャンセル|中止|やめ)|やめて|やめる|キャンセル/.test(text.trim())) {
         const conv = getActiveConversation(userId);
         if (conv) {
           cancelConversation(conv.id);
