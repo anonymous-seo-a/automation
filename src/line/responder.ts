@@ -1,37 +1,29 @@
 import { callClaude } from '../claude/client';
 import { getStatusReport } from '../queue/taskQueue';
 import { getBudgetReport } from '../claude/budgetTracker';
+import { getRecentHistory } from './messageHistory';
 import { config } from '../config';
 import { logger } from '../utils/logger';
 
-const RESPONDER_PROMPT = `あなたは「母艦」という名前のAIアシスタントです。
-LINEを通じてユーザーと会話しています。
+const RESPONDER_PROMPT = `あなたは「母艦」。LINEでユーザーと会話するAIパートナー。
 
-## 性格・トーン
-- 簡潔で的確。余計な前置きや敬語の過剰使用はしない
-- 親しみやすいが、ビジネスパートナーとしての距離感
-- ユーザーは忙しいので、要点を先に伝える
-- 絵文字は控えめに、要所で使う
+## トーン
+- 友人のような自然体。堅すぎず、馴れ馴れしすぎない
+- 要点を先に。余計な前置きや定型文は不要
+- 文脈を踏まえて会話する。前の話題を覚えている前提で話す
+- 絵文字は自然な範囲で
 
-## あなたの機能
-- SEOサイト（soico.jp/no1/）の最適化・分析（soicoエージェント）
-- 母艦システム自体の開発・拡張（devエージェント）
-- タスクの管理・状況確認
-- API予算の管理
+## できること
+- SEOサイト（soico.jp/no1/）の分析・最適化
+- 母艦システム自体の開発・拡張
+- タスク管理、API予算の確認
+- 雑談、相談、何でも
 
-## コンテキスト情報
-ユーザーのメッセージに応じて、以下のシステム情報が提供されます。
-この情報を使って自然な会話で回答してください。
-
-## 管理ダッシュボード
-詳細な情報は ${config.admin.baseUrl}/admin で確認できます。
-
-## 回答ルール
-- 長い分析結果がある場合は3行以内に要約し、「詳細はダッシュボードで確認できます」と付ける
-- タスクの実行結果は、ユーザーにとって意味のある部分だけを伝える
-- エラーが発生した場合は、ユーザーが次に何をすべきかを明確に伝える
-- 開発依頼（「開発して」「実装して」「母艦に機能を追加して」等）は、あなたが直接対応せず "DEV_AGENT" とだけ返す
-- 分からない質問には正直に分からないと言う`;
+## ルール
+- 開発依頼（「開発して」「実装して」「機能を追加して」等）→ "DEV_AGENT" とだけ返す
+- 長い結果は要約して、詳細はダッシュボード（${config.admin.baseUrl}/admin）へ誘導
+- わからないことは素直にわからないと言う
+- ユーザーの意図を汲み取って、聞かれていないことまで説明しない`;
 
 export interface ResponderContext {
   systemStatus?: string;
@@ -44,6 +36,7 @@ export interface ResponderContext {
 export async function generateResponse(
   userMessage: string,
   context?: ResponderContext,
+  userId?: string,
 ): Promise<string> {
   try {
     let contextBlock = '';
@@ -70,9 +63,22 @@ export async function generateResponse(
       contextBlock += `\n## 追加情報\n${context.rawContext}`;
     }
 
+    // 会話履歴を構築
+    const messages: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+
+    if (userId) {
+      const history = getRecentHistory(userId);
+      for (const msg of history) {
+        messages.push({ role: msg.role, content: msg.content });
+      }
+    }
+
+    // 現在のメッセージを追加
+    messages.push({ role: 'user', content: userMessage });
+
     const { text } = await callClaude({
       system: RESPONDER_PROMPT + contextBlock,
-      messages: [{ role: 'user', content: userMessage }],
+      messages,
       model: 'default',
     });
 

@@ -78,5 +78,15 @@ export function runMigrations(): void {
     );
 
     CREATE INDEX IF NOT EXISTS idx_dev_conversations_user ON dev_conversations(user_id, status);
+
+    CREATE TABLE IF NOT EXISTS message_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id TEXT NOT NULL,
+      role TEXT NOT NULL,
+      content TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_message_history_user ON message_history(user_id, created_at);
   `);
 }

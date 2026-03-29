@@ -8,6 +8,7 @@ import { enqueueTask } from '../queue/taskQueue';
 import { getActiveConversation } from '../agents/dev/conversation';
 import { DevAgent } from '../agents/dev/devAgent';
 import { generateResponse, gatherSystemContext } from './responder';
+import { saveMessage } from './messageHistory';
 import { logger } from '../utils/logger';
 
 const devAgent = new DevAgent();
@@ -72,15 +73,18 @@ async function handleMessage(userId: string, text: string): Promise<void> {
     return;
   }
 
+  // ユーザーのメッセージを履歴に保存
+  saveMessage(userId, 'user', text);
+
   // 全てのメッセージをClaude経由で処理
   try {
     // システム状況を収集
     const systemContext = await gatherSystemContext();
 
-    // Claudeで意図を判定しつつ自然な応答を生成
+    // Claudeで意図を判定しつつ自然な応答を生成（会話履歴付き）
     const response = await generateResponse(text, {
       systemStatus: systemContext,
-    });
+    }, userId);
 
     // DEV_AGENT トリガーの場合（Claudeが開発依頼と判断）
     if (response.trim() === 'DEV_AGENT') {
@@ -97,9 +101,11 @@ async function handleMessage(userId: string, text: string): Promise<void> {
       if (interpreted.confirmation_needed) {
         const clarifyResponse = await generateResponse(
           `ユーザーの指示「${text}」について確認が必要です: ${interpreted.clarification_question}`,
-          { rawContext: '確認事項をユーザーに自然に質問してください。' }
+          { rawContext: '確認事項をユーザーに自然に質問してください。' },
+          userId,
         );
         await sendLineMessage(userId, clarifyResponse);
+        saveMessage(userId, 'assistant', clarifyResponse);
         return;
       }
 
@@ -110,12 +116,15 @@ async function handleMessage(userId: string, text: string): Promise<void> {
       const taskNames = interpreted.tasks.map(t => t.description).join('\n');
       const queueResponse = await generateResponse(
         `「${text}」を受けて以下のタスクをキューに追加しました:\n${taskNames}\n\n推定API呼び出し: ${interpreted.estimated_api_calls}回`,
-        { rawContext: 'タスクが正常にキューに入ったことをユーザーに伝えてください。' }
+        { rawContext: 'タスクが正常にキューに入ったことをユーザーに伝えてください。' },
+        userId,
       );
       await sendLineMessage(userId, queueResponse);
+      saveMessage(userId, 'assistant', queueResponse);
     } else {
       // タスク不要 → そのまま応答
       await sendLineMessage(userId, response);
+      saveMessage(userId, 'assistant', response);
     }
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
@@ -123,10 +132,12 @@ async function handleMessage(userId: string, text: string): Promise<void> {
 
     const errorResponse = await generateResponse(
       `エラーが発生しました: ${errMsg.slice(0, 200)}`,
-      { rawContext: 'エラーをユーザーに伝え、次に何をすべきか提案してください。' }
+      { rawContext: 'エラーをユーザーに伝え、次に何をすべきか提案してください。' },
+      userId,
     ).catch(() => `エラーが発生しました。ダッシュボードで詳細を確認してください: ${config.admin.baseUrl}/admin`);
 
     await sendLineMessage(userId, errorResponse);
+    saveMessage(userId, 'assistant', errorResponse);
   }
 }
 
