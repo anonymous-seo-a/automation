@@ -6,7 +6,11 @@ import { sendLineMessage } from './sender';
 import { interpretTask } from '../interpreter/taskInterpreter';
 import { enqueueTask, getStatusReport } from '../queue/taskQueue';
 import { getBudgetReport } from '../claude/budgetTracker';
+import { getActiveConversation } from '../agents/dev/conversation';
+import { DevAgent } from '../agents/dev/devAgent';
 import { logger } from '../utils/logger';
+
+const devAgent = new DevAgent();
 
 const lineMiddlewareConfig = {
   channelSecret: config.line.channelSecret,
@@ -58,6 +62,26 @@ async function handleMessage(userId: string, text: string): Promise<void> {
 
   if (text === 'ping') {
     await sendLineMessage(userId, 'pong 🏓 母艦稼働中');
+    return;
+  }
+
+  // 開発キャンセル
+  if (/^(開発キャンセル|開発中止)$/.test(text)) {
+    await devAgent.handleMessage(userId, text);
+    return;
+  }
+
+  // 開発エージェントへの分岐
+  const activeDevConv = getActiveConversation(userId);
+  if (activeDevConv) {
+    // 進行中の開発会話がある場合は全メッセージをdevAgentに転送
+    await devAgent.handleMessage(userId, text);
+    return;
+  }
+
+  const isDevRequest = /開発して|実装して|母艦に.*追加して|新しいエージェントを作って|機能を追加して/.test(text);
+  if (isDevRequest) {
+    await devAgent.handleMessage(userId, text);
     return;
   }
 

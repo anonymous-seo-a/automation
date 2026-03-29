@@ -64,5 +64,19 @@ export function runMigrations(): void {
       metadata TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+
+    CREATE TABLE IF NOT EXISTS dev_conversations (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'hearing',
+      topic TEXT NOT NULL,
+      hearing_log TEXT DEFAULT '[]',
+      requirements TEXT,
+      generated_files TEXT DEFAULT '[]',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_dev_conversations_user ON dev_conversations(user_id, status);
   `);
 }
