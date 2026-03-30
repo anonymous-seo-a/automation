@@ -228,7 +228,7 @@ export class DevAgent implements Agent {
       messages: [
         { role: 'user', content: `開発依頼: ${initialMessage}\n\nヒアリングログ:\n${JSON.stringify(hearingLog)}\n\n現在のヒアリング回数: 1/${MAX_HEARING_ROUNDS}` },
       ],
-      model: 'default',
+      model: 'opus',
     });
 
     dbLog('info', 'dev-agent', `[PM] ヒアリング応答: ${text.slice(0, 100)}`, { convId: conv.id });
@@ -257,7 +257,7 @@ export class DevAgent implements Agent {
       messages: [
         { role: 'user', content: `開発依頼: ${conv.topic}\n\nヒアリングログ:\n${JSON.stringify(hearingLog)}\n\nユーザーの最新回答: ${userReply}\n\n現在のヒアリング回数: ${round}/${MAX_HEARING_ROUNDS}` },
       ],
-      model: 'default',
+      model: 'opus',
     });
 
     dbLog('info', 'dev-agent', `[PM] ヒアリング応答: ${text.slice(0, 100)}`, { convId: conv.id });
@@ -591,7 +591,7 @@ export class DevAgent implements Agent {
         const { text: engineerOutput } = await callClaude({
           system: DEV_SYSTEM_PROMPT + '\n\n' + ENGINEER_PROMPT,
           messages,
-          model: 'default',
+          model: 'opus',
           maxTokens: 16384,
         });
 
@@ -624,7 +624,7 @@ export class DevAgent implements Agent {
       const { text: reviewOutput } = await callClaude({
         system: DEV_SYSTEM_PROMPT + '\n\n' + REVIEWER_PROMPT,
         messages: [{ role: 'user', content: reviewContext }],
-        model: 'default',
+        model: 'opus',
       });
 
       const reviewParsed = safeParseJson(reviewOutput);
@@ -842,7 +842,7 @@ export class DevAgent implements Agent {
             `## 重要\n- 既存ファイルのimportパスや型定義に合わせてください\n- 存在しないモジュールをimportしないでください\n\n` +
             `全ファイルをまとめて修正してください。出力形式:\n{"files": [{"path": "...", "content": "...", "action": "..."}]}`,
         }],
-        model: 'default',
+        model: 'opus',
         maxTokens: 16384,
       });
 
@@ -913,7 +913,7 @@ export class DevAgent implements Agent {
             `## 重要\n- ランタイムエラー（起動時に落ちる原因）を特定して修正してください\n- importの不整合、未定義変数、型ミスマッチ等を確認\n- NODE_ENV=test時はLINE/Telegram送信がスキップされます\n\n` +
             `全ファイルをまとめて修正してください。出力形式:\n{"files": [{"path": "...", "content": "...", "action": "..."}]}`,
         }],
-        model: 'default',
+        model: 'opus',
         maxTokens: 16384,
       });
 
