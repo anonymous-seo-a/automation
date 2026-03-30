@@ -148,6 +148,14 @@ export async function handleMessage(userId: string, text: string): Promise<void>
     return;
   }
 
+  // ★ 実装中/テスト中: 進捗通知（「中止」で脱出可能なことを伝える）
+  if (activeDevConv && ['approved', 'implementing', 'testing'].includes(activeDevConv.status)) {
+    dbLog('info', 'webhook', `実装中メッセージ受信: "${text.slice(0, 20)}" (status=${activeDevConv.status})`);
+    const statusLabel = activeDevConv.status === 'testing' ? 'テスト・デプロイ' : '実装';
+    await sendLineMessage(userId, `現在${statusLabel}中です。完了次第ご報告します。\n（「中止」で開発をキャンセルできます）`);
+    return;
+  }
+
   // ★ defining フェーズ: OKか修正指示のみdevへ
   if (activeDevConv && activeDevConv.status === 'defining') {
     if (isDefiningResponse(text)) {

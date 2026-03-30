@@ -25,7 +25,9 @@ export interface DevConversation {
 
 export function getActiveConversation(userId: string): DevConversation | null {
   const db = getDB();
-  // hearing/defining は10分で自動期限切れ（SQLレベルで除外）
+  // ステータス別タイムアウト:
+  //   hearing/defining: 10分（ユーザー応答待ち）
+  //   approved/implementing/testing/stuck: 30分（処理中 or クラッシュ復旧）
   const row = db.prepare(`
     SELECT * FROM dev_conversations
     WHERE user_id = ?
@@ -34,9 +36,29 @@ export function getActiveConversation(userId: string): DevConversation | null {
         status IN ('hearing', 'defining')
         AND updated_at < datetime('now', '-10 minutes')
       )
+      AND NOT (
+        status IN ('approved', 'implementing', 'testing', 'stuck')
+        AND updated_at < datetime('now', '-30 minutes')
+      )
     ORDER BY created_at DESC
     LIMIT 1
   `).get(userId) as DevConversation | undefined;
+
+  // タイムアウトした会話を failed に遷移（次回の新規会話をブロックしないよう）
+  if (!row) {
+    db.prepare(`
+      UPDATE dev_conversations
+      SET status = 'failed', updated_at = datetime('now')
+      WHERE user_id = ?
+        AND status NOT IN ('deployed', 'failed')
+        AND (
+          (status IN ('hearing', 'defining') AND updated_at < datetime('now', '-10 minutes'))
+          OR
+          (status IN ('approved', 'implementing', 'testing', 'stuck') AND updated_at < datetime('now', '-30 minutes'))
+        )
+    `).run(userId);
+  }
+
   return row || null;
 }
 

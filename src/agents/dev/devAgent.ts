@@ -318,7 +318,14 @@ export class DevAgent implements Agent {
       updateConversationStatus(conv.id, 'approved');
       dbLog('info', 'dev-agent', '[PM] 要件承認 → 実装開始', { convId: conv.id });
       await sendLineMessage(conv.user_id, '実装を開始します。チーム体制で進めます。\n（PM → エンジニア → レビュアー の順で各ファイルを処理）');
-      await this.runImplementation(conv);
+      // 実装は非同期で実行（safeExecutePhaseの5分タイムアウトを回避）
+      // runImplementation は独自のtry/catch/finallyで全てのエラーを処理する
+      this.runImplementation(conv).catch(err => {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        dbLog('error', 'dev-agent', `[チーム] 実装未捕捉エラー: ${errMsg}`, { convId: conv.id });
+        updateConversationStatus(conv.id, 'failed');
+        sendLineMessage(conv.user_id, `実装中に予期しないエラー:\n${errMsg.slice(0, 300)}\n\n新しい開発依頼でリトライできます。`).catch(() => {});
+      });
     } else {
       dbLog('info', 'dev-agent', '[PM] 要件修正指示を受信', { convId: conv.id });
       await sendLineMessage(conv.user_id, '要件を修正中...');
@@ -501,11 +508,16 @@ export class DevAgent implements Agent {
     if (/^スキップ/.test(normalizedReply)) {
       dbLog('info', 'dev-agent', `[stuck] サブタスク ${ctx.failedSubtaskIndex + 1} をスキップ`, { convId: conv.id });
       this.stuckContextMap.delete(conv.id);
-      await this.runImplementation(conv, {
+      this.runImplementation(conv, {
         branchName: ctx.branchName,
         subtasks: ctx.subtasks,
         completedFiles: ctx.completedFiles,
         startIndex: ctx.failedSubtaskIndex + 1,
+      }).catch(err => {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        dbLog('error', 'dev-agent', `[チーム] 再開未捕捉エラー: ${errMsg}`, { convId: conv.id });
+        updateConversationStatus(conv.id, 'failed');
+        sendLineMessage(conv.user_id, `再開中にエラー:\n${errMsg.slice(0, 300)}`).catch(() => {});
       });
       return;
     }
@@ -520,11 +532,16 @@ export class DevAgent implements Agent {
     }
 
     this.stuckContextMap.delete(conv.id);
-    await this.runImplementation(conv, {
+    this.runImplementation(conv, {
       branchName: ctx.branchName,
       subtasks: ctx.subtasks,
       completedFiles: ctx.completedFiles,
       startIndex: ctx.failedSubtaskIndex,
+    }).catch(err => {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      dbLog('error', 'dev-agent', `[チーム] リトライ未捕捉エラー: ${errMsg}`, { convId: conv.id });
+      updateConversationStatus(conv.id, 'failed');
+      sendLineMessage(conv.user_id, `リトライ中にエラー:\n${errMsg.slice(0, 300)}`).catch(() => {});
     });
   }
 
