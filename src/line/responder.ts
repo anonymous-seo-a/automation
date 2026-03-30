@@ -4,8 +4,24 @@ import { getBudgetReport } from '../claude/budgetTracker';
 import { getRecentHistory } from './messageHistory';
 import { buildSmartContext } from '../memory/store';
 import { buildBunshinPrompt } from './bunshinPrompt';
+import { buildSelfAwarenessContext } from '../github/client';
 import { config } from '../config';
 import { logger } from '../utils/logger';
+
+/** ユーザーがシステム自身について質問しているか判定 */
+function isSelfReferentialQuery(text: string): boolean {
+  const keywords = [
+    '母艦', 'システム', 'ボット', 'bot',
+    'あなた', 'お前', '君',
+    '機能', 'できること', '何ができ',
+    '最新', 'アップデート', '更新', '変更',
+    'バージョン', 'コミット', 'commit',
+    '開発状況', '実装', 'ステータス', 'status',
+    '自分', '自己紹介', 'github', 'GitHub',
+  ];
+  const lower = text.toLowerCase();
+  return keywords.some(kw => lower.includes(kw.toLowerCase()));
+}
 
 export interface ResponderContext {
   systemStatus?: string;
@@ -68,6 +84,16 @@ export async function generateResponse(
         memoryContext = await buildSmartContext(userId, userMessage);
       } catch (err) {
         logger.warn('スマートコンテキスト構築失敗', { err: err instanceof Error ? err.message : String(err) });
+      }
+    }
+
+    // 自己参照的な質問にはGitHub情報を注入
+    if (isSelfReferentialQuery(userMessage)) {
+      try {
+        const selfContext = await buildSelfAwarenessContext();
+        contextBlock += `\n${selfContext}`;
+      } catch (err) {
+        logger.warn('GitHub自己認識コンテキスト取得失敗', { err: err instanceof Error ? err.message : String(err) });
       }
     }
 

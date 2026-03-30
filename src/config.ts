@@ -43,6 +43,12 @@ export const config = {
     allowedChatId: process.env.TELEGRAM_ALLOWED_CHAT_ID || '',
     webhookSecret: process.env.TELEGRAM_WEBHOOK_SECRET || '',
   },
+  github: {
+    token: process.env.GITHUB_TOKEN || '',
+    owner: process.env.GITHUB_OWNER || 'anonymous-seo-a',
+    repo: process.env.GITHUB_REPO || 'automation',
+    branch: process.env.GITHUB_BRANCH || 'dev/initial-build',
+  },
   admin: {
     password: process.env.ADMIN_PASSWORD || 'mothership2026',
     baseUrl: process.env.ADMIN_BASE_URL || 'https://bot.anonymous-seo.jp',
