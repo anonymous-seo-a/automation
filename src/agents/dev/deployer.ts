@@ -5,6 +5,73 @@ import { logger } from '../../utils/logger';
 
 const PROJECT_ROOT = path.resolve(__dirname, '..', '..', '..');
 
+// ── Git キューロック ──────────────────────────────
+// 同時に複数の会話がgit操作しないよう、キュー方式で直列化する
+interface LockWaiter {
+  resolve: () => void;
+  reject: (err: Error) => void;
+}
+
+let currentLockHolder: string | null = null;
+const lockQueue: Array<{ convId: string } & LockWaiter> = [];
+
+/**
+ * Git操作のキューロックを取得する。
+ * 既に別の会話がロックを持っている場合、キューに入って順番待ちする。
+ * @param convId 会話ID（ロック所有者の識別用）
+ * @param timeoutMs 最大待機時間（ms）。超過すると false を返す
+ * @returns ロック取得できたら true
+ */
+export function acquireGitLock(convId: string, timeoutMs = 60_000): Promise<boolean> {
+  // 既に同じ会話が持っている場合は再入可
+  if (currentLockHolder === convId) return Promise.resolve(true);
+
+  // ロックが空いていればそのまま取得
+  if (currentLockHolder === null) {
+    currentLockHolder = convId;
+    logger.info('Gitロック取得', { convId });
+    return Promise.resolve(true);
+  }
+
+  // キューに入って待つ
+  return new Promise<boolean>((resolve) => {
+    const timer = setTimeout(() => {
+      // タイムアウト: キューから自分を除去して false を返す
+      const idx = lockQueue.findIndex(w => w.convId === convId);
+      if (idx !== -1) lockQueue.splice(idx, 1);
+      logger.warn('Gitロックタイムアウト', { convId, timeoutMs });
+      resolve(false);
+    }, timeoutMs);
+
+    lockQueue.push({
+      convId,
+      resolve: () => { clearTimeout(timer); resolve(true); },
+      reject: () => { clearTimeout(timer); resolve(false); },
+    });
+    logger.info('Gitロック待機キューに追加', { convId, queueLength: lockQueue.length });
+  });
+}
+
+/**
+ * Git操作のロックを解放する。キューに次の待機者がいれば自動で渡す。
+ */
+export function releaseGitLock(convId: string): void {
+  if (currentLockHolder !== convId) {
+    logger.warn('Gitロック解放: 所有者不一致', { convId, holder: currentLockHolder });
+    return;
+  }
+
+  if (lockQueue.length > 0) {
+    const next = lockQueue.shift()!;
+    currentLockHolder = next.convId;
+    logger.info('Gitロック引き継ぎ', { from: convId, to: next.convId });
+    next.resolve();
+  } else {
+    currentLockHolder = null;
+    logger.info('Gitロック解放', { convId });
+  }
+}
+
 export interface FileToWrite {
   path: string;
   content: string;

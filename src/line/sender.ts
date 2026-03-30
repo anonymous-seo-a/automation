@@ -24,13 +24,31 @@ export function getActiveSendTo(): string {
 
 /**
  * ユニファイド送信関数: userId が "tg:" プレフィックスならTelegram、それ以外はLINE
+ * 1回リトライ付き（1秒待機後に再送）
  */
 export async function sendMessage(userId: string, text: string): Promise<void> {
-  if (userId.startsWith('tg:')) {
-    const chatId = userId.slice(3);
-    await sendTelegramMessage(chatId, text);
-  } else {
-    await sendLineMessageDirect(userId, text);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      if (userId.startsWith('tg:')) {
+        const chatId = userId.slice(3);
+        await sendTelegramMessage(chatId, text);
+      } else {
+        await sendLineMessageDirect(userId, text);
+      }
+      return; // 成功
+    } catch (err) {
+      if (attempt === 0) {
+        logger.warn('メッセージ送信失敗、1秒後にリトライ', {
+          userId, err: err instanceof Error ? err.message : String(err),
+        });
+        await new Promise(r => setTimeout(r, 1000));
+      } else {
+        logger.error('メッセージ送信リトライも失敗', {
+          userId, err: err instanceof Error ? err.message : String(err),
+        });
+        // 握り潰す（通知失敗でプロセスを落とさない）
+      }
+    }
   }
 }
 
@@ -40,20 +58,12 @@ export async function sendLineMessage(userId: string, text: string): Promise<voi
 }
 
 async function sendLineMessageDirect(userId: string, text: string): Promise<void> {
-  try {
-    const chunks = splitMessage(text);
-    for (const chunk of chunks) {
-      await client.pushMessage({
-        to: userId,
-        messages: [{ type: 'text', text: chunk }],
-      });
-    }
-  } catch (err: any) {
-    if (err?.status === 429 || err?.statusCode === 429) {
-      logger.error('LINE送信失敗: 月間メッセージ上限到達', { userId });
-    } else {
-      logger.error('LINE送信エラー', { err: err instanceof Error ? err.message : String(err), userId });
-    }
+  const chunks = splitMessage(text);
+  for (const chunk of chunks) {
+    await client.pushMessage({
+      to: userId,
+      messages: [{ type: 'text', text: chunk }],
+    });
   }
 }
 

@@ -31,12 +31,15 @@ import {
   commitAndStay,
   readProjectFile,
   FileToWrite,
+  acquireGitLock,
+  releaseGitLock,
 } from './deployer';
 
 const MAX_BUILD_RETRIES = 5;
 const MAX_HEARING_ROUNDS = 3;
 const MAX_REVIEW_RETRIES = 3;
 const MAX_ENGINEER_PARSE_RETRIES = 3;
+const PHASE_TIMEOUT_MS = 5 * 60 * 1000; // 各フェーズ最大5分
 
 interface Subtask {
   index: number;
@@ -45,8 +48,33 @@ interface Subtask {
   description: string;
 }
 
+interface StuckContext {
+  branchName: string;
+  subtasks: Subtask[];
+  completedFiles: Array<{ path: string; content: string }>;
+  failedSubtaskIndex: number;
+  errorMessage: string;
+  phase: string; // エラーが起きたフェーズ名
+}
+
+/**
+ * タイムアウト付きでPromiseを実行するヘルパー
+ */
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label}: ${ms / 1000}秒でタイムアウト`)), ms);
+    promise.then(
+      val => { clearTimeout(timer); resolve(val); },
+      err => { clearTimeout(timer); reject(err); },
+    );
+  });
+}
+
 export class DevAgent implements Agent {
   name = 'dev';
+
+  // 会話ID → stuckコンテキストのマッピング（シングルトンでも安全）
+  private stuckContextMap = new Map<string, StuckContext>();
 
   async execute(task: Task): Promise<TaskResult> {
     return {
@@ -61,6 +89,7 @@ export class DevAgent implements Agent {
       if (/開発(キャンセル|中止|やめ)|やめて|やめる|キャンセル|別の話/.test(text.trim())) {
         const conv = getActiveConversation(userId);
         if (conv) {
+          this.cleanupConversation(conv.id, conv.user_id);
           cancelConversation(conv.id);
           dbLog('info', 'dev-agent', `開発キャンセル: ${conv.topic}`, { convId: conv.id });
           await sendLineMessage(userId, '開発を中止しました。');
@@ -76,7 +105,7 @@ export class DevAgent implements Agent {
         conv = createConversation(userId, text);
         dbLog('info', 'dev-agent', `新規開発会話: ${text.slice(0, 60)}`, { convId: conv.id });
         await sendLineMessage(userId, `「${text}」について、いくつか確認させてください。`);
-        await this.runHearing(conv, text);
+        await this.safeExecutePhase(conv, 'hearing', () => this.runHearing(conv!, text));
         return;
       }
 
@@ -84,13 +113,13 @@ export class DevAgent implements Agent {
 
       switch (conv.status) {
         case 'hearing':
-          await this.handleHearing(conv, text);
+          await this.safeExecutePhase(conv, 'hearing', () => this.handleHearing(conv!, text));
           break;
         case 'defining':
-          await this.handleDefining(conv, text);
+          await this.safeExecutePhase(conv, 'defining', () => this.handleDefining(conv!, text));
           break;
         case 'stuck':
-          await this.handleStuck(conv, text);
+          await this.safeExecutePhase(conv, 'stuck', () => this.handleStuck(conv!, text));
           break;
         case 'approved':
         case 'implementing':
@@ -103,11 +132,77 @@ export class DevAgent implements Agent {
           break;
       }
     } catch (err) {
+      // 最終安全弁: ここに来たら何かが本当におかしい
       const errMsg = err instanceof Error ? err.message : String(err);
-      logger.error('DevAgent処理エラー', { err: errMsg, userId });
-      dbLog('error', 'dev-agent', `処理エラー: ${errMsg.slice(0, 200)}`, { userId });
-      await sendLineMessage(userId, `開発エージェントエラー:\n${errMsg.slice(0, 300)}`);
+      logger.error('DevAgent最終エラーハンドラ', { err: errMsg, userId });
+      dbLog('error', 'dev-agent', `最終エラー: ${errMsg.slice(0, 200)}`, { userId });
+      try {
+        await sendLineMessage(userId, `開発エージェントでエラーが発生しました:\n${errMsg.slice(0, 300)}\n\n新しい開発依頼を送ってリトライできます。`);
+      } catch {
+        // 送信も失敗した場合はログだけ
+        logger.error('エラー通知送信も失敗', { userId });
+      }
     }
+  }
+
+  /**
+   * 各フェーズをtry/catchで安全に実行。
+   * エラー時は途中作業を保全しつつ、ユーザーに選択肢を提示する。
+   */
+  private async safeExecutePhase(
+    conv: DevConversation,
+    phaseName: string,
+    fn: () => Promise<void>,
+  ): Promise<void> {
+    try {
+      await withTimeout(fn(), PHASE_TIMEOUT_MS, `${phaseName}フェーズ`);
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      dbLog('error', 'dev-agent', `[${phaseName}] フェーズエラー: ${errMsg.slice(0, 200)}`, { convId: conv.id });
+
+      // hearing/defining フェーズはstuckに移行せず、即座にfailed + 通知
+      if (phaseName === 'hearing' || phaseName === 'defining') {
+        updateConversationStatus(conv.id, 'failed');
+        await sendLineMessage(conv.user_id,
+          `${phaseName}フェーズでエラーが発生しました:\n${errMsg.slice(0, 300)}\n\n` +
+          `新しい開発依頼を送り直してください。`
+        ).catch(() => {});
+        return;
+      }
+
+      // implementing/stuck フェーズは途中作業を保全してstuckに移行
+      if (conv.status !== 'stuck') {
+        updateConversationStatus(conv.id, 'stuck');
+      }
+
+      // stuckコンテキストが無ければ作成
+      if (!this.stuckContextMap.has(conv.id)) {
+        this.stuckContextMap.set(conv.id, {
+          branchName: '',
+          subtasks: [],
+          completedFiles: [],
+          failedSubtaskIndex: 0,
+          errorMessage: errMsg,
+          phase: phaseName,
+        });
+      } else {
+        const ctx = this.stuckContextMap.get(conv.id)!;
+        ctx.errorMessage = errMsg;
+        ctx.phase = phaseName;
+      }
+
+      await sendLineMessage(conv.user_id,
+        `${phaseName}フェーズでエラーが発生しました:\n${errMsg.slice(0, 300)}\n\n` +
+        `選択肢:\n` +
+        `・「リトライ」→ 再試行\n` +
+        `・「中止」→ 開発を中止（完了分はブランチに残ります）`
+      ).catch(() => {});
+    }
+  }
+
+  /** 会話に関連するリソースのクリーンアップ */
+  private cleanupConversation(convId: string, _userId: string): void {
+    this.stuckContextMap.delete(convId);
   }
 
   // ========================================
@@ -170,7 +265,7 @@ export class DevAgent implements Agent {
       dbLog('info', 'dev-agent', '[PM] ヒアリング完了 → 要件定義へ', { convId: conv.id });
       appendHearingLog(conv.id, 'agent', parsed.summary || 'ヒアリング完了');
       await this.transitionToDefining(conv);
-    } else if (parsed && parsed.questions && parsed.questions.length > 0) {
+    } else if (parsed && parsed.questions && Array.isArray(parsed.questions) && parsed.questions.length > 0) {
       const questions = (parsed.questions as string[]).slice(0, 3);
       const msg = questions.map((q: string, i: number) => `${i + 1}. ${q}`).join('\n') + '\n\n（「やめる」で中止できます）';
       appendHearingLog(conv.id, 'agent', msg);
@@ -255,18 +350,31 @@ export class DevAgent implements Agent {
     const allFiles: FileToWrite[] = [];
     const completedFiles: Array<{ path: string; content: string }> = resumeFrom?.completedFiles || [];
     let startIndex = resumeFrom?.startIndex || 0;
+    let gitLockAcquired = false;
 
     try {
       // 新規開始の場合
       if (!resumeFrom) {
+        // Gitロック取得（キュー待ち）
+        await sendLineMessage(conv.user_id, 'Gitロック取得中...');
+        gitLockAcquired = await acquireGitLock(conv.id, 60_000);
+        if (!gitLockAcquired) {
+          throw new Error('Git操作のロック取得に失敗しました（他の開発が進行中の可能性）');
+        }
+
         branchName = await prepareGitBranch();
         dbLog('info', 'dev-agent', `[チーム] ブランチ作成: ${branchName}`, { convId: conv.id });
         await sendLineMessage(conv.user_id, `ブランチ: ${branchName}`);
 
         subtasks = await this.pmDecompose(updatedConv);
         dbLog('info', 'dev-agent', `[PM] サブタスク分解完了: ${subtasks.length}件`, { convId: conv.id });
-        await sendLineMessage(conv.user_id, `📋 ${subtasks.length}個のサブタスクに分解しました:\n${subtasks.map(s => `${s.index}. ${s.path}`).join('\n')}`);
+        await sendLineMessage(conv.user_id, `${subtasks.length}個のサブタスクに分解しました:\n${subtasks.map(s => `${s.index}. ${s.path}`).join('\n')}`);
       } else {
+        // 再開時もロック取得
+        gitLockAcquired = await acquireGitLock(conv.id, 60_000);
+        if (!gitLockAcquired) {
+          throw new Error('Git操作のロック取得に失敗しました');
+        }
         await sendLineMessage(conv.user_id, `サブタスク ${startIndex + 1} から再開します...`);
       }
 
@@ -281,26 +389,29 @@ export class DevAgent implements Agent {
           completedFiles.push({ path: file.path, content: file.content });
 
           await writeFiles([file]);
-
-          // サブタスクごとにcommitして成果を保護
           await commitAndStay(branchName, `feat: ${subtask.path} - ${subtask.description.slice(0, 50)}`);
 
-          await sendLineMessage(conv.user_id, `📦 ${subtask.index}/${subtasks.length} 完了: ${subtask.path}`);
+          await sendLineMessage(conv.user_id, `${subtask.index}/${subtasks.length} 完了: ${subtask.path}`);
         } catch (subtaskErr) {
           const errMsg = subtaskErr instanceof Error ? subtaskErr.message : String(subtaskErr);
           dbLog('error', 'dev-agent', `[チーム] サブタスク失敗: ${errMsg.slice(0, 200)}`, { convId: conv.id, subtaskIndex: subtask.index });
 
-          // stuckモードに移行（ロールバックしない）
-          this.stuckContext = {
+          // stuckモードに移行（ロールバックしない、ブランチと完了分を保全）
+          this.stuckContextMap.set(conv.id, {
             branchName,
             subtasks,
             completedFiles: [...completedFiles],
             failedSubtaskIndex: i,
             errorMessage: errMsg,
-          };
+            phase: 'implementing',
+          });
           updateConversationStatus(conv.id, 'stuck');
+
+          // ロック解放
+          if (gitLockAcquired) releaseGitLock(conv.id);
+
           await sendLineMessage(conv.user_id,
-            `⚠️ サブタスク ${subtask.index}/${subtasks.length} (${subtask.path}) で問題が発生しました:\n` +
+            `サブタスク ${subtask.index}/${subtasks.length} (${subtask.path}) で問題が発生しました:\n` +
             `${errMsg.slice(0, 300)}\n\n` +
             `完了済み: ${completedFiles.length}/${subtasks.length} ファイル（コミット済み）\n\n` +
             `選択肢:\n` +
@@ -325,34 +436,45 @@ export class DevAgent implements Agent {
       const errMsg = err instanceof Error ? err.message : String(err);
       dbLog('error', 'dev-agent', `[チーム] 実装失敗: ${errMsg.slice(0, 200)}`, { convId: conv.id });
 
-      // 完了済みサブタスクがある場合はブランチを残す
+      // 完了済みサブタスクがある場合はブランチを残してstuckへ
       if (completedFiles.length > 0 && branchName) {
-        await commitAndStay(branchName, `partial: ${completedFiles.length} files completed before error`);
+        await commitAndStay(branchName, `partial: ${completedFiles.length} files completed before error`).catch(() => {});
+
+        this.stuckContextMap.set(conv.id, {
+          branchName,
+          subtasks,
+          completedFiles: [...completedFiles],
+          failedSubtaskIndex: startIndex,
+          errorMessage: errMsg,
+          phase: 'implementing',
+        });
+        updateConversationStatus(conv.id, 'stuck');
+
         await sendLineMessage(conv.user_id,
           `実装中にエラーが発生しました:\n${errMsg.slice(0, 400)}\n\n` +
-          `完了済み ${completedFiles.length} ファイルはブランチ ${branchName} に保存されています。`
-        );
-      } else if (branchName) {
-        await rollbackGit(branchName);
-        await sendLineMessage(conv.user_id, 'コードをロールバックしました。');
+          `完了済み ${completedFiles.length} ファイルはブランチ ${branchName} に保存されています。\n\n` +
+          `選択肢:\n` +
+          `・「リトライ」→ 再試行\n` +
+          `・「中止」→ 開発を中止（完了分はブランチに残ります）`
+        ).catch(() => {});
+      } else {
+        // 何も進んでいない場合はロールバック
+        if (branchName) {
+          await rollbackGit(branchName).catch(() => {});
+        }
+        updateConversationStatus(conv.id, 'failed');
+        await sendLineMessage(conv.user_id,
+          `実装中にエラーが発生しました:\n${errMsg.slice(0, 400)}\n\n` +
+          `コードをロールバックしました。新しい依頼を送ってリトライできます。`
+        ).catch(() => {});
       }
-
-      updateConversationStatus(conv.id, 'failed');
-      await sendLineMessage(conv.user_id, '新しい依頼を送ってリトライできます。');
+    } finally {
+      if (gitLockAcquired) releaseGitLock(conv.id);
     }
   }
 
-  // stuckモードのコンテキスト保持
-  private stuckContext: {
-    branchName: string;
-    subtasks: Subtask[];
-    completedFiles: Array<{ path: string; content: string }>;
-    failedSubtaskIndex: number;
-    errorMessage: string;
-  } | null = null;
-
   private async handleStuck(conv: DevConversation, userReply: string): Promise<void> {
-    const ctx = this.stuckContext;
+    const ctx = this.stuckContextMap.get(conv.id);
     if (!ctx) {
       await sendLineMessage(conv.user_id, 'スタック情報が失われました。新しい開発依頼を送ってください。');
       updateConversationStatus(conv.id, 'failed');
@@ -363,17 +485,16 @@ export class DevAgent implements Agent {
 
     if (/^(中止|キャンセル|やめ)/.test(normalizedReply)) {
       dbLog('info', 'dev-agent', '[stuck] ユーザーが中止を選択', { convId: conv.id });
-      this.stuckContext = null;
+      this.stuckContextMap.delete(conv.id);
       updateConversationStatus(conv.id, 'failed');
-      await sendLineMessage(conv.user_id,
-        `開発を中止しました。完了済みファイルはブランチ ${ctx.branchName} に残っています。`
-      );
+      const branchMsg = ctx.branchName ? `\n完了済みファイルはブランチ ${ctx.branchName} に残っています。` : '';
+      await sendLineMessage(conv.user_id, `開発を中止しました。${branchMsg}`);
       return;
     }
 
     if (/^スキップ/.test(normalizedReply)) {
       dbLog('info', 'dev-agent', `[stuck] サブタスク ${ctx.failedSubtaskIndex + 1} をスキップ`, { convId: conv.id });
-      this.stuckContext = null;
+      this.stuckContextMap.delete(conv.id);
       await this.runImplementation(conv, {
         branchName: ctx.branchName,
         subtasks: ctx.subtasks,
@@ -388,11 +509,11 @@ export class DevAgent implements Agent {
     const failedSubtask = ctx.subtasks[ctx.failedSubtaskIndex];
 
     // ユーザーの追加指示をサブタスクのdescriptionに反映
-    if (!/^リトライ$/.test(normalizedReply)) {
+    if (failedSubtask && !/^リトライ$/.test(normalizedReply)) {
       failedSubtask.description += `\n\n追加指示: ${userReply}`;
     }
 
-    this.stuckContext = null;
+    this.stuckContextMap.delete(conv.id);
     await this.runImplementation(conv, {
       branchName: ctx.branchName,
       subtasks: ctx.subtasks,
@@ -596,8 +717,9 @@ export class DevAgent implements Agent {
       const deployResult = await deployWithHealthCheck(branchName);
       if (deployResult.success) {
         updateConversationStatus(conv.id, 'deployed');
+        this.stuckContextMap.delete(conv.id);
         const updatedConv = getConversation(conv.id) || conv;
-        const generatedFiles = JSON.parse(updatedConv.generated_files || '[]') as string[];
+        const generatedFiles = safeParseJson(updatedConv.generated_files) as string[] || [];
 
         dbLog('info', 'dev-agent', `[チーム] デプロイ成功: ${branchName}`, { convId: conv.id, files: generatedFiles });
         await sendLineMessage(conv.user_id,
@@ -609,6 +731,7 @@ export class DevAgent implements Agent {
         );
       } else {
         updateConversationStatus(conv.id, 'failed');
+        this.stuckContextMap.delete(conv.id);
         dbLog('error', 'dev-agent', `[チーム] デプロイ失敗: ${deployResult.message}`, { convId: conv.id });
         await sendLineMessage(conv.user_id,
           `${deployResult.message}\n前の状態に復帰済みです。`
@@ -672,21 +795,21 @@ export class DevAgent implements Agent {
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
         dbLog('error', 'dev-agent', `[エンジニア] 自動修正失敗: ${errMsg.slice(0, 200)}`, { convId: conv.id });
-        await rollbackGit(branchName);
-        await sendLineMessage(conv.user_id, 'コードをロールバックしました。');
+        await rollbackGit(branchName).catch(() => {});
         updateConversationStatus(conv.id, 'failed');
+        this.stuckContextMap.delete(conv.id);
         await sendLineMessage(conv.user_id,
-          `ビルドエラーの自動修正に失敗しました:\n${errMsg.slice(0, 300)}`
-        );
+          `ビルドエラーの自動修正に失敗しました:\n${errMsg.slice(0, 300)}\n\nコードをロールバックしました。`
+        ).catch(() => {});
       }
     } else {
       dbLog('error', 'dev-agent', `[チーム] ビルド修正${MAX_BUILD_RETRIES}回失敗`, { convId: conv.id });
-      await rollbackGit(branchName);
-      await sendLineMessage(conv.user_id, 'コードをロールバックしました。');
+      await rollbackGit(branchName).catch(() => {});
       updateConversationStatus(conv.id, 'failed');
+      this.stuckContextMap.delete(conv.id);
       await sendLineMessage(conv.user_id,
-        `ビルドエラーを${MAX_BUILD_RETRIES}回修正しましたが解決できませんでした:\n${buildResult.buildOutput?.slice(0, 500)}\n\n手動での修正が必要です。`
-      );
+        `ビルドエラーを${MAX_BUILD_RETRIES}回修正しましたが解決できませんでした:\n${buildResult.buildOutput?.slice(0, 500)}\n\n手動での修正が必要です。コードをロールバックしました。`
+      ).catch(() => {});
     }
   }
 }
