@@ -3,6 +3,7 @@ module.exports = {
     name: 'mothership',
     script: './src/index.ts',
     interpreter: './node_modules/.bin/tsx',
+    exec_mode: 'fork',
     instances: 1,
     autorestart: true,
     watch: false,
