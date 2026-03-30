@@ -53,8 +53,8 @@ async function main(): Promise<void> {
     logger.info('Telegram Webhook 有効: /telegram');
   }
 
-  // 開発用テストエンドポイント（LINE経由せずにタスク投入）
-  if (config.server.env !== 'production') {
+  // テストエンドポイント（LINE経由せずにタスク投入、テスト環境でも使用）
+  if (config.server.env !== 'production' || process.env.NODE_ENV === 'test') {
     app.post('/test/task', express.json(), async (req: Request, res: Response) => {
       try {
         const message = req.body?.message;

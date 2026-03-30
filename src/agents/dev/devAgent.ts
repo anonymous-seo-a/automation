@@ -34,8 +34,14 @@ import {
   acquireGitLock,
   releaseGitLock,
 } from './deployer';
+import {
+  runAllTests,
+  formatTestResults,
+  TestResult,
+} from './tester';
 
 const MAX_BUILD_RETRIES = 5;
+const MAX_TEST_FIX_RETRIES = 3;
 const MAX_HEARING_ROUNDS = 3;
 const MAX_REVIEW_RETRIES = 3;
 const MAX_ENGINEER_PARSE_RETRIES = 3;
@@ -698,7 +704,7 @@ export class DevAgent implements Agent {
   }
 
   // ========================================
-  // Phase 4: ビルド＆デプロイ
+  // Phase 4: ビルド → テスト → 自己修正 → デプロイ
   // ========================================
 
   private async runBuildAndDeploy(
@@ -707,108 +713,230 @@ export class DevAgent implements Agent {
     retryCount: number,
     branchName: string,
   ): Promise<void> {
+    // ── Step 1: ビルド ──
     dbLog('info', 'dev-agent', `[チーム] ビルド開始 (試行 ${retryCount + 1})`, { convId: conv.id });
     const buildResult = await runBuild();
 
-    if (buildResult.success) {
-      dbLog('info', 'dev-agent', '[チーム] ビルド成功 → デプロイ開始', { convId: conv.id });
-      await commitAndStay(branchName, `feat(dev-agent): ${conv.topic}`);
-
-      const deployResult = await deployWithHealthCheck(branchName);
-      if (deployResult.success) {
-        updateConversationStatus(conv.id, 'deployed');
-        this.stuckContextMap.delete(conv.id);
-        const updatedConv = getConversation(conv.id) || conv;
-        const generatedFiles = safeParseJson(updatedConv.generated_files) as string[] || [];
-
-        dbLog('info', 'dev-agent', `[チーム] デプロイ成功: ${branchName}`, { convId: conv.id, files: generatedFiles });
-        await sendLineMessage(conv.user_id,
-          `開発完了!\n\n` +
-          `${conv.topic}\n` +
-          `ブランチ: ${branchName}\n` +
-          `ファイル: ${generatedFiles.join(', ')}\n\n` +
-          `ビルド・デプロイ・ヘルスチェック全て通過。`
-        );
+    if (!buildResult.success) {
+      // ビルド失敗 → 自動修正
+      if (retryCount < MAX_BUILD_RETRIES) {
+        await this.autoFixBuildError(conv, lastFiles, retryCount, branchName, buildResult.buildOutput || '');
       } else {
-        updateConversationStatus(conv.id, 'failed');
-        this.stuckContextMap.delete(conv.id);
-        dbLog('error', 'dev-agent', `[チーム] デプロイ失敗: ${deployResult.message}`, { convId: conv.id });
-        await sendLineMessage(conv.user_id,
-          `${deployResult.message}\n前の状態に復帰済みです。`
-        );
-      }
-    } else if (retryCount < MAX_BUILD_RETRIES) {
-      dbLog('warn', 'dev-agent', `[エンジニア] ビルドエラー → 自動修正 (${retryCount + 1}/${MAX_BUILD_RETRIES})`, {
-        convId: conv.id,
-        buildOutput: buildResult.buildOutput?.slice(0, 300),
-      });
-      await sendLineMessage(conv.user_id,
-        `ビルドエラー検出。自動修正中... (${retryCount + 1}/${MAX_BUILD_RETRIES})`
-      );
-
-      try {
-        // ビルドエラーで参照されている既存ファイルも読み込む
-        const { extractErrorFiles } = await import('./deployer');
-        const errorFiles = extractErrorFiles(buildResult.buildOutput || '');
-        let existingContext = '';
-        for (const ef of errorFiles) {
-          const alreadyInLast = lastFiles.find(f => f.path === ef);
-          if (!alreadyInLast) {
-            const content = await readProjectFile(ef);
-            if (content) {
-              existingContext += `### ${ef}（既存ファイル）\n\`\`\`typescript\n${content}\n\`\`\`\n\n`;
-            }
-          }
-        }
-
-        const { text } = await callClaude({
-          system: DEV_SYSTEM_PROMPT + '\n\n' + ENGINEER_PROMPT,
-          messages: [
-            {
-              role: 'user',
-              content: `以下のコードにビルドエラーがあります。修正してください。\n\n` +
-                `## ビルドエラー\n${buildResult.buildOutput}\n\n` +
-                `## 今回変更したコード\n${lastFiles.map(f => `### ${f.path}\n\`\`\`typescript\n${f.content}\n\`\`\``).join('\n\n')}\n\n` +
-                (existingContext ? `## 関連する既存ファイル（参照用・変更が必要な場合のみ含めてください）\n${existingContext}\n\n` : '') +
-                `## 重要\n- 既存ファイルのimportパスや型定義に合わせてください\n- 存在しないモジュールをimportしないでください\n- package.jsonに無いパッケージは使わないでください\n\n` +
-                `全ファイルをまとめて修正してください。出力形式:\n{"files": [{"path": "...", "content": "...", "action": "..."}]}`,
-            },
-          ],
-          model: 'default',
-          maxTokens: 16384,
-        });
-
-        const parsed = safeParseJson(text);
-        if (parsed && parsed.files && Array.isArray(parsed.files)) {
-          const files = parsed.files as FileToWrite[];
-          await writeFiles(files);
-          await this.runBuildAndDeploy(conv, files, retryCount + 1, branchName);
-        } else if (parsed && parsed.file) {
-          // 単一ファイル形式の場合
-          const file = parsed.file as FileToWrite;
-          await writeFiles([file]);
-          const merged = lastFiles.map(f => f.path === file.path ? file : f);
-          await this.runBuildAndDeploy(conv, merged, retryCount + 1, branchName);
-        } else {
-          throw new Error('修正コードのパースに失敗');
-        }
-      } catch (err) {
-        const errMsg = err instanceof Error ? err.message : String(err);
-        dbLog('error', 'dev-agent', `[エンジニア] 自動修正失敗: ${errMsg.slice(0, 200)}`, { convId: conv.id });
+        dbLog('error', 'dev-agent', `[チーム] ビルド修正${MAX_BUILD_RETRIES}回失敗`, { convId: conv.id });
         await rollbackGit(branchName).catch(() => {});
         updateConversationStatus(conv.id, 'failed');
         this.stuckContextMap.delete(conv.id);
         await sendLineMessage(conv.user_id,
-          `ビルドエラーの自動修正に失敗しました:\n${errMsg.slice(0, 300)}\n\nコードをロールバックしました。`
+          `ビルドエラーを${MAX_BUILD_RETRIES}回修正しましたが解決できませんでした:\n${buildResult.buildOutput?.slice(0, 500)}\n\n手動での修正が必要です。コードをロールバックしました。`
         ).catch(() => {});
       }
+      return;
+    }
+
+    await sendLineMessage(conv.user_id, '🔨 ビルド: OK');
+    dbLog('info', 'dev-agent', '[チーム] ビルド成功 → テスト開始', { convId: conv.id });
+
+    // ── Step 2-3: 起動テスト + 機能テスト ──
+    await sendLineMessage(conv.user_id, '🧪 自動テスト実行中...');
+    const testResults = await runAllTests();
+    const allPassed = testResults.every(r => r.passed);
+
+    if (allPassed) {
+      // 全テスト通過
+      for (const r of testResults) {
+        const icon = r.stage === 'startup' ? '🚀' : '🧪';
+        const name = r.stage === 'startup' ? '起動テスト' : '機能テスト';
+        await sendLineMessage(conv.user_id, `${icon} ${name}: OK`);
+      }
     } else {
-      dbLog('error', 'dev-agent', `[チーム] ビルド修正${MAX_BUILD_RETRIES}回失敗`, { convId: conv.id });
+      // テスト失敗 → 自己修正ループ
+      const failedResult = testResults.find(r => !r.passed)!;
+      const failedName = failedResult.stage === 'startup' ? '起動テスト' : '機能テスト';
+      dbLog('warn', 'dev-agent', `[テスト] ${failedName}失敗`, { convId: conv.id, details: failedResult.details?.slice(0, 300) });
+
+      await sendLineMessage(conv.user_id,
+        `❌ ${failedName}失敗: ${failedResult.message}\n${failedResult.details?.slice(0, 200) || ''}`
+      );
+
+      if (retryCount < MAX_TEST_FIX_RETRIES) {
+        await this.autoFixTestError(conv, lastFiles, retryCount, branchName, testResults);
+      } else {
+        dbLog('error', 'dev-agent', `[チーム] テスト修正${MAX_TEST_FIX_RETRIES}回失敗`, { convId: conv.id });
+        await rollbackGit(branchName).catch(() => {});
+        updateConversationStatus(conv.id, 'failed');
+        this.stuckContextMap.delete(conv.id);
+        await sendLineMessage(conv.user_id,
+          `テスト失敗を${MAX_TEST_FIX_RETRIES}回修正しましたが解決できませんでした。\nコードをロールバックしました。`
+        ).catch(() => {});
+      }
+      return;
+    }
+
+    // ── Step 4: デプロイ ──
+    dbLog('info', 'dev-agent', '[チーム] 全テスト通過 → デプロイ開始', { convId: conv.id });
+    await commitAndStay(branchName, `feat(dev-agent): ${conv.topic}`);
+
+    const deployResult = await deployWithHealthCheck(branchName);
+    if (deployResult.success) {
+      updateConversationStatus(conv.id, 'deployed');
+      this.stuckContextMap.delete(conv.id);
+      const updatedConv = getConversation(conv.id) || conv;
+      const generatedFiles = safeParseJson(updatedConv.generated_files) as string[] || [];
+
+      dbLog('info', 'dev-agent', `[チーム] デプロイ成功: ${branchName}`, { convId: conv.id, files: generatedFiles });
+      await sendLineMessage(conv.user_id,
+        `✅ デプロイ完了!\n\n` +
+        `${conv.topic}\n` +
+        `ブランチ: ${branchName}\n` +
+        `ファイル: ${generatedFiles.join(', ')}\n\n` +
+        `ビルド・起動テスト・機能テスト・ヘルスチェック 全て通過。`
+      );
+    } else {
+      updateConversationStatus(conv.id, 'failed');
+      this.stuckContextMap.delete(conv.id);
+      dbLog('error', 'dev-agent', `[チーム] デプロイ失敗: ${deployResult.message}`, { convId: conv.id });
+      await sendLineMessage(conv.user_id,
+        `${deployResult.message}\n前の状態に復帰済みです。`
+      );
+    }
+  }
+
+  // ── ビルドエラー自動修正 ──
+
+  private async autoFixBuildError(
+    conv: DevConversation,
+    lastFiles: FileToWrite[],
+    retryCount: number,
+    branchName: string,
+    buildOutput: string,
+  ): Promise<void> {
+    dbLog('warn', 'dev-agent', `[エンジニア] ビルドエラー → 自動修正 (${retryCount + 1}/${MAX_BUILD_RETRIES})`, {
+      convId: conv.id,
+      buildOutput: buildOutput.slice(0, 300),
+    });
+    await sendLineMessage(conv.user_id,
+      `🔧 ビルドエラー自動修正中... (${retryCount + 1}/${MAX_BUILD_RETRIES})`
+    );
+
+    try {
+      const { extractErrorFiles } = await import('./deployer');
+      const errorFiles = extractErrorFiles(buildOutput);
+      let existingContext = '';
+      for (const ef of errorFiles) {
+        if (!lastFiles.find(f => f.path === ef)) {
+          const content = await readProjectFile(ef);
+          if (content) {
+            existingContext += `### ${ef}（既存ファイル）\n\`\`\`typescript\n${content}\n\`\`\`\n\n`;
+          }
+        }
+      }
+
+      const { text } = await callClaude({
+        system: DEV_SYSTEM_PROMPT + '\n\n' + ENGINEER_PROMPT,
+        messages: [{
+          role: 'user',
+          content: `以下のコードにビルドエラーがあります。修正してください。\n\n` +
+            `## ビルドエラー\n${buildOutput}\n\n` +
+            `## 今回変更したコード\n${lastFiles.map(f => `### ${f.path}\n\`\`\`typescript\n${f.content}\n\`\`\``).join('\n\n')}\n\n` +
+            (existingContext ? `## 関連する既存ファイル\n${existingContext}\n\n` : '') +
+            `## 重要\n- 既存ファイルのimportパスや型定義に合わせてください\n- 存在しないモジュールをimportしないでください\n\n` +
+            `全ファイルをまとめて修正してください。出力形式:\n{"files": [{"path": "...", "content": "...", "action": "..."}]}`,
+        }],
+        model: 'default',
+        maxTokens: 16384,
+      });
+
+      const parsed = safeParseJson(text);
+      let fixedFiles: FileToWrite[];
+      if (parsed?.files && Array.isArray(parsed.files)) {
+        fixedFiles = parsed.files;
+      } else if (parsed?.file) {
+        fixedFiles = [parsed.file];
+      } else {
+        throw new Error('修正コードのパースに失敗');
+      }
+
+      await writeFiles(fixedFiles);
+      await this.runBuildAndDeploy(conv, fixedFiles, retryCount + 1, branchName);
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      dbLog('error', 'dev-agent', `[エンジニア] ビルド自動修正失敗: ${errMsg.slice(0, 200)}`, { convId: conv.id });
       await rollbackGit(branchName).catch(() => {});
       updateConversationStatus(conv.id, 'failed');
       this.stuckContextMap.delete(conv.id);
       await sendLineMessage(conv.user_id,
-        `ビルドエラーを${MAX_BUILD_RETRIES}回修正しましたが解決できませんでした:\n${buildResult.buildOutput?.slice(0, 500)}\n\n手動での修正が必要です。コードをロールバックしました。`
+        `ビルドエラーの自動修正に失敗しました:\n${errMsg.slice(0, 300)}\n\nコードをロールバックしました。`
+      ).catch(() => {});
+    }
+  }
+
+  // ── テスト失敗自動修正 ──
+
+  private async autoFixTestError(
+    conv: DevConversation,
+    lastFiles: FileToWrite[],
+    retryCount: number,
+    branchName: string,
+    testResults: TestResult[],
+  ): Promise<void> {
+    dbLog('warn', 'dev-agent', `[エンジニア] テスト失敗 → 自動修正 (${retryCount + 1}/${MAX_TEST_FIX_RETRIES})`, { convId: conv.id });
+    await sendLineMessage(conv.user_id,
+      `🔧 テスト失敗の自動修正中... (${retryCount + 1}/${MAX_TEST_FIX_RETRIES})`
+    );
+
+    try {
+      // 関連する既存ファイルも読み込む
+      let existingContext = '';
+      const relevantFiles = ['src/index.ts', 'src/line/sender.ts', 'src/config.ts'];
+      for (const ef of relevantFiles) {
+        if (!lastFiles.find(f => f.path === ef)) {
+          const content = await readProjectFile(ef);
+          if (content) {
+            existingContext += `### ${ef}（既存ファイル）\n\`\`\`typescript\n${content}\n\`\`\`\n\n`;
+          }
+        }
+      }
+
+      const testReport = formatTestResults(testResults);
+
+      const { text } = await callClaude({
+        system: DEV_SYSTEM_PROMPT + '\n\n' + ENGINEER_PROMPT,
+        messages: [{
+          role: 'user',
+          content: `以下のコードはビルドは通りましたが、ランタイムテストで失敗しました。修正してください。\n\n` +
+            `## テスト結果\n${testReport}\n\n` +
+            `## テストの説明\n` +
+            `- 起動テスト: PORT=3999 NODE_ENV=test で別プロセス起動 → /health で200確認\n` +
+            `- 機能テスト: /test/task, /webhook, /telegram のルート存在確認\n\n` +
+            `## 今回変更したコード\n${lastFiles.map(f => `### ${f.path}\n\`\`\`typescript\n${f.content}\n\`\`\``).join('\n\n')}\n\n` +
+            (existingContext ? `## 関連する既存ファイル\n${existingContext}\n\n` : '') +
+            `## 重要\n- ランタイムエラー（起動時に落ちる原因）を特定して修正してください\n- importの不整合、未定義変数、型ミスマッチ等を確認\n- NODE_ENV=test時はLINE/Telegram送信がスキップされます\n\n` +
+            `全ファイルをまとめて修正してください。出力形式:\n{"files": [{"path": "...", "content": "...", "action": "..."}]}`,
+        }],
+        model: 'default',
+        maxTokens: 16384,
+      });
+
+      const parsed = safeParseJson(text);
+      let fixedFiles: FileToWrite[];
+      if (parsed?.files && Array.isArray(parsed.files)) {
+        fixedFiles = parsed.files;
+      } else if (parsed?.file) {
+        fixedFiles = [parsed.file];
+      } else {
+        throw new Error('修正コードのパースに失敗');
+      }
+
+      await writeFiles(fixedFiles);
+      await this.runBuildAndDeploy(conv, fixedFiles, retryCount + 1, branchName);
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      dbLog('error', 'dev-agent', `[エンジニア] テスト自動修正失敗: ${errMsg.slice(0, 200)}`, { convId: conv.id });
+      await rollbackGit(branchName).catch(() => {});
+      updateConversationStatus(conv.id, 'failed');
+      this.stuckContextMap.delete(conv.id);
+      await sendLineMessage(conv.user_id,
+        `テスト失敗の自動修正に失敗しました:\n${errMsg.slice(0, 300)}\n\nコードをロールバックしました。`
       ).catch(() => {});
     }
   }

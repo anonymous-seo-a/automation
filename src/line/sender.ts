@@ -27,6 +27,12 @@ export function getActiveSendTo(): string {
  * 1回リトライ付き（1秒待機後に再送）
  */
 export async function sendMessage(userId: string, text: string): Promise<void> {
+  // テスト環境では実送信しない
+  if (process.env.NODE_ENV === 'test') {
+    logger.info('[TEST] メッセージ送信スキップ', { userId, text: text.slice(0, 50) });
+    return;
+  }
+
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       if (userId.startsWith('tg:')) {
