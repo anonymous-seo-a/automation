@@ -39,6 +39,7 @@ import {
   formatTestResults,
   TestResult,
 } from './tester';
+import { runClaudeCLI } from './cliRunner';
 
 const MAX_BUILD_RETRIES = 5;
 const MAX_TEST_FIX_RETRIES = 3;
@@ -401,7 +402,7 @@ export class DevAgent implements Agent {
           allFiles.push(file);
           completedFiles.push({ path: file.path, content: file.content });
 
-          await writeFiles([file]);
+          // CLIが直接ファイルを書くのでwriteFiles不要、commitのみ
           await commitAndStay(branchName, `feat: ${subtask.path} - ${subtask.description.slice(0, 50)}`);
 
           await sendLineMessage(conv.user_id, `${subtask.index}/${subtasks.length} 完了: ${subtask.path}`);
@@ -580,83 +581,57 @@ export class DevAgent implements Agent {
   ): Promise<FileToWrite> {
 
     let reviewRetry = 0;
-    let lastCode: FileToWrite | null = null;
     let reviewFeedback = '';
 
     while (reviewRetry <= MAX_REVIEW_RETRIES) {
-      // --- エンジニア（パースリトライ付き） ---
-      const engineerContext = this.buildEngineerContext(conv, subtask, allSubtasks, completedFiles, reviewFeedback);
+      // --- エンジニア（Claude CLI） ---
+      const cliPrompt = this.buildCLIPrompt(conv, subtask, allSubtasks, completedFiles, reviewFeedback);
 
-      let engineerParsed: any = null;
-      let lastRawOutput = '';
+      dbLog('info', 'dev-agent', `[エンジニア/CLI] コード生成開始 (レビュー試行 ${reviewRetry + 1})`, { convId: conv.id, path: subtask.path });
 
-      for (let parseRetry = 0; parseRetry < MAX_ENGINEER_PARSE_RETRIES; parseRetry++) {
-        dbLog('info', 'dev-agent', `[エンジニア] コード生成 (レビュー試行 ${reviewRetry + 1}, パース試行 ${parseRetry + 1})`, { convId: conv.id, path: subtask.path });
+      const cliResult = await runClaudeCLI(cliPrompt);
 
-        const messages: Array<{ role: 'user' | 'assistant'; content: string }> = [
-          { role: 'user', content: engineerContext },
-        ];
-
-        // パースリトライ時は前回の出力をフィードバック
-        if (parseRetry > 0 && lastRawOutput) {
-          messages.push(
-            { role: 'assistant', content: lastRawOutput },
-            { role: 'user', content: `上記の出力はJSON形式として不正です。以下の形式で正確にJSON"のみ"を出力してください。説明文やマークダウンは不要です。\n\n{"file": {"path": "${subtask.path}", "content": "ファイル内容全体", "action": "${subtask.action}"}}` },
-          );
-        }
-
-        const { text: engineerOutput } = await callClaude({
-          system: DEV_SYSTEM_PROMPT + '\n\n' + ENGINEER_PROMPT,
-          messages,
-          model: 'opus',
-          maxTokens: 16384,
-        });
-
-        lastRawOutput = engineerOutput;
-        engineerParsed = safeParseJson(engineerOutput);
-
-        if (engineerParsed?.file?.path && engineerParsed?.file?.content) {
-          break; // パース成功
-        }
-
-        dbLog('warn', 'dev-agent', `[エンジニア] パース失敗 (${parseRetry + 1}/${MAX_ENGINEER_PARSE_RETRIES}): ${engineerOutput.slice(0, 100)}`, { convId: conv.id });
-        engineerParsed = null;
+      if (!cliResult.success) {
+        throw new Error(`CLI実行失敗: ${cliResult.output.slice(-300)}`);
       }
 
-      if (!engineerParsed || !engineerParsed.file || !engineerParsed.file.path || !engineerParsed.file.content) {
-        throw new Error(`エンジニア: ${subtask.path} のパースに${MAX_ENGINEER_PARSE_RETRIES}回失敗\n最後の出力: ${lastRawOutput.slice(0, 200)}`);
+      dbLog('info', 'dev-agent', `[エンジニア/CLI] コード生成完了`, { convId: conv.id, path: subtask.path });
+
+      // CLIが書いたファイルの内容を読み取り
+      const content = await readProjectFile(subtask.path);
+      if (!content) {
+        throw new Error(`CLIがファイルを生成しませんでした: ${subtask.path}`);
       }
 
-      lastCode = {
-        path: engineerParsed.file.path,
-        content: engineerParsed.file.content,
-        action: engineerParsed.file.action || subtask.action,
+      const fileToWrite: FileToWrite = {
+        path: subtask.path,
+        content,
+        action: subtask.action,
       };
 
-      // --- レビュアー ---
+      // --- レビュアー（Claude API, Sonnet） ---
       dbLog('info', 'dev-agent', `[レビュアー] レビュー開始: ${subtask.path}`, { convId: conv.id });
 
-      const reviewContext = this.buildReviewContext(subtask, lastCode, completedFiles);
+      const reviewContext = this.buildReviewContext(subtask, fileToWrite, completedFiles);
 
       const { text: reviewOutput } = await callClaude({
         system: DEV_SYSTEM_PROMPT + '\n\n' + REVIEWER_PROMPT,
         messages: [{ role: 'user', content: reviewContext }],
-        model: 'opus',
+        model: 'default',
       });
 
       const reviewParsed = safeParseJson(reviewOutput);
 
-      if (!reviewParsed) {
-        dbLog('warn', 'dev-agent', `[レビュアー] レビュー結果パース失敗。承認扱い`, { convId: conv.id });
-        break;
+      if (!reviewParsed || reviewParsed.approved) {
+        if (reviewParsed) {
+          dbLog('info', 'dev-agent', `[レビュアー] 承認: ${subtask.path} - ${reviewParsed.summary}`, { convId: conv.id });
+        } else {
+          dbLog('warn', 'dev-agent', `[レビュアー] レビュー結果パース失敗。承認扱い`, { convId: conv.id });
+        }
+        return fileToWrite;
       }
 
-      if (reviewParsed.approved) {
-        dbLog('info', 'dev-agent', `[レビュアー] 承認: ${subtask.path} - ${reviewParsed.summary}`, { convId: conv.id });
-        break;
-      }
-
-      // レビューNG → フィードバックを元にリトライ
+      // レビューNG → フィードバックを次のCLI実行に渡す
       reviewRetry++;
       const issues = (reviewParsed.issues || []) as Array<{ severity: string; message: string; fix: string }>;
       reviewFeedback = issues.map(i => `[${i.severity}] ${i.message}\n修正: ${i.fix}`).join('\n\n');
@@ -665,40 +640,47 @@ export class DevAgent implements Agent {
 
       if (reviewRetry > MAX_REVIEW_RETRIES) {
         dbLog('warn', 'dev-agent', `[レビュアー] 最大リトライ到達。最終版で続行`, { convId: conv.id });
-        break;
+        return fileToWrite;
       }
     }
 
-    if (!lastCode) {
-      throw new Error(`エンジニア: ${subtask.path} のコード生成に完全に失敗`);
-    }
-
-    return lastCode;
+    throw new Error(`レビューループ異常終了: ${subtask.path}`);
   }
 
-  private buildEngineerContext(
+  private buildCLIPrompt(
     conv: DevConversation,
     subtask: Subtask,
-    allSubtasks: Subtask[],
+    _allSubtasks: Subtask[],
     completedFiles: Array<{ path: string; content: string }>,
     reviewFeedback: string,
   ): string {
-    let ctx = `## 要件定義\n${conv.requirements}\n\n`;
-    ctx += `## 全サブタスク一覧\n${allSubtasks.map(s => `${s.index}. [${s.path}] ${s.description}`).join('\n')}\n\n`;
-    ctx += `## 今回のサブタスク\nindex: ${subtask.index}\npath: ${subtask.path}\naction: ${subtask.action}\n説明: ${subtask.description}\n\n`;
+    let prompt = `CLAUDE.md を読んでから、以下のサブタスクを実装してください。
+
+## サブタスク
+- ファイル: ${subtask.path}
+- 内容: ${subtask.description}
+- アクション: ${subtask.action}
+
+## 全体の要件定義
+${conv.requirements}
+`;
 
     if (completedFiles.length > 0) {
-      ctx += `## 完了済みファイル（参照用）\n`;
+      prompt += `\n## 完了済みファイル（参照用）\n`;
       for (const f of completedFiles) {
-        ctx += `### ${f.path}\n\`\`\`typescript\n${f.content}\n\`\`\`\n\n`;
+        prompt += `- ${f.path}\n`;
       }
     }
 
     if (reviewFeedback) {
-      ctx += `## レビュアーからの修正指示（これを反映して再生成してください）\n${reviewFeedback}\n`;
+      prompt += `\n## レビュアーからのフィードバック（必ず反映すること）\n${reviewFeedback}\n`;
     }
 
-    return ctx;
+    prompt += `\n## 指示
+- このサブタスク（1ファイル）だけを作成/変更してください
+- npm run build でビルドが通ることを確認してください`;
+
+    return prompt;
   }
 
   private buildReviewContext(
