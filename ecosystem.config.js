@@ -1,7 +1,8 @@
 module.exports = {
   apps: [{
     name: 'mothership',
-    script: './dist/index.js',
+    script: './src/index.ts',
+    interpreter: './node_modules/.bin/tsx',
     instances: 1,
     autorestart: true,
     watch: false,
