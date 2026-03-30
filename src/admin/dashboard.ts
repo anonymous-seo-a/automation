@@ -4,6 +4,7 @@ import { getDB } from '../db/database';
 import { config } from '../config';
 import { listAgents } from '../agents/router';
 import { renderPage } from './views';
+import { setupLiveRoutes } from './liveView';
 
 export const adminRouter = Router();
 
@@ -26,6 +27,9 @@ adminRouter.use((req: Request, res: Response, next) => {
 });
 
 adminRouter.use(express.json());
+
+// ライブオフィスビュー
+setupLiveRoutes(adminRouter);
 
 // ダッシュボードトップ
 adminRouter.get('/', (_req: Request, res: Response) => {

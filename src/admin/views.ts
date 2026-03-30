@@ -61,6 +61,7 @@ function layout(title: string, content: string): string {
 <nav>
   <a href="/admin" class="brand">母艦管理</a>
   <a href="/admin">ダッシュボード</a>
+  <a href="/admin/live">オフィス</a>
   <a href="/admin/knowledge">ナレッジ</a>
 </nav>
 <div class="container">
