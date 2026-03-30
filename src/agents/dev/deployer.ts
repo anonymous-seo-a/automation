@@ -1,7 +1,8 @@
 import { exec } from 'child_process';
 import { promises as fs } from 'fs';
+import * as fsSync from 'fs';
 import path from 'path';
-import { logger } from '../../utils/logger';
+import { logger, dbLog } from '../../utils/logger';
 
 const PROJECT_ROOT = path.resolve(__dirname, '..', '..', '..');
 
@@ -280,41 +281,132 @@ export async function healthCheck(): Promise<boolean> {
   }
 }
 
-export async function deployWithHealthCheck(branchName: string): Promise<DeployResult> {
-  const pm2Result = await restartPM2();
-  if (!pm2Result.success) {
-    return pm2Result;
-  }
+// ── Pending Deploy（pm2 restart後の後処理用）──────────
 
-  // 5秒待ってヘルスチェック
-  await sleep(5000);
+export interface PendingDeploy {
+  convId: string;
+  branchName: string;
+  userId: string;
+  topic: string;
+}
+
+const PENDING_DEPLOY_PATH = path.join(PROJECT_ROOT, 'data', 'pending_deploy.json');
+
+export function savePendingDeploy(info: PendingDeploy): void {
+  fsSync.writeFileSync(PENDING_DEPLOY_PATH, JSON.stringify(info), 'utf-8');
+  logger.info('PendingDeploy保存', { convId: info.convId, branch: info.branchName });
+}
+
+export function loadPendingDeploy(): PendingDeploy | null {
+  try {
+    const data = fsSync.readFileSync(PENDING_DEPLOY_PATH, 'utf-8');
+    return JSON.parse(data);
+  } catch {
+    return null;
+  }
+}
+
+export function clearPendingDeploy(): void {
+  try {
+    fsSync.unlinkSync(PENDING_DEPLOY_PATH);
+  } catch { /* file doesn't exist, ignore */ }
+}
+
+/**
+ * デプロイ実行: pending情報を保存してからpm2 restartを発火。
+ * pm2 restartにより自プロセスが終了するため、この関数は「返らない」前提。
+ * 後処理（ヘルスチェック・push・ステータス更新）は新プロセスの completePendingDeploy() で行う。
+ */
+export async function deployWithHealthCheck(branchName: string, pendingInfo: PendingDeploy): Promise<DeployResult> {
+  // pm2 restart前にpending情報をディスクに永続化
+  savePendingDeploy(pendingInfo);
+
+  dbLog('info', 'deploy', 'pm2 restart発火（プロセス再起動予定）', { convId: pendingInfo.convId, branch: branchName });
+
+  // pm2 restartを fire-and-forget で発火。自プロセスは死ぬ前提。
+  exec('pm2 restart mothership', { cwd: PROJECT_ROOT, timeout: 15000 }, () => {});
+
+  // pm2が自プロセスを殺すまで少し待つ（通常ここには到達しない）
+  await sleep(30000);
+
+  // 万が一ここに到達した場合（pm2が自分を管理していない等）
+  clearPendingDeploy();
+  return { success: false, message: 'PM2再起動後もプロセスが生きています。手動でpm2 restartしてください。' };
+}
+
+/**
+ * 起動時に呼ばれる後処理。pendingデプロイがあればヘルスチェック→push→完了処理を行う。
+ */
+export async function completePendingDeploy(): Promise<void> {
+  const pending = loadPendingDeploy();
+  if (!pending) return;
+
+  dbLog('info', 'deploy', `PendingDeploy検出: ${pending.branchName}`, { convId: pending.convId });
+
+  // ヘルスチェック（起動直後なので少し待つ）
+  await sleep(3000);
   const healthy = await healthCheck();
 
+  // 遅延import（循環参照回避）
+  const { updateConversationStatus, getConversation } = await import('./conversation');
+  const { sendLineMessage } = await import('../../line/sender');
+  const { recordMetric } = await import('./teamEvaluation');
+
   if (healthy) {
-    logger.info('ヘルスチェック成功');
+    dbLog('info', 'deploy', 'ヘルスチェック成功', { convId: pending.convId });
 
     // GitHubにpush
     try {
-      await execAsync(`git push origin ${branchName}`, 30000);
-      logger.info(`GitHub push 完了: ${branchName}`);
+      await execAsync(`git push origin ${pending.branchName}`, 30000);
+      dbLog('info', 'deploy', `GitHub push 完了: ${pending.branchName}`, { convId: pending.convId });
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       logger.warn('GitHub push 失敗（デプロイ自体は成功）', { err: errMsg });
     }
 
-    return { success: true, message: 'デプロイ成功（ヘルスチェック通過）', branch: branchName };
+    // ステータス更新
+    recordMetric(pending.convId, 'deployer', 'deploy_success');
+    updateConversationStatus(pending.convId, 'deployed');
+
+    const updatedConv = getConversation(pending.convId);
+    const generatedFiles: string[] = [];
+    try {
+      const parsed = JSON.parse(updatedConv?.generated_files || '[]');
+      if (Array.isArray(parsed)) generatedFiles.push(...parsed);
+    } catch { /* ignore */ }
+
+    dbLog('info', 'deploy', `デプロイ成功: ${pending.branchName}`, { convId: pending.convId, files: generatedFiles });
+
+    await sendLineMessage(pending.userId,
+      `✅ デプロイ完了!\n\n` +
+      `${pending.topic}\n` +
+      `ブランチ: ${pending.branchName}\n` +
+      `ファイル: ${generatedFiles.join(', ')}\n\n` +
+      `ビルド・テスト・ヘルスチェック 全て通過。`
+    ).catch(err => logger.warn('デプロイ成功通知失敗', { err: err instanceof Error ? err.message : String(err) }));
+
+    // レトロスペクティブ（バックグラウンド）
+    if (updatedConv) {
+      import('./retrospective').then(({ runRetrospective }) =>
+        runRetrospective(updatedConv).catch(err =>
+          logger.warn('レトロスペクティブ失敗', { err: err instanceof Error ? err.message : String(err) })
+        )
+      ).catch(() => {});
+    }
+  } else {
+    dbLog('error', 'deploy', 'ヘルスチェック失敗 → ロールバック', { convId: pending.convId });
+
+    // ロールバック
+    await rollbackGit(pending.branchName);
+    updateConversationStatus(pending.convId, 'failed');
+
+    await sendLineMessage(pending.userId,
+      `デプロイ失敗: ヘルスチェックNG\nロールバックしました。\nブランチ: ${pending.branchName}`
+    ).catch(err => logger.warn('デプロイ失敗通知失敗', { err: err instanceof Error ? err.message : String(err) }));
+
+    // ロールバック後に再起動が必要（コードを元に戻したので）
+    exec('pm2 restart mothership', { cwd: PROJECT_ROOT, timeout: 15000 }, () => {});
   }
 
-  // ヘルスチェック失敗 → ロールバック
-  logger.error('ヘルスチェック失敗。ロールバック開始');
-  await rollbackGit(branchName);
-  await runBuild();
-  await restartPM2();
-  await sleep(3000);
-
-  return {
-    success: false,
-    message: 'デプロイ失敗: ヘルスチェックNG。ロールバックしました。',
-    branch: branchName,
-  };
+  clearPendingDeploy();
 }

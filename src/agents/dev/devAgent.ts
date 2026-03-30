@@ -860,40 +860,22 @@ ${conv.requirements}
     }
 
     // ── Step 4: デプロイ ──
+    // pm2 restartで自プロセスが死ぬため、後処理は新プロセスのcompletePendingDeploy()で行う
     dbLog('info', 'dev-agent', '[チーム] 全テスト通過 → デプロイ開始', { convId: conv.id });
     await commitAndStay(branchName, `feat(dev-agent): ${conv.topic}`);
+    this.stuckContextMap.delete(conv.id);
 
-    const deployResult = await deployWithHealthCheck(branchName);
-    if (deployResult.success) {
-      recordMetric(conv.id, 'deployer', 'deploy_success');
-      updateConversationStatus(conv.id, 'deployed');
-      this.stuckContextMap.delete(conv.id);
-      const updatedConv = getConversation(conv.id) || conv;
-      const generatedFiles = safeParseJson(updatedConv.generated_files) as string[] || [];
+    await sendLineMessage(conv.user_id, '🚀 全テスト通過。デプロイ中（再起動します）...');
 
-      dbLog('info', 'dev-agent', `[チーム] デプロイ成功: ${branchName}`, { convId: conv.id, files: generatedFiles });
-      await sendLineMessage(conv.user_id,
-        `✅ デプロイ完了!\n\n` +
-        `${conv.topic}\n` +
-        `ブランチ: ${branchName}\n` +
-        `ファイル: ${generatedFiles.join(', ')}\n\n` +
-        `ビルド・起動テスト・機能テスト・ヘルスチェック 全て通過。`
-      );
-
-      // レトロスペクティブをバックグラウンドで実行
-      import('./retrospective').then(({ runRetrospective }) =>
-        runRetrospective(updatedConv).catch(err =>
-          logger.warn('レトロスペクティブ失敗', { err: err instanceof Error ? err.message : String(err) })
-        )
-      ).catch(() => {});
-    } else {
-      updateConversationStatus(conv.id, 'failed');
-      this.stuckContextMap.delete(conv.id);
-      dbLog('error', 'dev-agent', `[チーム] デプロイ失敗: ${deployResult.message}`, { convId: conv.id });
-      await sendLineMessage(conv.user_id,
-        `${deployResult.message}\n前の状態に復帰済みです。`
-      );
-    }
+    // deployWithHealthCheckはpm2 restartを発火して自プロセスを終了させる。
+    // 成功/失敗の処理は新プロセス起動時のcompletePendingDeploy()で行われる。
+    await deployWithHealthCheck(branchName, {
+      convId: conv.id,
+      branchName,
+      userId: conv.user_id,
+      topic: conv.topic,
+    });
+    // ↑ 通常ここには到達しない（pm2がプロセスを殺すため）
   }
 
   // ── ビルドエラー自動修正 ──

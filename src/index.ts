@@ -11,6 +11,7 @@ import { enqueueTask } from './queue/taskQueue';
 import { checkIdleSessions } from './memory/session';
 import { runDailyConsolidation } from './memory/consolidation';
 import { loadKnowledgeCache } from './line/bunshinPrompt';
+import { completePendingDeploy } from './agents/dev/deployer';
 import { logger } from './utils/logger';
 import path from 'path';
 
@@ -90,6 +91,11 @@ async function main(): Promise<void> {
 
   app.listen(config.server.port, () => {
     logger.info(`サーバー起動: port ${config.server.port}`);
+
+    // PendingDeploy後処理（pm2 restart後にヘルスチェック・push・通知を完了させる）
+    completePendingDeploy().catch(err =>
+      logger.error('PendingDeploy後処理失敗', { err: err instanceof Error ? err.message : String(err) })
+    );
   });
 
   // タスク実行ワーカー起動
