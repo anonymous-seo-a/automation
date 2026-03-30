@@ -40,6 +40,7 @@ import {
   TestResult,
 } from './tester';
 import { runClaudeCLI } from './cliRunner';
+import { getSourceTree } from '../../github/client';
 
 const MAX_BUILD_RETRIES = 5;
 const MAX_TEST_FIX_RETRIES = 3;
@@ -216,6 +217,49 @@ export class DevAgent implements Agent {
   }
 
   // ========================================
+  // コードベースコンテキスト（PM用）
+  // ========================================
+
+  /**
+   * PMがプロジェクト構造を理解するためのコンテキストを構築。
+   * GitHubのファイルツリー + 主要ファイルの内容を含む。
+   */
+  private async buildCodebaseContext(): Promise<string> {
+    const [fileTree, migrations, routerCode, indexCode, adminCode] = await Promise.all([
+      getSourceTree(),
+      readProjectFile('src/db/migrations.ts'),
+      readProjectFile('src/agents/router.ts'),
+      readProjectFile('src/index.ts'),
+      readProjectFile('src/admin/dashboard.ts'),
+    ]);
+
+    let ctx = '## 現在のプロジェクト構造（GitHub リポジトリから取得）\n\n';
+    ctx += '### ソースファイル一覧\n' + fileTree + '\n\n';
+
+    if (migrations) {
+      ctx += '### DBスキーマ (src/db/migrations.ts)\n```typescript\n' + migrations + '\n```\n\n';
+    }
+
+    if (routerCode) {
+      ctx += '### エージェントルーター (src/agents/router.ts)\n```typescript\n' + routerCode + '\n```\n\n';
+    }
+
+    if (indexCode) {
+      const truncated = indexCode.length > 3000 ? indexCode.slice(0, 3000) + '\n// ...(以下省略)' : indexCode;
+      ctx += '### エントリポイント (src/index.ts)\n```typescript\n' + truncated + '\n```\n\n';
+    }
+
+    if (adminCode) {
+      const truncated = adminCode.length > 3000 ? adminCode.slice(0, 3000) + '\n// ...(以下省略)' : adminCode;
+      ctx += '### 管理ダッシュボード (src/admin/dashboard.ts)\n```typescript\n' + truncated + '\n```\n\n';
+    }
+
+    ctx += '※ PMはこの情報を基にユーザーに質問不要な項目は自分で判断すること。コード構造の質問をユーザーにしないこと。\n';
+
+    return ctx;
+  }
+
+  // ========================================
   // Phase 1: ヒアリング（PM）
   // ========================================
 
@@ -227,10 +271,12 @@ export class DevAgent implements Agent {
     if (!updatedConv) return;
     const hearingLog = safeParseJson(updatedConv.hearing_log) || [];
 
+    const codebaseCtx = await this.buildCodebaseContext();
+
     const { text } = await callClaude({
       system: DEV_SYSTEM_PROMPT + '\n\n' + PM_HEARING_PROMPT,
       messages: [
-        { role: 'user', content: `開発依頼: ${initialMessage}\n\nヒアリングログ:\n${JSON.stringify(hearingLog)}\n\n現在のヒアリング回数: 1/${MAX_HEARING_ROUNDS}` },
+        { role: 'user', content: `${codebaseCtx}\n\n開発依頼: ${initialMessage}\n\nヒアリングログ:\n${JSON.stringify(hearingLog)}\n\n現在のヒアリング回数: 1/${MAX_HEARING_ROUNDS}` },
       ],
       model: 'opus',
     });
@@ -256,10 +302,12 @@ export class DevAgent implements Agent {
       return;
     }
 
+    const codebaseCtx = await this.buildCodebaseContext();
+
     const { text } = await callClaude({
       system: DEV_SYSTEM_PROMPT + '\n\n' + PM_HEARING_PROMPT,
       messages: [
-        { role: 'user', content: `開発依頼: ${conv.topic}\n\nヒアリングログ:\n${JSON.stringify(hearingLog)}\n\nユーザーの最新回答: ${userReply}\n\n現在のヒアリング回数: ${round}/${MAX_HEARING_ROUNDS}` },
+        { role: 'user', content: `${codebaseCtx}\n\n開発依頼: ${conv.topic}\n\nヒアリングログ:\n${JSON.stringify(hearingLog)}\n\nユーザーの最新回答: ${userReply}\n\n現在のヒアリング回数: ${round}/${MAX_HEARING_ROUNDS}` },
       ],
       model: 'opus',
     });
@@ -301,10 +349,12 @@ export class DevAgent implements Agent {
 
     await sendLineMessage(conv.user_id, 'ヒアリング完了。要件定義書を作成中...');
 
+    const codebaseCtx = await this.buildCodebaseContext();
+
     const { text } = await callClaude({
       system: DEV_SYSTEM_PROMPT + '\n\n' + PM_REQUIREMENTS_PROMPT,
       messages: [
-        { role: 'user', content: `開発依頼: ${conv.topic}\n\nヒアリング内容:\n${JSON.stringify(hearingLog)}` },
+        { role: 'user', content: `${codebaseCtx}\n\n開発依頼: ${conv.topic}\n\nヒアリング内容:\n${JSON.stringify(hearingLog)}` },
       ],
       model: 'opus',
     });
@@ -336,10 +386,11 @@ export class DevAgent implements Agent {
 
       const updatedConv = getConversation(conv.id);
       const requirements = updatedConv?.requirements || conv.requirements || '(要件未記録)';
+      const codebaseCtx = await this.buildCodebaseContext();
       const { text } = await callClaude({
         system: DEV_SYSTEM_PROMPT + '\n\n' + PM_REQUIREMENTS_PROMPT,
         messages: [
-          { role: 'user', content: `元の要件:\n${requirements}\n\n修正指示: ${userReply}` },
+          { role: 'user', content: `${codebaseCtx}\n\n元の要件:\n${requirements}\n\n修正指示: ${userReply}` },
         ],
         model: 'opus',
       });
@@ -556,10 +607,12 @@ export class DevAgent implements Agent {
   private async pmDecompose(conv: DevConversation): Promise<Subtask[]> {
     dbLog('info', 'dev-agent', '[PM] サブタスク分解開始', { convId: conv.id });
 
+    const codebaseCtx = await this.buildCodebaseContext();
+
     const { text } = await callClaude({
       system: DEV_SYSTEM_PROMPT + '\n\n' + PM_DECOMPOSE_PROMPT,
       messages: [
-        { role: 'user', content: `以下の要件をサブタスクに分解してください:\n\n${conv.requirements}` },
+        { role: 'user', content: `${codebaseCtx}\n\n以下の要件をサブタスクに分解してください:\n\n${conv.requirements}` },
       ],
       model: 'opus',
     });
