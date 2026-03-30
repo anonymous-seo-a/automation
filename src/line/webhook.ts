@@ -13,6 +13,9 @@ import { saveMessage } from './messageHistory';
 import { saveMemoryWithEmbedding, getAllMemories, searchByMeaning, deleteMemory, MemoryType } from '../memory/store';
 import { trackMessage, isEndSignal, endSession } from '../memory/session';
 import { consolidateKnowledge, applyPendingUpdate } from '../knowledge/consolidator';
+import { extractDaikiEvaluation } from '../agents/dev/teamEvaluation';
+import { getTeamConversations } from '../agents/dev/teamConversation';
+import { getDB } from '../db/database';
 import { logger, dbLog } from '../utils/logger';
 
 /**
@@ -126,6 +129,29 @@ export async function handleMessage(userId: string, text: string): Promise<void>
     } catch (err) {
       logger.error('ナレッジ反映エラー', { err: err instanceof Error ? err.message : String(err) });
       await sendLineMessage(userId, 'ナレッジ反映でエラーが発生しました。');
+    }
+    return;
+  }
+
+  // ★ 会話ログコマンド
+  if (/^会話ログ$/.test(text)) {
+    saveMessage(dbId, 'user', text);
+    try {
+      const logs = getTeamConversations(undefined, 5);
+      if (logs.length === 0) {
+        await sendLineMessage(userId, 'チーム会話ログはまだありません。');
+      } else {
+        const lines = logs.map((log: any) => {
+          const participants = JSON.parse(log.participants).join(',');
+          const created = log.created_at?.slice(0, 16) || '';
+          const decision = log.decision ? `\n  → ${log.decision.slice(0, 60)}` : '';
+          return `[${log.conversation_type}] ${participants} (${created})${decision}`;
+        });
+        await sendLineMessage(userId, `📋 チーム会話ログ（直近5件）\n\n${lines.join('\n\n')}`);
+      }
+    } catch (err) {
+      logger.error('会話ログ取得エラー', { err: err instanceof Error ? err.message : String(err) });
+      await sendLineMessage(userId, '会話ログの取得でエラーが発生しました。');
     }
     return;
   }
@@ -256,6 +282,14 @@ export async function handleMessage(userId: string, text: string): Promise<void>
     await sendLineMessage(userId, response);
     saveMessage(dbId, 'assistant', response);
     extractAndSaveMemories(dbId, text, response).catch(err => logger.warn('自動記憶抽出失敗', { err }));
+
+    // バックグラウンドで評価抽出（直近のdeployedタスクのtopicを渡す）
+    const lastDeployed = getDB().prepare(
+      `SELECT topic FROM dev_conversations WHERE user_id = ? AND status = 'deployed' ORDER BY updated_at DESC LIMIT 1`
+    ).get(userId) as { topic: string } | undefined;
+    extractDaikiEvaluation(text, lastDeployed?.topic).catch(err =>
+      logger.warn('評価抽出失敗', { err: err instanceof Error ? err.message : String(err) })
+    );
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
     logger.error('メッセージ処理エラー', { err: errMsg, text });

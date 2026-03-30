@@ -122,6 +122,55 @@ export function runMigrations(): void {
       status TEXT NOT NULL DEFAULT 'pending',
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+
+    CREATE TABLE IF NOT EXISTS agent_evaluations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      evaluator TEXT NOT NULL,
+      target TEXT NOT NULL,
+      sentiment INTEGER NOT NULL,
+      aspect TEXT,
+      context TEXT,
+      raw_feedback TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_eval_target ON agent_evaluations(target, created_at);
+
+    CREATE TABLE IF NOT EXISTS agent_memories (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      agent TEXT NOT NULL,
+      type TEXT NOT NULL,
+      key TEXT NOT NULL,
+      content TEXT NOT NULL,
+      source TEXT,
+      embedding BLOB,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(agent, type, key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_agent_mem ON agent_memories(agent, type);
+
+    CREATE TABLE IF NOT EXISTS team_conversations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      task_id TEXT,
+      dev_conversation_id TEXT,
+      conversation_type TEXT NOT NULL,
+      participants TEXT NOT NULL,
+      log TEXT NOT NULL,
+      decision TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_team_conv_task ON team_conversations(task_id);
+
+    CREATE TABLE IF NOT EXISTS task_metrics (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      task_id TEXT NOT NULL,
+      agent TEXT NOT NULL,
+      metric_type TEXT NOT NULL,
+      value INTEGER NOT NULL DEFAULT 1,
+      context TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_task_metrics ON task_metrics(task_id, agent);
   `);
 
   // 既存テーブルに embedding 列がなければ追加（マイグレーション互換）

@@ -21,6 +21,7 @@ import {
   PM_DECOMPOSE_PROMPT,
   ENGINEER_PROMPT,
   REVIEWER_PROMPT,
+  buildAgentPersonality,
 } from './prompts';
 import {
   writeFiles,
@@ -41,9 +42,12 @@ import {
 } from './tester';
 import { runClaudeCLI } from './cliRunner';
 import { getSourceTree } from '../../github/client';
+import { recordMetric } from './teamEvaluation';
+import { recordReject } from './teamConversation';
+import { recordBuildLearning, recordRejectLearning } from './teamMemory';
 
 const MAX_BUILD_RETRIES = 5;
-const MAX_TEST_FIX_RETRIES = 3;
+const MAX_TEST_FIX_RETRIES = 5;
 const MAX_HEARING_ROUNDS = 3;
 const MAX_REVIEW_RETRIES = 3;
 const MAX_ENGINEER_PARSE_RETRIES = 3;
@@ -690,7 +694,7 @@ export class DevAgent implements Agent {
       const reviewContext = this.buildReviewContext(subtask, fileToWrite, completedFiles);
 
       const { text: reviewOutput } = await callClaude({
-        system: DEV_SYSTEM_PROMPT + '\n\n' + REVIEWER_PROMPT,
+        system: buildAgentPersonality('reviewer') + '\n\n' + REVIEWER_PROMPT,
         messages: [{ role: 'user', content: reviewContext }],
         model: 'default',
       });
@@ -706,12 +710,16 @@ export class DevAgent implements Agent {
         return fileToWrite;
       }
 
-      // レビューNG → フィードバックを次のCLI実行に渡す
+      // レビューNG → フィードバックを次のCLI実行に渡す（差し戻し）
       reviewRetry++;
+      recordMetric(conv.id, 'reviewer', 'review_reject');
       const issues = (reviewParsed.issues || []) as Array<{ severity: string; message: string; fix: string }>;
       reviewFeedback = issues.map(i => `[${i.severity}] ${i.message}\n修正: ${i.fix}`).join('\n\n');
+      recordReject('reviewer', 'engineer', reviewParsed.summary || 'レビューNG',
+        reviewFeedback.slice(0, 300), 'major', false, conv.id);
+      recordRejectLearning('engineer', reviewParsed.summary || 'レビューNG', reviewFeedback.slice(0, 200));
 
-      dbLog('warn', 'dev-agent', `[レビュアー] NG (${reviewRetry}/${MAX_REVIEW_RETRIES}): ${reviewParsed.summary}`, { convId: conv.id });
+      dbLog('warn', 'dev-agent', `[レビュアー] NG → エンジニアに差し戻し (${reviewRetry}/${MAX_REVIEW_RETRIES}): ${reviewParsed.summary}`, { convId: conv.id });
 
       if (reviewRetry > MAX_REVIEW_RETRIES) {
         dbLog('warn', 'dev-agent', `[レビュアー] 最大リトライ到達。最終版で続行`, { convId: conv.id });
@@ -792,6 +800,7 @@ ${conv.requirements}
     const buildResult = await runBuild();
 
     if (!buildResult.success) {
+      recordMetric(conv.id, 'engineer', 'build_fail');
       // ビルド失敗 → 自動修正
       if (retryCount < MAX_BUILD_RETRIES) {
         await this.autoFixBuildError(conv, lastFiles, retryCount, branchName, buildResult.buildOutput || '');
@@ -823,13 +832,17 @@ ${conv.requirements}
         await sendLineMessage(conv.user_id, `${icon} ${name}: OK`);
       }
     } else {
-      // テスト失敗 → 自己修正ループ
+      // テスト失敗 → デプロイヤーがエンジニアに差し戻し
       const failedResult = testResults.find(r => !r.passed)!;
       const failedName = failedResult.stage === 'startup' ? '起動テスト' : '機能テスト';
-      dbLog('warn', 'dev-agent', `[テスト] ${failedName}失敗`, { convId: conv.id, details: failedResult.details?.slice(0, 300) });
+      dbLog('warn', 'dev-agent', `[デプロイヤー] ${failedName}失敗 → エンジニアに差し戻し`, { convId: conv.id, details: failedResult.details?.slice(0, 300) });
+
+      recordMetric(conv.id, 'deployer', 'test_fail');
+      recordReject('deployer', 'engineer', failedResult.message,
+        failedResult.details || '修正してください', 'major', false, conv.id);
 
       await sendLineMessage(conv.user_id,
-        `❌ ${failedName}失敗: ${failedResult.message}\n${failedResult.details?.slice(0, 200) || ''}`
+        `🧪 ${failedName}失敗 → エンジニアに差し戻し (${retryCount + 1}/${MAX_TEST_FIX_RETRIES})\n${failedResult.message}\n${failedResult.details?.slice(0, 200) || ''}`
       );
 
       if (retryCount < MAX_TEST_FIX_RETRIES) {
@@ -852,6 +865,7 @@ ${conv.requirements}
 
     const deployResult = await deployWithHealthCheck(branchName);
     if (deployResult.success) {
+      recordMetric(conv.id, 'deployer', 'deploy_success');
       updateConversationStatus(conv.id, 'deployed');
       this.stuckContextMap.delete(conv.id);
       const updatedConv = getConversation(conv.id) || conv;
@@ -865,6 +879,13 @@ ${conv.requirements}
         `ファイル: ${generatedFiles.join(', ')}\n\n` +
         `ビルド・起動テスト・機能テスト・ヘルスチェック 全て通過。`
       );
+
+      // レトロスペクティブをバックグラウンドで実行
+      import('./retrospective').then(({ runRetrospective }) =>
+        runRetrospective(updatedConv).catch(err =>
+          logger.warn('レトロスペクティブ失敗', { err: err instanceof Error ? err.message : String(err) })
+        )
+      ).catch(() => {});
     } else {
       updateConversationStatus(conv.id, 'failed');
       this.stuckContextMap.delete(conv.id);
@@ -931,6 +952,7 @@ ${conv.requirements}
       }
 
       await writeFiles(fixedFiles);
+      recordBuildLearning('engineer', buildOutput.slice(0, 200), '自動修正を適用');
       await this.runBuildAndDeploy(conv, fixedFiles, retryCount + 1, branchName);
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
@@ -1002,6 +1024,10 @@ ${conv.requirements}
       }
 
       await writeFiles(fixedFiles);
+      const failedResult = testResults.find(r => !r.passed);
+      if (failedResult) {
+        recordBuildLearning('engineer', failedResult.message, '自動修正を適用');
+      }
       await this.runBuildAndDeploy(conv, fixedFiles, retryCount + 1, branchName);
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
