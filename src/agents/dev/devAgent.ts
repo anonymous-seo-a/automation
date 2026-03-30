@@ -865,6 +865,9 @@ ${conv.requirements}
     await commitAndStay(branchName, `feat(dev-agent): ${conv.topic}`);
     this.stuckContextMap.delete(conv.id);
 
+    // pm2 restartでプロセスが死ぬためfinallyが実行されない → 先にロック解放
+    releaseGitLock(conv.id);
+
     await sendLineMessage(conv.user_id, '🚀 全テスト通過。デプロイ中（再起動します）...');
 
     // deployWithHealthCheckはpm2 restartを発火して自プロセスを終了させる。

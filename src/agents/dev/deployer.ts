@@ -396,6 +396,9 @@ export async function completePendingDeploy(): Promise<void> {
   } else {
     dbLog('error', 'deploy', 'ヘルスチェック失敗 → ロールバック', { convId: pending.convId });
 
+    // ★ 先にpendingファイルを削除（pm2 restart後の無限ループ防止）
+    clearPendingDeploy();
+
     // ロールバック
     await rollbackGit(pending.branchName);
     updateConversationStatus(pending.convId, 'failed');
@@ -406,6 +409,7 @@ export async function completePendingDeploy(): Promise<void> {
 
     // ロールバック後に再起動が必要（コードを元に戻したので）
     exec('pm2 restart mothership', { cwd: PROJECT_ROOT, timeout: 15000 }, () => {});
+    return; // clearPendingDeploy は既に呼び済み
   }
 
   clearPendingDeploy();

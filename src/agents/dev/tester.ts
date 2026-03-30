@@ -53,6 +53,8 @@ export async function runStartupTest(): Promise<TestResult> {
   killTestServer(); // 前回の残骸があれば掃除
   await cleanupTestDb();
 
+  const OVERALL_TIMEOUT_MS = 30_000;
+
   return new Promise<TestResult>((resolve) => {
     let settled = false;
     const settle = (result: TestResult) => {
@@ -61,6 +63,16 @@ export async function runStartupTest(): Promise<TestResult> {
         resolve(result);
       }
     };
+
+    // 全体タイムアウト（Promiseが永遠に解決しない場合の安全弁）
+    const overallTimer = setTimeout(() => {
+      killTestServer();
+      settle({
+        passed: false,
+        stage: 'startup',
+        message: `起動テスト全体タイムアウト (${OVERALL_TIMEOUT_MS / 1000}秒)`,
+      });
+    }, OVERALL_TIMEOUT_MS);
 
     // テスト用サーバーを別ポートで起動
     const env = {
@@ -77,11 +89,12 @@ export async function runStartupTest(): Promise<TestResult> {
     );
 
     testServerProcess.stderr?.on('data', (chunk: string) => {
-      stderr += chunk;
+      stderr += chunk.slice(0, 5000); // バッファ上限
     });
 
     testServerProcess.on('exit', (code) => {
       if (!settled) {
+        clearTimeout(overallTimer);
         settle({
           passed: false,
           stage: 'startup',
@@ -103,6 +116,7 @@ export async function runStartupTest(): Promise<TestResult> {
         clearTimeout(timeoutId);
 
         if (res.status === 200) {
+          clearTimeout(overallTimer);
           settle({
             passed: true,
             stage: 'startup',
@@ -110,6 +124,7 @@ export async function runStartupTest(): Promise<TestResult> {
           });
         } else {
           const body = await res.text().catch(() => '');
+          clearTimeout(overallTimer);
           settle({
             passed: false,
             stage: 'startup',
@@ -118,6 +133,7 @@ export async function runStartupTest(): Promise<TestResult> {
           });
         }
       } catch (err) {
+        clearTimeout(overallTimer);
         settle({
           passed: false,
           stage: 'startup',
