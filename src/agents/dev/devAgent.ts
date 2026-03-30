@@ -45,6 +45,9 @@ import { getSourceTree } from '../../github/client';
 import { recordMetric } from './teamEvaluation';
 import { recordReject } from './teamConversation';
 import { recordBuildLearning, recordRejectLearning } from './teamMemory';
+import { runPreflightChecks, autoFixEnvironment } from './preflight';
+import { classifyError, categoryLabel } from './errorClassifier';
+import { runTeamDiagnosis, DiagnosisResult } from './teamDiagnosis';
 
 const MAX_BUILD_RETRIES = 5;
 const MAX_TEST_FIX_RETRIES = 5;
@@ -80,6 +83,10 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
       err => { clearTimeout(timer); reject(err); },
     );
   });
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 export class DevAgent implements Agent {
@@ -434,6 +441,21 @@ export class DevAgent implements Agent {
     try {
       // 新規開始の場合
       if (!resumeFrom) {
+        // ── プリフライトチェック ──
+        await sendLineMessage(conv.user_id, '🔍 環境チェック中...');
+        const preflight = await runPreflightChecks();
+        if (preflight.fixedIssues.length > 0) {
+          await sendLineMessage(conv.user_id, `🔧 自動修正: ${preflight.fixedIssues.join(', ')}`);
+        }
+        if (!preflight.passed) {
+          const errorMsgs = preflight.issues.filter(i => i.severity === 'error').map(i => `・${i.message}`).join('\n');
+          throw new Error(`環境チェック失敗（自動修正不可）:\n${errorMsgs}`);
+        }
+        if (preflight.issues.length > 0) {
+          const warnMsgs = preflight.issues.filter(i => i.severity === 'warning').map(i => `⚠️ ${i.message}`).join('\n');
+          await sendLineMessage(conv.user_id, `警告:\n${warnMsgs}\n\n続行します。`);
+        }
+
         // Gitロック取得（キュー待ち）
         await sendLineMessage(conv.user_id, 'Gitロック取得中...');
         gitLockAcquired = await acquireGitLock(conv.id, 60_000);
@@ -468,7 +490,27 @@ export class DevAgent implements Agent {
           completedFiles.push({ path: file.path, content: file.content });
 
           // CLIが直接ファイルを書くのでwriteFiles不要、commitのみ
-          await commitAndStay(branchName, `feat: ${subtask.path} - ${subtask.description.slice(0, 50)}`);
+          const commitResult = await commitAndStay(branchName, `feat: ${subtask.path} - ${subtask.description.slice(0, 50)}`);
+          if (!commitResult.success) {
+            // コミット失敗 → エラー分類 → 環境問題なら自動修正してリトライ
+            const classified = classifyError(commitResult.error || '');
+            dbLog('warn', 'dev-agent', `[チーム] コミット失敗: ${categoryLabel(classified.category)} - ${classified.subcategory}`, { convId: conv.id });
+
+            if (classified.autoFixable) {
+              const fixed = await autoFixEnvironment(classified);
+              if (fixed) {
+                const retryResult = await commitAndStay(branchName, `feat: ${subtask.path} - ${subtask.description.slice(0, 50)}`);
+                if (!retryResult.success) {
+                  throw new Error(`コミット失敗（自動修正後も解決せず）: ${retryResult.error}`);
+                }
+                dbLog('info', 'dev-agent', `[チーム] コミット: 自動修正後に成功`, { convId: conv.id });
+              } else {
+                throw new Error(`コミット失敗（自動修正失敗）: ${commitResult.error}`);
+              }
+            } else {
+              throw new Error(`コミット失敗: ${commitResult.error}`);
+            }
+          }
 
           await sendLineMessage(conv.user_id, `${subtask.index}/${subtasks.length} 完了: ${subtask.path}`);
         } catch (subtaskErr) {
@@ -801,17 +843,31 @@ ${conv.requirements}
 
     if (!buildResult.success) {
       recordMetric(conv.id, 'engineer', 'build_fail');
-      // ビルド失敗 → 自動修正
+      const classified = classifyError(buildResult.buildOutput || '');
+      dbLog('info', 'dev-agent', `[チーム] ビルド失敗: ${categoryLabel(classified.category)}/${classified.subcategory}`, { convId: conv.id });
+
       if (retryCount < MAX_BUILD_RETRIES) {
+        // エラー種別に応じた修正
+        if (classified.category === 'transient') {
+          const waitMs = classified.waitMs || 30_000;
+          await sendLineMessage(conv.user_id, `⏳ 一時的エラー（${classified.subcategory}）。${waitMs / 1000}秒後にリトライ...`);
+          await sleep(waitMs);
+          await this.runBuildAndDeploy(conv, lastFiles, retryCount + 1, branchName);
+          return;
+        }
+        if (classified.category === 'environment' && classified.autoFixable) {
+          const fixed = await autoFixEnvironment(classified);
+          if (fixed) {
+            await sendLineMessage(conv.user_id, `🔧 環境問題を自動修正。リビルド中...`);
+            await this.runBuildAndDeploy(conv, lastFiles, retryCount + 1, branchName);
+            return;
+          }
+        }
+        // コードエラー or 修正不可な環境エラー → エンジニアに自動修正させる
         await this.autoFixBuildError(conv, lastFiles, retryCount, branchName, buildResult.buildOutput || '');
       } else {
-        dbLog('error', 'dev-agent', `[チーム] ビルド修正${MAX_BUILD_RETRIES}回失敗`, { convId: conv.id });
-        await rollbackGit(branchName).catch(() => {});
-        updateConversationStatus(conv.id, 'failed');
-        this.stuckContextMap.delete(conv.id);
-        await sendLineMessage(conv.user_id,
-          `ビルドエラーを${MAX_BUILD_RETRIES}回修正しましたが解決できませんでした:\n${buildResult.buildOutput?.slice(0, 500)}\n\n手動での修正が必要です。コードをロールバックしました。`
-        ).catch(() => {});
+        // ── リトライ上限到達 → チーム診断 ──
+        await this.handleExhaustedRetries(conv, branchName, 'build', buildResult.buildOutput || '', classified, lastFiles);
       }
       return;
     }
@@ -825,44 +881,74 @@ ${conv.requirements}
     const allPassed = testResults.every(r => r.passed);
 
     if (allPassed) {
-      // 全テスト通過
       for (const r of testResults) {
         const icon = r.stage === 'startup' ? '🚀' : '🧪';
         const name = r.stage === 'startup' ? '起動テスト' : '機能テスト';
         await sendLineMessage(conv.user_id, `${icon} ${name}: OK`);
       }
     } else {
-      // テスト失敗 → デプロイヤーがエンジニアに差し戻し
       const failedResult = testResults.find(r => !r.passed)!;
       const failedName = failedResult.stage === 'startup' ? '起動テスト' : '機能テスト';
-      dbLog('warn', 'dev-agent', `[デプロイヤー] ${failedName}失敗 → エンジニアに差し戻し`, { convId: conv.id, details: failedResult.details?.slice(0, 300) });
+      const errorText = `${failedResult.message}\n${failedResult.details || ''}`;
+      const classified = classifyError(errorText);
 
+      dbLog('warn', 'dev-agent', `[デプロイヤー] ${failedName}失敗: ${categoryLabel(classified.category)}/${classified.subcategory}`, { convId: conv.id });
       recordMetric(conv.id, 'deployer', 'test_fail');
       recordReject('deployer', 'engineer', failedResult.message,
         failedResult.details || '修正してください', 'major', false, conv.id);
 
-      await sendLineMessage(conv.user_id,
-        `🧪 ${failedName}失敗 → エンジニアに差し戻し (${retryCount + 1}/${MAX_TEST_FIX_RETRIES})\n${failedResult.message}\n${failedResult.details?.slice(0, 200) || ''}`
-      );
-
       if (retryCount < MAX_TEST_FIX_RETRIES) {
+        // 一時的エラー → 待機してリトライ
+        if (classified.category === 'transient') {
+          const waitMs = classified.waitMs || 30_000;
+          await sendLineMessage(conv.user_id, `⏳ テスト中の一時的エラー（${classified.subcategory}）。${waitMs / 1000}秒後にリトライ...`);
+          await sleep(waitMs);
+          await this.runBuildAndDeploy(conv, lastFiles, retryCount + 1, branchName);
+          return;
+        }
+        // 環境エラー → 自動修正してリトライ
+        if (classified.category === 'environment' && classified.autoFixable) {
+          const fixed = await autoFixEnvironment(classified);
+          if (fixed) {
+            await sendLineMessage(conv.user_id, `🔧 環境問題を自動修正。再テスト中...`);
+            await this.runBuildAndDeploy(conv, lastFiles, retryCount + 1, branchName);
+            return;
+          }
+        }
+        // コードエラー → エンジニアに差し戻し
+        await sendLineMessage(conv.user_id,
+          `🧪 ${failedName}失敗 → エンジニアに差し戻し (${retryCount + 1}/${MAX_TEST_FIX_RETRIES})\n${failedResult.message}\n${failedResult.details?.slice(0, 200) || ''}`
+        );
         await this.autoFixTestError(conv, lastFiles, retryCount, branchName, testResults);
       } else {
-        dbLog('error', 'dev-agent', `[チーム] テスト修正${MAX_TEST_FIX_RETRIES}回失敗`, { convId: conv.id });
-        await rollbackGit(branchName).catch(() => {});
-        updateConversationStatus(conv.id, 'failed');
-        this.stuckContextMap.delete(conv.id);
-        await sendLineMessage(conv.user_id,
-          `テスト失敗を${MAX_TEST_FIX_RETRIES}回修正しましたが解決できませんでした。\nコードをロールバックしました。`
-        ).catch(() => {});
+        // ── リトライ上限到達 → チーム診断 ──
+        await this.handleExhaustedRetries(conv, branchName, 'test', errorText, classified, lastFiles, testResults);
       }
       return;
     }
 
     // ── Step 4: デプロイ ──
-    // pm2 restartで自プロセスが死ぬため、後処理は新プロセスのcompletePendingDeploy()で行う
     dbLog('info', 'dev-agent', '[チーム] 全テスト通過 → デプロイ開始', { convId: conv.id });
-    await commitAndStay(branchName, `feat(dev-agent): ${conv.topic}`);
+
+    // デプロイ前コミット（失敗を検知）
+    const finalCommit = await commitAndStay(branchName, `feat(dev-agent): ${conv.topic}`);
+    if (!finalCommit.success) {
+      const classified = classifyError(finalCommit.error || '');
+      if (classified.autoFixable) {
+        const fixed = await autoFixEnvironment(classified);
+        if (fixed) {
+          const retry = await commitAndStay(branchName, `feat(dev-agent): ${conv.topic}`);
+          if (!retry.success) {
+            throw new Error(`デプロイ前コミット失敗（自動修正後も解決せず）: ${retry.error}`);
+          }
+        } else {
+          throw new Error(`デプロイ前コミット失敗: ${finalCommit.error}`);
+        }
+      } else {
+        throw new Error(`デプロイ前コミット失敗: ${finalCommit.error}`);
+      }
+    }
+
     this.stuckContextMap.delete(conv.id);
 
     // pm2 restartでプロセスが死ぬためfinallyが実行されない → 先にロック解放
@@ -870,8 +956,6 @@ ${conv.requirements}
 
     await sendLineMessage(conv.user_id, '🚀 全テスト通過。デプロイ中（再起動します）...');
 
-    // deployWithHealthCheckはpm2 restartを発火して自プロセスを終了させる。
-    // 成功/失敗の処理は新プロセス起動時のcompletePendingDeploy()で行われる。
     await deployWithHealthCheck(branchName, {
       convId: conv.id,
       branchName,
@@ -879,6 +963,101 @@ ${conv.requirements}
       topic: conv.topic,
     });
     // ↑ 通常ここには到達しない（pm2がプロセスを殺すため）
+  }
+
+  // ── リトライ上限到達時のチーム診断 ──
+
+  private async handleExhaustedRetries(
+    conv: DevConversation,
+    branchName: string,
+    phase: 'build' | 'test',
+    errorOutput: string,
+    classified: ReturnType<typeof classifyError>,
+    lastFiles: FileToWrite[],
+    testResults?: TestResult[],
+  ): Promise<void> {
+    const maxRetries = phase === 'build' ? MAX_BUILD_RETRIES : MAX_TEST_FIX_RETRIES;
+    const phaseName = phase === 'build' ? 'ビルド' : 'テスト';
+    dbLog('info', 'dev-agent', `[チーム診断] ${phaseName}修正${maxRetries}回失敗 → チーム診断開始`, { convId: conv.id });
+    await sendLineMessage(conv.user_id, `🏥 ${phaseName}修正が上限に達しました。チーム診断会議を開始...`);
+
+    const diagnosis = await runTeamDiagnosis({
+      convId: conv.id,
+      phase,
+      error: errorOutput,
+      classifiedError: classified,
+      buildOutput: phase === 'build' ? errorOutput : undefined,
+      testResults: testResults,
+      filesChanged: lastFiles.map(f => f.path),
+      retryCount: maxRetries,
+      maxRetries,
+    });
+
+    dbLog('info', 'dev-agent', `[チーム診断] 結果: ${diagnosis.recommendation} - ${diagnosis.rootCause.slice(0, 100)}`, { convId: conv.id });
+
+    // チーム分析の報告
+    const analysisReport = diagnosis.teamAnalysis
+      ? `\n\n📋 チーム分析:\n` +
+        `PM: ${diagnosis.teamAnalysis.pm}\n` +
+        `エンジニア: ${diagnosis.teamAnalysis.engineer}\n` +
+        `デプロイヤー: ${diagnosis.teamAnalysis.deployer}`
+      : '';
+
+    switch (diagnosis.recommendation) {
+      case 'retry_after_wait': {
+        const waitMs = diagnosis.waitMs || 60_000;
+        await sendLineMessage(conv.user_id, `⏳ チーム診断: ${diagnosis.actionPlan}\n${waitMs / 1000}秒待機後にリトライ...${analysisReport}`);
+        await sleep(waitMs);
+        // リトライカウントをリセット（診断を経たので新しい試行として扱う）
+        await this.runBuildAndDeploy(conv, lastFiles, 0, branchName);
+        break;
+      }
+      case 'retry_with_fix': {
+        await sendLineMessage(conv.user_id, `🔧 チーム診断: ${diagnosis.actionPlan}${analysisReport}`);
+        // 診断の修正指示をもとに再修正を試みる
+        if (phase === 'build') {
+          await this.autoFixBuildError(conv, lastFiles, 0, branchName, errorOutput, diagnosis.fixInstructions);
+        } else {
+          await this.autoFixTestError(conv, lastFiles, 0, branchName, testResults || [], diagnosis.fixInstructions);
+        }
+        break;
+      }
+      case 'rollback': {
+        await rollbackGit(branchName).catch(() => {});
+        updateConversationStatus(conv.id, 'failed');
+        this.stuckContextMap.delete(conv.id);
+        await sendLineMessage(conv.user_id,
+          `🏥 チーム診断結果: ロールバック\n` +
+          `根本原因: ${diagnosis.rootCause}\n` +
+          `対処: ${diagnosis.actionPlan}${analysisReport}\n\n` +
+          `コードをロールバックしました。新しい開発依頼でリトライできます。`
+        ).catch(() => {});
+        break;
+      }
+      case 'escalate_to_user':
+      default: {
+        // ロールバックせず、stuckモードでユーザーに判断を委ねる
+        this.stuckContextMap.set(conv.id, {
+          branchName,
+          subtasks: [],
+          completedFiles: [],
+          failedSubtaskIndex: 0,
+          errorMessage: diagnosis.rootCause,
+          phase,
+        });
+        updateConversationStatus(conv.id, 'stuck');
+        await sendLineMessage(conv.user_id,
+          `🏥 チーム診断結果: 判断をお願いします\n` +
+          `根本原因: ${diagnosis.rootCause}\n` +
+          `対処案: ${diagnosis.actionPlan}${analysisReport}\n\n` +
+          `選択肢:\n` +
+          `・「リトライ」→ 再試行\n` +
+          `・追加指示を送る → 情報を元に再試行\n` +
+          `・「中止」→ ロールバックして終了`
+        ).catch(() => {});
+        break;
+      }
+    }
   }
 
   // ── ビルドエラー自動修正 ──
@@ -889,6 +1068,7 @@ ${conv.requirements}
     retryCount: number,
     branchName: string,
     buildOutput: string,
+    diagnosisHint?: string,
   ): Promise<void> {
     dbLog('warn', 'dev-agent', `[エンジニア] ビルドエラー → 自動修正 (${retryCount + 1}/${MAX_BUILD_RETRIES})`, {
       convId: conv.id,
@@ -911,12 +1091,17 @@ ${conv.requirements}
         }
       }
 
+      const diagnosisSection = diagnosisHint
+        ? `## チーム診断からの追加指示\n${diagnosisHint}\n\n`
+        : '';
+
       const { text } = await callClaude({
         system: DEV_SYSTEM_PROMPT + '\n\n' + ENGINEER_PROMPT,
         messages: [{
           role: 'user',
           content: `以下のコードにビルドエラーがあります。修正してください。\n\n` +
             `## ビルドエラー\n${buildOutput}\n\n` +
+            diagnosisSection +
             `## 今回変更したコード\n${lastFiles.map(f => `### ${f.path}\n\`\`\`typescript\n${f.content}\n\`\`\``).join('\n\n')}\n\n` +
             (existingContext ? `## 関連する既存ファイル\n${existingContext}\n\n` : '') +
             `## 重要\n- 既存ファイルのimportパスや型定義に合わせてください\n- 存在しないモジュールをimportしないでください\n\n` +
@@ -942,6 +1127,20 @@ ${conv.requirements}
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       dbLog('error', 'dev-agent', `[エンジニア] ビルド自動修正失敗: ${errMsg.slice(0, 200)}`, { convId: conv.id });
+
+      // 自動修正自体が失敗した場合もエラーを分類
+      const classified = classifyError(errMsg);
+      if (classified.category === 'transient') {
+        // APIレートリミット等 → 待機してリトライ
+        const waitMs = classified.waitMs || 60_000;
+        dbLog('info', 'dev-agent', `[エンジニア] 自動修正中の一時的エラー → ${waitMs / 1000}秒待機`, { convId: conv.id });
+        await sendLineMessage(conv.user_id, `⏳ API制限。${waitMs / 1000}秒待機後にリトライ...`);
+        await sleep(waitMs);
+        await this.autoFixBuildError(conv, lastFiles, retryCount, branchName, buildOutput, diagnosisHint);
+        return;
+      }
+
+      // それ以外 → ロールバック
       await rollbackGit(branchName).catch(() => {});
       updateConversationStatus(conv.id, 'failed');
       this.stuckContextMap.delete(conv.id);
@@ -959,6 +1158,7 @@ ${conv.requirements}
     retryCount: number,
     branchName: string,
     testResults: TestResult[],
+    diagnosisHint?: string,
   ): Promise<void> {
     dbLog('warn', 'dev-agent', `[エンジニア] テスト失敗 → 自動修正 (${retryCount + 1}/${MAX_TEST_FIX_RETRIES})`, { convId: conv.id });
     await sendLineMessage(conv.user_id,
@@ -979,6 +1179,9 @@ ${conv.requirements}
       }
 
       const testReport = formatTestResults(testResults);
+      const diagnosisSection = diagnosisHint
+        ? `## チーム診断からの追加指示\n${diagnosisHint}\n\n`
+        : '';
 
       const { text } = await callClaude({
         system: DEV_SYSTEM_PROMPT + '\n\n' + ENGINEER_PROMPT,
@@ -986,6 +1189,7 @@ ${conv.requirements}
           role: 'user',
           content: `以下のコードはビルドは通りましたが、ランタイムテストで失敗しました。修正してください。\n\n` +
             `## テスト結果\n${testReport}\n\n` +
+            diagnosisSection +
             `## テストの説明\n` +
             `- 起動テスト: PORT=3999 NODE_ENV=test で別プロセス起動 → /health で200確認\n` +
             `- 機能テスト: /test/task, /webhook, /telegram のルート存在確認\n\n` +
@@ -1017,6 +1221,18 @@ ${conv.requirements}
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       dbLog('error', 'dev-agent', `[エンジニア] テスト自動修正失敗: ${errMsg.slice(0, 200)}`, { convId: conv.id });
+
+      // 自動修正自体が失敗した場合もエラーを分類
+      const classified = classifyError(errMsg);
+      if (classified.category === 'transient') {
+        const waitMs = classified.waitMs || 60_000;
+        dbLog('info', 'dev-agent', `[エンジニア] 自動修正中の一時的エラー → ${waitMs / 1000}秒待機`, { convId: conv.id });
+        await sendLineMessage(conv.user_id, `⏳ API制限。${waitMs / 1000}秒待機後にリトライ...`);
+        await sleep(waitMs);
+        await this.autoFixTestError(conv, lastFiles, retryCount, branchName, testResults, diagnosisHint);
+        return;
+      }
+
       await rollbackGit(branchName).catch(() => {});
       updateConversationStatus(conv.id, 'failed');
       this.stuckContextMap.delete(conv.id);

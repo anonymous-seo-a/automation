@@ -149,16 +149,28 @@ export async function rollbackGit(branchName: string): Promise<void> {
   }
 }
 
-export async function commitAndStay(branchName: string, message: string): Promise<void> {
+export interface CommitResult {
+  success: boolean;
+  error?: string;
+}
+
+export async function commitAndStay(branchName: string, message: string): Promise<CommitResult> {
   try {
     // シェルインジェクション防止: メッセージ内の特殊文字をエスケープ
     const safeMessage = message.replace(/'/g, "'\\''");
     await execAsync('git add -A');
     await execAsync(`git commit -m '${safeMessage}'`);
     logger.info(`コミット完了: ${branchName}`);
+    return { success: true };
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
-    logger.warn('git commit スキップ', { err: errMsg });
+    // "nothing to commit" は正常（変更なし）
+    if (/nothing to commit|working tree clean/i.test(errMsg)) {
+      logger.info('git commit スキップ（変更なし）', { branchName });
+      return { success: true };
+    }
+    logger.warn('git commit 失敗', { err: errMsg });
+    return { success: false, error: errMsg };
   }
 }
 

@@ -3,8 +3,8 @@ import { logger } from '../utils/logger';
 import { trackUsage, isOverBudget } from './budgetTracker';
 
 const API_TIMEOUT_MS = 60_000; // 60秒
-const MAX_RETRIES = 2;
-const RETRY_DELAYS = [1000, 3000]; // 指数バックオフ
+const MAX_RETRIES = 4;
+const RETRY_DELAYS = [2000, 5000, 15000, 30000]; // レートリミット対策: 長めのバックオフ
 
 interface ClaudeMessage {
   role: 'user' | 'assistant';
@@ -42,10 +42,12 @@ export async function callClaude(params: {
     : config.claude.defaultModel;
 
   let lastError: Error | null = null;
+  let retryDelayOverride: number | null = null;
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     if (attempt > 0) {
-      const delay = RETRY_DELAYS[attempt - 1] || 3000;
+      const delay = retryDelayOverride || RETRY_DELAYS[attempt - 1] || 3000;
+      retryDelayOverride = null; // 使用後リセット
       logger.warn(`Claude API リトライ ${attempt}/${MAX_RETRIES}（${delay}ms待機）`, { model });
       await sleep(delay);
     }
@@ -81,6 +83,14 @@ export async function callClaude(params: {
         const errBody = await response.text().catch(() => '(response body unreadable)');
 
         if (isRetryable(response.status) && attempt < MAX_RETRIES) {
+          // Retry-Afterヘッダーがあればそちらを優先（ローカル変数で上書き、定数は汚染しない）
+          const retryAfter = response.headers.get('retry-after');
+          if (retryAfter && response.status === 429) {
+            const waitSec = parseInt(retryAfter, 10);
+            if (!isNaN(waitSec) && waitSec > 0 && waitSec <= 120) {
+              retryDelayOverride = waitSec * 1000;
+            }
+          }
           logger.warn('Claude API リトライ可能エラー', { status: response.status, errBody: errBody.slice(0, 200) });
           lastError = new Error(`Claude API ${response.status}: ${errBody.slice(0, 500)}`);
           continue;
