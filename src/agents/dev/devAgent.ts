@@ -54,6 +54,8 @@ const MAX_TEST_FIX_RETRIES = 5;
 const MAX_HEARING_ROUNDS = 3;
 const MAX_REVIEW_RETRIES = 3;
 const MAX_ENGINEER_PARSE_RETRIES = 3;
+const MAX_DIAGNOSIS_ROUNDS = 2;   // チーム診断→リトライの最大サイクル数
+const MAX_TRANSIENT_WAITS = 3;    // 一時的エラー待機の最大回数（autoFix内）
 const PHASE_TIMEOUT_MS = 5 * 60 * 1000; // 各フェーズ最大5分
 
 interface Subtask {
@@ -70,6 +72,7 @@ interface StuckContext {
   failedSubtaskIndex: number;
   errorMessage: string;
   phase: string; // エラーが起きたフェーズ名
+  lastFiles?: FileToWrite[]; // build/testフェーズで使用したファイル（リカバリ用）
 }
 
 /**
@@ -281,7 +284,11 @@ export class DevAgent implements Agent {
     dbLog('info', 'dev-agent', `[PM] ヒアリング開始: round 1/${MAX_HEARING_ROUNDS}`, { convId: conv.id });
 
     const updatedConv = getConversation(conv.id);
-    if (!updatedConv) return;
+    if (!updatedConv) {
+      dbLog('error', 'dev-agent', `[PM] 会話データ消失: ${conv.id}`, { convId: conv.id });
+      await sendLineMessage(conv.user_id, '会話データの読み込みに失敗しました。もう一度開発依頼を送ってください。').catch(() => {});
+      return;
+    }
     const hearingLog = safeParseJson(updatedConv.hearing_log) || [];
 
     const codebaseCtx = await this.buildCodebaseContext();
@@ -305,7 +312,11 @@ export class DevAgent implements Agent {
     dbLog('info', 'dev-agent', `[PM] ヒアリング回答受信: round ${round}/${MAX_HEARING_ROUNDS}`, { convId: conv.id });
 
     const updatedConv = getConversation(conv.id);
-    if (!updatedConv) return;
+    if (!updatedConv) {
+      dbLog('error', 'dev-agent', `[PM] 会話データ消失: ${conv.id}`, { convId: conv.id });
+      await sendLineMessage(conv.user_id, '会話データの読み込みに失敗しました。もう一度開発依頼を送ってください。').catch(() => {});
+      return;
+    }
     const hearingLog = safeParseJson(updatedConv.hearing_log) || [];
 
     if (round >= MAX_HEARING_ROUNDS) {
@@ -357,7 +368,11 @@ export class DevAgent implements Agent {
     dbLog('info', 'dev-agent', '[PM] 要件定義書作成開始', { convId: conv.id });
 
     const updatedConv = getConversation(conv.id);
-    if (!updatedConv) return;
+    if (!updatedConv) {
+      dbLog('error', 'dev-agent', `[PM] 会話データ消失: ${conv.id}`, { convId: conv.id });
+      await sendLineMessage(conv.user_id, '会話データの読み込みに失敗しました。もう一度開発依頼を送ってください。').catch(() => {});
+      return;
+    }
     const hearingLog = safeParseJson(updatedConv.hearing_log) || [];
 
     await sendLineMessage(conv.user_id, 'ヒアリング完了。要件定義書を作成中...');
@@ -431,7 +446,12 @@ export class DevAgent implements Agent {
     dbLog('info', 'dev-agent', '[チーム] 実装フェーズ開始', { convId: conv.id });
 
     const updatedConv = getConversation(conv.id);
-    if (!updatedConv) return;
+    if (!updatedConv) {
+      dbLog('error', 'dev-agent', `[チーム] 会話データ消失: ${conv.id}`, { convId: conv.id });
+      updateConversationStatus(conv.id, 'failed');
+      await sendLineMessage(conv.user_id, '会話データが見つかりません。新しい開発依頼を送ってください。').catch(() => {});
+      return;
+    }
 
     let branchName = resumeFrom?.branchName || '';
     let subtasks: Subtask[] = resumeFrom?.subtasks || [];
@@ -624,6 +644,26 @@ export class DevAgent implements Agent {
       return;
     }
 
+    // build/testフェーズのスタックの場合、サブタスクスキップは不可
+    if (ctx.phase === 'build' || ctx.phase === 'test') {
+      if (/^スキップ/.test(normalizedReply)) {
+        await sendLineMessage(conv.user_id, 'ビルド/テストフェーズではスキップできません。「リトライ」で再試行するか「中止」で終了してください。');
+        return;
+      }
+
+      dbLog('info', 'dev-agent', `[stuck] ${ctx.phase}フェーズ リトライ`, { convId: conv.id });
+      this.stuckContextMap.delete(conv.id);
+      this.resumingSet.add(conv.id);
+
+      this.resumeBuildTest(conv, ctx).catch(err => {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        dbLog('error', 'dev-agent', `[チーム] ${ctx.phase}再試行失敗: ${errMsg}`, { convId: conv.id });
+        updateConversationStatus(conv.id, 'failed');
+        sendLineMessage(conv.user_id, `再試行中にエラー:\n${errMsg.slice(0, 300)}`).catch(() => {});
+      }).finally(() => this.resumingSet.delete(conv.id));
+      return;
+    }
+
     if (/^スキップ/.test(normalizedReply)) {
       dbLog('info', 'dev-agent', `[stuck] サブタスク ${ctx.failedSubtaskIndex + 1} をスキップ`, { convId: conv.id });
       this.stuckContextMap.delete(conv.id);
@@ -664,6 +704,21 @@ export class DevAgent implements Agent {
       updateConversationStatus(conv.id, 'failed');
       sendLineMessage(conv.user_id, `リトライ中にエラー:\n${errMsg.slice(0, 300)}`).catch(() => {});
     }).finally(() => this.resumingSet.delete(conv.id));
+  }
+
+  /** build/testフェーズからの復帰（Gitロック管理付き） */
+  private async resumeBuildTest(conv: DevConversation, ctx: StuckContext): Promise<void> {
+    let gitLockAcquired = false;
+    try {
+      gitLockAcquired = await acquireGitLock(conv.id, 60_000);
+      if (!gitLockAcquired) throw new Error('Gitロック取得失敗');
+      updateConversationStatus(conv.id, 'testing');
+      const phaseName = ctx.phase === 'build' ? 'ビルド' : 'テスト';
+      await sendLineMessage(conv.user_id, `🔄 ${phaseName}から再試行中...`);
+      await this.runBuildAndDeploy(conv, ctx.lastFiles || [], 0, ctx.branchName);
+    } finally {
+      if (gitLockAcquired) releaseGitLock(conv.id);
+    }
   }
 
   // ========================================
@@ -849,6 +904,7 @@ ${conv.requirements}
     lastFiles: FileToWrite[],
     retryCount: number,
     branchName: string,
+    diagnosisRound = 0,
   ): Promise<void> {
     // ── Step 1: ビルド ──
     dbLog('info', 'dev-agent', `[チーム] ビルド開始 (試行 ${retryCount + 1})`, { convId: conv.id });
@@ -877,10 +933,10 @@ ${conv.requirements}
           }
         }
         // コードエラー or 修正不可な環境エラー → エンジニアに自動修正させる
-        await this.autoFixBuildError(conv, lastFiles, retryCount, branchName, buildResult.buildOutput || '');
+        await this.autoFixBuildError(conv, lastFiles, retryCount, branchName, buildResult.buildOutput || '', undefined, diagnosisRound);
       } else {
         // ── リトライ上限到達 → チーム診断 ──
-        await this.handleExhaustedRetries(conv, branchName, 'build', buildResult.buildOutput || '', classified, lastFiles);
+        await this.handleExhaustedRetries(conv, branchName, 'build', buildResult.buildOutput || '', classified, lastFiles, undefined, diagnosisRound);
       }
       return;
     }
@@ -932,10 +988,10 @@ ${conv.requirements}
         await sendLineMessage(conv.user_id,
           `🧪 ${failedName}失敗 → エンジニアに差し戻し (${retryCount + 1}/${MAX_TEST_FIX_RETRIES})\n${failedResult.message}\n${failedResult.details?.slice(0, 200) || ''}`
         );
-        await this.autoFixTestError(conv, lastFiles, retryCount, branchName, testResults);
+        await this.autoFixTestError(conv, lastFiles, retryCount, branchName, testResults, undefined, diagnosisRound);
       } else {
         // ── リトライ上限到達 → チーム診断 ──
-        await this.handleExhaustedRetries(conv, branchName, 'test', errorText, classified, lastFiles, testResults);
+        await this.handleExhaustedRetries(conv, branchName, 'test', errorText, classified, lastFiles, testResults, diagnosisRound);
       }
       return;
     }
@@ -988,11 +1044,30 @@ ${conv.requirements}
     classified: ReturnType<typeof classifyError>,
     lastFiles: FileToWrite[],
     testResults?: TestResult[],
+    diagnosisRound = 0,
   ): Promise<void> {
     const maxRetries = phase === 'build' ? MAX_BUILD_RETRIES : MAX_TEST_FIX_RETRIES;
     const phaseName = phase === 'build' ? 'ビルド' : 'テスト';
-    dbLog('info', 'dev-agent', `[チーム診断] ${phaseName}修正${maxRetries}回失敗 → チーム診断開始`, { convId: conv.id });
-    await sendLineMessage(conv.user_id, `🏥 ${phaseName}修正が上限に達しました。チーム診断会議を開始...`);
+
+    // ── 診断ラウンド上限チェック ──
+    if (diagnosisRound >= MAX_DIAGNOSIS_ROUNDS) {
+      dbLog('error', 'dev-agent', `[チーム診断] 診断${MAX_DIAGNOSIS_ROUNDS}ラウンド到達 → 強制エスカレーション`, { convId: conv.id });
+      this.stuckContextMap.set(conv.id, {
+        branchName, subtasks: [], completedFiles: [],
+        failedSubtaskIndex: 0, errorMessage: errorOutput.slice(0, 500),
+        phase, lastFiles,
+      });
+      updateConversationStatus(conv.id, 'stuck');
+      await sendLineMessage(conv.user_id,
+        `🏥 ${phaseName}エラーが${MAX_DIAGNOSIS_ROUNDS}ラウンドの診断・修正を経ても解決できませんでした。\n\n` +
+        `エラー:\n${errorOutput.slice(0, 300)}\n\n` +
+        `選択肢:\n・「リトライ」→ もう一度ビルドから再試行\n・追加指示 → 修正のヒントを教えてください\n・「中止」→ ロールバックして終了`
+      ).catch(() => {});
+      return;
+    }
+
+    dbLog('info', 'dev-agent', `[チーム診断] ${phaseName}修正${maxRetries}回失敗 → チーム診断開始 (round ${diagnosisRound + 1}/${MAX_DIAGNOSIS_ROUNDS})`, { convId: conv.id });
+    await sendLineMessage(conv.user_id, `🏥 ${phaseName}修正が上限に達しました。チーム診断会議を開始... (${diagnosisRound + 1}/${MAX_DIAGNOSIS_ROUNDS})`);
 
     const diagnosis = await runTeamDiagnosis({
       convId: conv.id,
@@ -1022,16 +1097,16 @@ ${conv.requirements}
         await sendLineMessage(conv.user_id, `⏳ チーム診断: ${diagnosis.actionPlan}\n${waitMs / 1000}秒待機後にリトライ...${analysisReport}`);
         await sleep(waitMs);
         // リトライカウントをリセット（診断を経たので新しい試行として扱う）
-        await this.runBuildAndDeploy(conv, lastFiles, 0, branchName);
+        await this.runBuildAndDeploy(conv, lastFiles, 0, branchName, diagnosisRound + 1);
         break;
       }
       case 'retry_with_fix': {
         await sendLineMessage(conv.user_id, `🔧 チーム診断: ${diagnosis.actionPlan}${analysisReport}`);
         // 診断の修正指示をもとに再修正を試みる
         if (phase === 'build') {
-          await this.autoFixBuildError(conv, lastFiles, 0, branchName, errorOutput, diagnosis.fixInstructions);
+          await this.autoFixBuildError(conv, lastFiles, 0, branchName, errorOutput, diagnosis.fixInstructions, diagnosisRound + 1);
         } else {
-          await this.autoFixTestError(conv, lastFiles, 0, branchName, testResults || [], diagnosis.fixInstructions);
+          await this.autoFixTestError(conv, lastFiles, 0, branchName, testResults || [], diagnosis.fixInstructions, diagnosisRound + 1);
         }
         break;
       }
@@ -1057,6 +1132,7 @@ ${conv.requirements}
           failedSubtaskIndex: 0,
           errorMessage: diagnosis.rootCause,
           phase,
+          lastFiles,
         });
         updateConversationStatus(conv.id, 'stuck');
         await sendLineMessage(conv.user_id,
@@ -1082,6 +1158,8 @@ ${conv.requirements}
     branchName: string,
     buildOutput: string,
     diagnosisHint?: string,
+    diagnosisRound = 0,
+    transientWaitCount = 0,
   ): Promise<void> {
     dbLog('warn', 'dev-agent', `[エンジニア] ビルドエラー → 自動修正 (${retryCount + 1}/${MAX_BUILD_RETRIES})`, {
       convId: conv.id,
@@ -1136,7 +1214,7 @@ ${conv.requirements}
 
       await writeFiles(fixedFiles);
       recordBuildLearning('engineer', buildOutput.slice(0, 200), '自動修正を適用');
-      await this.runBuildAndDeploy(conv, fixedFiles, retryCount + 1, branchName);
+      await this.runBuildAndDeploy(conv, fixedFiles, retryCount + 1, branchName, diagnosisRound);
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       dbLog('error', 'dev-agent', `[エンジニア] ビルド自動修正失敗: ${errMsg.slice(0, 200)}`, { convId: conv.id });
@@ -1144,12 +1222,25 @@ ${conv.requirements}
       // 自動修正自体が失敗した場合もエラーを分類
       const classified = classifyError(errMsg);
       if (classified.category === 'transient') {
-        // APIレートリミット等 → 待機してリトライ
+        if (transientWaitCount >= MAX_TRANSIENT_WAITS) {
+          dbLog('error', 'dev-agent', `[エンジニア] 一時的エラー待機${MAX_TRANSIENT_WAITS}回到達 → エスカレーション`, { convId: conv.id });
+          updateConversationStatus(conv.id, 'stuck');
+          this.stuckContextMap.set(conv.id, {
+            branchName, subtasks: [], completedFiles: [],
+            failedSubtaskIndex: 0, errorMessage: errMsg,
+            phase: 'build', lastFiles,
+          });
+          await sendLineMessage(conv.user_id,
+            `⏳ API制限が${MAX_TRANSIENT_WAITS}回連続で発生しました。\n\n` +
+            `選択肢:\n・「リトライ」→ 再試行\n・「中止」→ 開発を中止`
+          ).catch(() => {});
+          return;
+        }
         const waitMs = classified.waitMs || 60_000;
-        dbLog('info', 'dev-agent', `[エンジニア] 自動修正中の一時的エラー → ${waitMs / 1000}秒待機`, { convId: conv.id });
-        await sendLineMessage(conv.user_id, `⏳ API制限。${waitMs / 1000}秒待機後にリトライ...`);
+        dbLog('info', 'dev-agent', `[エンジニア] 自動修正中の一時的エラー → ${waitMs / 1000}秒待機 (${transientWaitCount + 1}/${MAX_TRANSIENT_WAITS})`, { convId: conv.id });
+        await sendLineMessage(conv.user_id, `⏳ API制限。${waitMs / 1000}秒待機後にリトライ... (${transientWaitCount + 1}/${MAX_TRANSIENT_WAITS})`);
         await sleep(waitMs);
-        await this.autoFixBuildError(conv, lastFiles, retryCount, branchName, buildOutput, diagnosisHint);
+        await this.autoFixBuildError(conv, lastFiles, retryCount, branchName, buildOutput, diagnosisHint, diagnosisRound, transientWaitCount + 1);
         return;
       }
 
@@ -1172,6 +1263,8 @@ ${conv.requirements}
     branchName: string,
     testResults: TestResult[],
     diagnosisHint?: string,
+    diagnosisRound = 0,
+    transientWaitCount = 0,
   ): Promise<void> {
     dbLog('warn', 'dev-agent', `[エンジニア] テスト失敗 → 自動修正 (${retryCount + 1}/${MAX_TEST_FIX_RETRIES})`, { convId: conv.id });
     await sendLineMessage(conv.user_id,
@@ -1230,7 +1323,7 @@ ${conv.requirements}
       if (failedResult) {
         recordBuildLearning('engineer', failedResult.message, '自動修正を適用');
       }
-      await this.runBuildAndDeploy(conv, fixedFiles, retryCount + 1, branchName);
+      await this.runBuildAndDeploy(conv, fixedFiles, retryCount + 1, branchName, diagnosisRound);
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       dbLog('error', 'dev-agent', `[エンジニア] テスト自動修正失敗: ${errMsg.slice(0, 200)}`, { convId: conv.id });
@@ -1238,11 +1331,25 @@ ${conv.requirements}
       // 自動修正自体が失敗した場合もエラーを分類
       const classified = classifyError(errMsg);
       if (classified.category === 'transient') {
+        if (transientWaitCount >= MAX_TRANSIENT_WAITS) {
+          dbLog('error', 'dev-agent', `[エンジニア] 一時的エラー待機${MAX_TRANSIENT_WAITS}回到達 → エスカレーション`, { convId: conv.id });
+          updateConversationStatus(conv.id, 'stuck');
+          this.stuckContextMap.set(conv.id, {
+            branchName, subtasks: [], completedFiles: [],
+            failedSubtaskIndex: 0, errorMessage: errMsg,
+            phase: 'test', lastFiles,
+          });
+          await sendLineMessage(conv.user_id,
+            `⏳ API制限が${MAX_TRANSIENT_WAITS}回連続で発生しました。\n\n` +
+            `選択肢:\n・「リトライ」→ 再試行\n・「中止」→ 開発を中止`
+          ).catch(() => {});
+          return;
+        }
         const waitMs = classified.waitMs || 60_000;
-        dbLog('info', 'dev-agent', `[エンジニア] 自動修正中の一時的エラー → ${waitMs / 1000}秒待機`, { convId: conv.id });
-        await sendLineMessage(conv.user_id, `⏳ API制限。${waitMs / 1000}秒待機後にリトライ...`);
+        dbLog('info', 'dev-agent', `[エンジニア] 自動修正中の一時的エラー → ${waitMs / 1000}秒待機 (${transientWaitCount + 1}/${MAX_TRANSIENT_WAITS})`, { convId: conv.id });
+        await sendLineMessage(conv.user_id, `⏳ API制限。${waitMs / 1000}秒待機後にリトライ... (${transientWaitCount + 1}/${MAX_TRANSIENT_WAITS})`);
         await sleep(waitMs);
-        await this.autoFixTestError(conv, lastFiles, retryCount, branchName, testResults, diagnosisHint);
+        await this.autoFixTestError(conv, lastFiles, retryCount, branchName, testResults, diagnosisHint, diagnosisRound, transientWaitCount + 1);
         return;
       }
 
