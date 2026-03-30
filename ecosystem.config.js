@@ -1,9 +1,8 @@
 module.exports = {
   apps: [{
     name: 'mothership',
-    script: './src/index.ts',
-    interpreter: 'node',
-    interpreter_args: '--import tsx/esm',
+    script: './start.sh',
+    interpreter: 'bash',
     exec_mode: 'fork',
     instances: 1,
     autorestart: true,
