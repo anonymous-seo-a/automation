@@ -1,8 +1,7 @@
 module.exports = {
   apps: [{
     name: 'mothership',
-    script: './start.sh',
-    interpreter: 'bash',
+    script: './dist/index.js',
     exec_mode: 'fork',
     instances: 1,
     autorestart: true,
