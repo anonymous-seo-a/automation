@@ -111,7 +111,10 @@ export class DevAgent implements Agent {
       if (!conv) {
         conv = createConversation(userId, text);
         dbLog('info', 'dev-agent', `新規開発会話: ${text.slice(0, 60)}`, { convId: conv.id });
-        await sendLineMessage(userId, `「${text}」について、いくつか確認させてください。`);
+        await sendLineMessage(userId,
+          `🛠 開発モード開始\n「${text.slice(0, 40)}」について、いくつか確認させてください。\n\n` +
+          `（「やめる」「中止」でいつでも開発モードを終了できます）`
+        );
         await this.safeExecutePhase(conv, 'hearing', () => this.runHearing(conv!, text));
         return;
       }

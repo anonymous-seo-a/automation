@@ -168,9 +168,9 @@ export async function handleMessage(userId: string, text: string): Promise<void>
 
   // ★ hearing フェーズ: responderに判断を委ねる（後述のDEV_AGENTトリガー経由）
 
-  // ★ 新規開発依頼
-  if (!activeDevConv && /開発して|実装して|母艦に.*追加して|新しいエージェントを作って|機能を追加して/.test(text)) {
-    dbLog('info', 'webhook', 'ルーティング → 新規開発依頼');
+  // ★ 新規開発依頼（正規表現で即マッチ）
+  if (!activeDevConv && isDevRequest(text)) {
+    dbLog('info', 'webhook', 'ルーティング → 新規開発依頼（パターンマッチ）');
     await devAgent.handleMessage(userId, text);
     return;
   }
@@ -228,6 +228,11 @@ export async function handleMessage(userId: string, text: string): Promise<void>
         } catch { /* ignore */ }
         devContext += '\n\nユーザーのメッセージがこの開発への回答であれば "DEV_AGENT" と返してください。無関係な話題なら普通に回答してください。';
       }
+    } else {
+      // 開発会話がない時も、新規開発依頼を検出する
+      devContext = '\n\n## 開発エージェント\nこのシステムには開発チーム（PM→エンジニア→レビュアー）が組み込まれています。' +
+        'ユーザーが「何かを作って欲しい」「機能を追加したい」「ページ/ツール/エージェントを開発して」のような開発依頼をしている場合は、"DEV_AGENT" とだけ返してください。' +
+        '雑談・質問・相談など開発依頼でないメッセージには普通に回答してください。';
     }
 
     const response = await generateResponse(text, {
@@ -259,6 +264,11 @@ export async function handleMessage(userId: string, text: string): Promise<void>
     await sendLineMessage(userId, errorResponse);
     saveMessage(dbId, 'assistant', errorResponse);
   }
+}
+
+/** 開発依頼かどうかを正規表現で判定 */
+function isDevRequest(text: string): boolean {
+  return /開発して|実装して|開発依頼|開発.*お願い|母艦に.*追加|新しいエージェント.*作|機能.*追加して|作って.*欲しい|ページ.*作って|ツール.*作って|ボット.*作って|追加.*開発|エンジニア.*依頼|開発チーム.*お願い/.test(text);
 }
 
 function isDefiningResponse(text: string): boolean {
