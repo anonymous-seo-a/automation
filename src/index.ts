@@ -2,6 +2,7 @@ import express, { Request, Response } from 'express';
 import { config } from './config';
 import { runMigrations } from './db/migrations';
 import { webhookRouter } from './line/webhook';
+import { telegramRouter } from './telegram/webhook';
 import { adminRouter } from './admin/dashboard';
 import { startWorker } from './executor/executor';
 import { loadKnowledgeFiles } from './knowledge/loader';
@@ -45,6 +46,12 @@ async function main(): Promise<void> {
   // /webhook でも / でもLINEからのリクエストを受け付ける
   app.use('/webhook', webhookRouter);
   app.use(webhookRouter);
+
+  // Telegram Webhook（express.json() でボディパース）
+  app.use('/telegram', express.json(), telegramRouter);
+  if (config.telegram.botToken) {
+    logger.info('Telegram Webhook 有効: /telegram');
+  }
 
   // 開発用テストエンドポイント（LINE経由せずにタスク投入）
   if (config.server.env !== 'production') {

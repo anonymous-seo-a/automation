@@ -56,7 +56,7 @@ function wantsToExit(text: string): boolean {
   return /リセット|reset|キャンセル|やめ|中止|中断|ストップ|stop|もういい|いらない|別の話|終わり|終了/i.test(text);
 }
 
-async function handleMessage(userId: string, text: string): Promise<void> {
+export async function handleMessage(userId: string, text: string): Promise<void> {
   // セッション追跡
   trackMessage(userId);
 

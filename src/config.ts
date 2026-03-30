@@ -38,6 +38,10 @@ export const config = {
     apiKey: process.env.VOYAGE_API_KEY || '',
     model: process.env.VOYAGE_MODEL || 'voyage-3.5',
   },
+  telegram: {
+    botToken: process.env.TELEGRAM_BOT_TOKEN || '',
+    allowedChatId: process.env.TELEGRAM_ALLOWED_CHAT_ID || '',
+  },
   admin: {
     password: process.env.ADMIN_PASSWORD || 'mothership2026',
     baseUrl: process.env.ADMIN_BASE_URL || 'https://bot.anonymous-seo.jp',

@@ -1,5 +1,6 @@
 import * as line from '@line/bot-sdk';
 import { config } from '../config';
+import { sendTelegramMessage } from '../telegram/client';
 import { logger } from '../utils/logger';
 
 const client = new line.messagingApi.MessagingApiClient({
@@ -8,10 +9,24 @@ const client = new line.messagingApi.MessagingApiClient({
 
 const MAX_LINE_LENGTH = 4900;
 
-export async function sendLineMessage(
-  userId: string,
-  text: string
-): Promise<void> {
+/**
+ * ユニファイド送信関数: userId が "tg:" プレフィックスならTelegram、それ以外はLINE
+ */
+export async function sendMessage(userId: string, text: string): Promise<void> {
+  if (userId.startsWith('tg:')) {
+    const chatId = userId.slice(3);
+    await sendTelegramMessage(chatId, text);
+  } else {
+    await sendLineMessageDirect(userId, text);
+  }
+}
+
+/** LINE専用送信（後方互換） */
+export async function sendLineMessage(userId: string, text: string): Promise<void> {
+  await sendMessage(userId, text);
+}
+
+async function sendLineMessageDirect(userId: string, text: string): Promise<void> {
   try {
     const chunks = splitMessage(text);
     for (const chunk of chunks) {
@@ -21,7 +36,6 @@ export async function sendLineMessage(
       });
     }
   } catch (err: any) {
-    // LINE月間無料枠超過 (429) の場合は明確にログ
     if (err?.status === 429 || err?.statusCode === 429) {
       logger.error('LINE送信失敗: 月間メッセージ上限到達', { userId });
     } else {
