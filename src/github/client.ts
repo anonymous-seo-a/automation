@@ -82,9 +82,65 @@ export async function getCommitDetail(sha: string): Promise<string> {
   return `コミット: ${sha.slice(0, 7)}\nメッセージ: ${msg}\n変更ファイル:\n${files}`;
 }
 
+interface GitTreeItem {
+  path: string;
+  type: 'blob' | 'tree';
+  size?: number;
+}
+
+/** リポジトリの src/ 配下のファイルツリーを取得 */
+export async function getSourceTree(): Promise<string> {
+  const { owner, repo, branch } = config.github;
+  const data = await ghFetch<{ tree: GitTreeItem[] }>(
+    `/repos/${owner}/${repo}/git/trees/${encodeURIComponent(branch)}?recursive=1`
+  );
+
+  if (!data?.tree) return '（ファイルツリーを取得できませんでした）';
+
+  // src/ と knowledge/ のみ表示（ディレクトリ構造として整形）
+  const relevantFiles = data.tree
+    .filter(item => item.type === 'blob' && (item.path.startsWith('src/') || item.path.startsWith('knowledge/')))
+    .map(item => item.path);
+
+  if (relevantFiles.length === 0) return '（src/ ファイルが見つかりません）';
+
+  // ディレクトリ別にグループ化
+  const dirs = new Map<string, string[]>();
+  for (const filePath of relevantFiles) {
+    const parts = filePath.split('/');
+    const dir = parts.slice(0, -1).join('/');
+    const file = parts[parts.length - 1];
+    if (!dirs.has(dir)) dirs.set(dir, []);
+    dirs.get(dir)!.push(file);
+  }
+
+  const lines: string[] = [];
+  for (const [dir, files] of [...dirs.entries()].sort()) {
+    lines.push(`📁 ${dir}/`);
+    for (const f of files.sort()) {
+      lines.push(`   ${f}`);
+    }
+  }
+
+  return lines.join('\n');
+}
+
 /** 自己状態レポートを生成（responderから呼ばれる） */
 export async function buildSelfAwarenessContext(): Promise<string> {
-  const commitLog = await getRecentCommits(8);
+  // コミット履歴とファイルツリーを並行取得
+  const [commitLog, fileTree] = await Promise.all([
+    getRecentCommits(8),
+    getSourceTree(),
+  ]);
 
-  return `## GitHub 最新状態（${config.github.owner}/${config.github.repo} @ ${config.github.branch}）\n\n### 最近のコミット\n${commitLog}`;
+  return [
+    `## GitHub 最新状態（${config.github.owner}/${config.github.repo} @ ${config.github.branch}）`,
+    '',
+    '### 実際のソースファイル構成',
+    '以下が現在リポジトリに存在する実ファイル。ナレッジに記載があっても、ここにないものは未実装。',
+    fileTree,
+    '',
+    '### 最近のコミット',
+    commitLog,
+  ].join('\n');
 }
