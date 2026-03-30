@@ -338,8 +338,8 @@ export async function deployWithHealthCheck(branchName: string, pendingInfo: Pen
   // pm2 restartを fire-and-forget で発火。自プロセスは死ぬ前提。
   exec('pm2 restart mothership', { cwd: PROJECT_ROOT, timeout: 15000 }, () => {});
 
-  // pm2が自プロセスを殺すまで少し待つ（通常ここには到達しない）
-  await sleep(30000);
+  // pm2が自プロセスを殺すまで待つ（通常ここには到達しない）
+  await sleep(60000);
 
   // 万が一ここに到達した場合（pm2が自分を管理していない等）
   clearPendingDeploy();
@@ -403,7 +403,7 @@ export async function completePendingDeploy(): Promise<void> {
         runRetrospective(updatedConv).catch(err =>
           logger.warn('レトロスペクティブ失敗', { err: err instanceof Error ? err.message : String(err) })
         )
-      ).catch(() => {});
+      ).catch(err => logger.warn('レトロスペクティブimport失敗', { err: err instanceof Error ? err.message : String(err) }));
     }
   } else {
     dbLog('error', 'deploy', 'ヘルスチェック失敗 → ロールバック', { convId: pending.convId });

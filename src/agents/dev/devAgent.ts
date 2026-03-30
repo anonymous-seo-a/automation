@@ -94,6 +94,8 @@ export class DevAgent implements Agent {
 
   // 会話ID → stuckコンテキストのマッピング（シングルトンでも安全）
   private stuckContextMap = new Map<string, StuckContext>();
+  // リトライ/スキップ実行中の会話IDセット（二重実行防止）
+  private resumingSet = new Set<string>();
 
   async execute(task: Task): Promise<TaskResult> {
     return {
@@ -528,8 +530,11 @@ export class DevAgent implements Agent {
           });
           updateConversationStatus(conv.id, 'stuck');
 
-          // ロック解放
-          if (gitLockAcquired) releaseGitLock(conv.id);
+          // ロック解放（finallyで二重解放されないようフラグを落とす）
+          if (gitLockAcquired) {
+            releaseGitLock(conv.id);
+            gitLockAcquired = false;
+          }
 
           await sendLineMessage(conv.user_id,
             `サブタスク ${subtask.index}/${subtasks.length} (${subtask.path}) で問題が発生しました:\n` +
@@ -595,6 +600,12 @@ export class DevAgent implements Agent {
   }
 
   private async handleStuck(conv: DevConversation, userReply: string): Promise<void> {
+    // 二重実行防止: リトライ/スキップが既に進行中ならブロック
+    if (this.resumingSet.has(conv.id)) {
+      await sendLineMessage(conv.user_id, '再試行を処理中です。完了までお待ちください。');
+      return;
+    }
+
     const ctx = this.stuckContextMap.get(conv.id);
     if (!ctx) {
       await sendLineMessage(conv.user_id, 'スタック情報が失われました。新しい開発依頼を送ってください。');
@@ -616,6 +627,7 @@ export class DevAgent implements Agent {
     if (/^スキップ/.test(normalizedReply)) {
       dbLog('info', 'dev-agent', `[stuck] サブタスク ${ctx.failedSubtaskIndex + 1} をスキップ`, { convId: conv.id });
       this.stuckContextMap.delete(conv.id);
+      this.resumingSet.add(conv.id);
       this.runImplementation(conv, {
         branchName: ctx.branchName,
         subtasks: ctx.subtasks,
@@ -626,7 +638,7 @@ export class DevAgent implements Agent {
         dbLog('error', 'dev-agent', `[チーム] 再開未捕捉エラー: ${errMsg}`, { convId: conv.id });
         updateConversationStatus(conv.id, 'failed');
         sendLineMessage(conv.user_id, `再開中にエラー:\n${errMsg.slice(0, 300)}`).catch(() => {});
-      });
+      }).finally(() => this.resumingSet.delete(conv.id));
       return;
     }
 
@@ -640,6 +652,7 @@ export class DevAgent implements Agent {
     }
 
     this.stuckContextMap.delete(conv.id);
+    this.resumingSet.add(conv.id);
     this.runImplementation(conv, {
       branchName: ctx.branchName,
       subtasks: ctx.subtasks,
@@ -650,7 +663,7 @@ export class DevAgent implements Agent {
       dbLog('error', 'dev-agent', `[チーム] リトライ未捕捉エラー: ${errMsg}`, { convId: conv.id });
       updateConversationStatus(conv.id, 'failed');
       sendLineMessage(conv.user_id, `リトライ中にエラー:\n${errMsg.slice(0, 300)}`).catch(() => {});
-    });
+    }).finally(() => this.resumingSet.delete(conv.id));
   }
 
   // ========================================

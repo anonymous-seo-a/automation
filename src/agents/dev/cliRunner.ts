@@ -1,4 +1,4 @@
-import { execFile } from 'child_process';
+import { execFile, ChildProcess } from 'child_process';
 import path from 'path';
 import { config } from '../../config';
 import { logger } from '../../utils/logger';
@@ -18,7 +18,7 @@ export function runClaudeCLI(prompt: string, timeoutMs = 300_000): Promise<CLIRe
   return new Promise((resolve) => {
     logger.info('Claude CLI実行開始', { promptLength: prompt.length });
 
-    execFile('npx', [
+    const child: ChildProcess = execFile('npx', [
       '-y', '@anthropic-ai/claude-code',
       '-p',
       '--output-format', 'text',
@@ -34,6 +34,10 @@ export function runClaudeCLI(prompt: string, timeoutMs = 300_000): Promise<CLIRe
       maxBuffer: 10 * 1024 * 1024, // 10MB
     }, (error, stdout, stderr) => {
       if (error) {
+        // タイムアウト時は子プロセスを確実にkill（孤児プロセス防止）
+        if (child.pid && error.message?.includes('TIMEOUT')) {
+          try { process.kill(child.pid, 'SIGKILL'); } catch { /* already dead */ }
+        }
         logger.warn('Claude CLI実行エラー', { err: error.message.slice(0, 300) });
         resolve({
           success: false,
