@@ -5,6 +5,7 @@ import { config } from '../config';
 import { listAgents } from '../agents/router';
 import { renderPage } from './views';
 import { setupLiveRoutes } from './liveView';
+import { statsRouter } from './stats';
 
 export const adminRouter = Router();
 
@@ -27,6 +28,9 @@ adminRouter.use((req: Request, res: Response, next) => {
 });
 
 adminRouter.use(express.json());
+
+// 統計API
+adminRouter.use('/stats', statsRouter);
 
 // ライブオフィスビュー
 setupLiveRoutes(adminRouter);
