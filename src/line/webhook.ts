@@ -158,6 +158,12 @@ export async function handleMessage(userId: string, text: string): Promise<void>
 
   // ★ defining フェーズ: OKか修正指示のみdevへ
   if (activeDevConv && activeDevConv.status === 'defining') {
+    // requirements が未生成（API呼び出し中）の場合はメッセージをブロック
+    if (!activeDevConv.requirements) {
+      dbLog('info', 'webhook', `要件定義書生成中にメッセージ受信（待機通知）: "${text.slice(0, 20)}"`);
+      await sendLineMessage(userId, '要件定義書を作成中です。もう少しお待ちください...\n（完了後に確認いただけます）');
+      return;
+    }
     if (isDefiningResponse(text)) {
       dbLog('info', 'webhook', `ルーティング → defining応答: "${text.slice(0, 20)}"`);
       await devAgent.handleMessage(userId, text);
@@ -272,8 +278,11 @@ function isDevRequest(text: string): boolean {
 }
 
 function isDefiningResponse(text: string): boolean {
-  if (/^(ok|おk|はい|いいよ|お願い|問題ない|大丈夫|進めて|実装して|それで)$/i.test(text.trim())) return true;
-  if (/変えて|修正して|追加して|削除して|不要|変更して|直して|ここを|要件/.test(text)) return true;
+  const trimmed = text.trim();
+  // 承認パターン（完全一致）
+  if (/^(ok|おk|はい|いいよ|お願い|問題ない|大丈夫|進めて|実装して|それで|それでいい|いいと思う|よさそう|良さそう)$/i.test(trimmed)) return true;
+  // 修正指示パターン（具体的な動詞のみ。「要件」「追加して」は状況確認と紛らわしいので除外）
+  if (/変えて|修正して|削除して|不要|変更して|直して|ここを|書き直して|やり直して/.test(trimmed)) return true;
   return false;
 }
 

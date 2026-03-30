@@ -368,8 +368,16 @@ export class DevAgent implements Agent {
   private async handleDefining(conv: DevConversation, userReply: string): Promise<void> {
     dbLog('info', 'dev-agent', `[PM] 要件定義フェーズ応答: ${userReply.slice(0, 40)}`, { convId: conv.id });
 
-    if (/^(ok|おk|はい|いいよ|お願い|問題ない|大丈夫|進めて|実装して|それで)$/i.test(userReply.trim())) {
-      updateConversationStatus(conv.id, 'approved');
+    // 要件が未生成の場合は何もしない（webhookで弾くが二重安全）
+    const freshConv = getConversation(conv.id);
+    if (!freshConv?.requirements) {
+      dbLog('warn', 'dev-agent', '[PM] 要件未生成のまま handleDefining に到達', { convId: conv.id });
+      await sendLineMessage(conv.user_id, '要件定義書を作成中です。完了までお待ちください。');
+      return;
+    }
+
+    if (/^(ok|おk|はい|いいよ|お願い|問題ない|大丈夫|進めて|実装して|それで|それでいい|いいと思う|よさそう|良さそう)$/i.test(userReply.trim())) {
+      updateConversationStatus(freshConv.id, 'approved');
       dbLog('info', 'dev-agent', '[PM] 要件承認 → 実装開始', { convId: conv.id });
       await sendLineMessage(conv.user_id, '実装を開始します。チーム体制で進めます。\n（PM → エンジニア → レビュアー の順で各ファイルを処理）');
       // 実装は非同期で実行（safeExecutePhaseの5分タイムアウトを回避）
@@ -384,8 +392,7 @@ export class DevAgent implements Agent {
       dbLog('info', 'dev-agent', '[PM] 要件修正指示を受信', { convId: conv.id });
       await sendLineMessage(conv.user_id, '要件を修正中...');
 
-      const updatedConv = getConversation(conv.id);
-      const requirements = updatedConv?.requirements || conv.requirements || '(要件未記録)';
+      const requirements = freshConv.requirements;
       const codebaseCtx = await this.buildCodebaseContext();
       const { text } = await callClaude({
         system: DEV_SYSTEM_PROMPT + '\n\n' + PM_REQUIREMENTS_PROMPT,
@@ -607,22 +614,34 @@ export class DevAgent implements Agent {
   private async pmDecompose(conv: DevConversation): Promise<Subtask[]> {
     dbLog('info', 'dev-agent', '[PM] サブタスク分解開始', { convId: conv.id });
 
-    const codebaseCtx = await this.buildCodebaseContext();
-
-    const { text } = await callClaude({
-      system: DEV_SYSTEM_PROMPT + '\n\n' + PM_DECOMPOSE_PROMPT,
-      messages: [
-        { role: 'user', content: `${codebaseCtx}\n\n以下の要件をサブタスクに分解してください:\n\n${conv.requirements}` },
-      ],
-      model: 'opus',
-    });
-
-    const parsed = safeParseJson(text);
-    if (!parsed || !parsed.subtasks || !Array.isArray(parsed.subtasks)) {
-      throw new Error('PM: サブタスク分解のパースに失敗');
+    // 要件が短すぎる場合は壊れている可能性が高い → エラー
+    if (!conv.requirements || conv.requirements.length < 100) {
+      throw new Error(`PM: 要件定義書が不正です (${conv.requirements?.length || 0}文字)。要件定義からやり直してください。`);
     }
 
-    return parsed.subtasks as Subtask[];
+    const codebaseCtx = await this.buildCodebaseContext();
+    const MAX_DECOMPOSE_RETRIES = 3;
+
+    for (let attempt = 1; attempt <= MAX_DECOMPOSE_RETRIES; attempt++) {
+      const retryHint = attempt > 1 ? '\n\n⚠️ 前回の出力がJSON形式ではありませんでした。必ず {"subtasks": [...]} のJSON形式のみを出力してください。説明文は不要です。' : '';
+
+      const { text } = await callClaude({
+        system: DEV_SYSTEM_PROMPT + '\n\n' + PM_DECOMPOSE_PROMPT,
+        messages: [
+          { role: 'user', content: `${codebaseCtx}\n\n以下の要件をサブタスクに分解してください:\n\n${conv.requirements}${retryHint}` },
+        ],
+        model: 'opus',
+      });
+
+      const parsed = safeParseJson(text);
+      if (parsed && parsed.subtasks && Array.isArray(parsed.subtasks) && parsed.subtasks.length > 0) {
+        return parsed.subtasks as Subtask[];
+      }
+
+      dbLog('warn', 'dev-agent', `[PM] サブタスク分解パース失敗 (${attempt}/${MAX_DECOMPOSE_RETRIES}): ${text.slice(0, 200)}`, { convId: conv.id });
+    }
+
+    throw new Error(`PM: サブタスク分解のパースに${MAX_DECOMPOSE_RETRIES}回失敗しました`);
   }
 
   // ========================================
