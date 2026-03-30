@@ -133,6 +133,14 @@ export async function rollbackGit(branchName: string): Promise<void> {
     await execAsync(`git branch -D ${branchName}`).catch(() => {});
     // stash を戻す
     await execAsync('git stash pop').catch(() => {});
+    // dist/ をクリーン＆リビルド（壊れたコンパイル結果を除去）
+    try {
+      await fs.rm(path.join(PROJECT_ROOT, 'dist'), { recursive: true, force: true });
+      await execAsync('npm run build', 60000);
+      logger.info('rollback後リビルド完了');
+    } catch (rebuildErr) {
+      logger.error('rollback後リビルド失敗', { err: rebuildErr instanceof Error ? rebuildErr.message : String(rebuildErr) });
+    }
     logger.info('git rollback 完了: dev/initial-build に復帰');
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
@@ -207,6 +215,11 @@ export function extractErrorFiles(buildOutput: string): string[] {
 }
 
 export async function runBuild(): Promise<DeployResult> {
+  // dist/ をクリーンしてから再ビルド（削除されたソースのゴミが残らないように）
+  try {
+    await fs.rm(path.join(PROJECT_ROOT, 'dist'), { recursive: true, force: true });
+  } catch { /* ignore */ }
+
   return new Promise((resolve) => {
     exec('npm run build', {
       cwd: PROJECT_ROOT,
