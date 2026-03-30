@@ -29,6 +29,7 @@ import {
   prepareGitBranch,
   rollbackGit,
   commitAndStay,
+  readProjectFile,
   FileToWrite,
 } from './deployer';
 
@@ -623,6 +624,20 @@ export class DevAgent implements Agent {
       );
 
       try {
+        // ビルドエラーで参照されている既存ファイルも読み込む
+        const { extractErrorFiles } = await import('./deployer');
+        const errorFiles = extractErrorFiles(buildResult.buildOutput || '');
+        let existingContext = '';
+        for (const ef of errorFiles) {
+          const alreadyInLast = lastFiles.find(f => f.path === ef);
+          if (!alreadyInLast) {
+            const content = await readProjectFile(ef);
+            if (content) {
+              existingContext += `### ${ef}（既存ファイル）\n\`\`\`typescript\n${content}\n\`\`\`\n\n`;
+            }
+          }
+        }
+
         const { text } = await callClaude({
           system: DEV_SYSTEM_PROMPT + '\n\n' + ENGINEER_PROMPT,
           messages: [
@@ -630,12 +645,14 @@ export class DevAgent implements Agent {
               role: 'user',
               content: `以下のコードにビルドエラーがあります。修正してください。\n\n` +
                 `## ビルドエラー\n${buildResult.buildOutput}\n\n` +
-                `## 現在のコード\n${lastFiles.map(f => `### ${f.path}\n\`\`\`typescript\n${f.content}\n\`\`\``).join('\n\n')}\n\n` +
+                `## 今回変更したコード\n${lastFiles.map(f => `### ${f.path}\n\`\`\`typescript\n${f.content}\n\`\`\``).join('\n\n')}\n\n` +
+                (existingContext ? `## 関連する既存ファイル（参照用・変更が必要な場合のみ含めてください）\n${existingContext}\n\n` : '') +
+                `## 重要\n- 既存ファイルのimportパスや型定義に合わせてください\n- 存在しないモジュールをimportしないでください\n- package.jsonに無いパッケージは使わないでください\n\n` +
                 `全ファイルをまとめて修正してください。出力形式:\n{"files": [{"path": "...", "content": "...", "action": "..."}]}`,
             },
           ],
           model: 'default',
-          maxTokens: 8192,
+          maxTokens: 16384,
         });
 
         const parsed = safeParseJson(text);

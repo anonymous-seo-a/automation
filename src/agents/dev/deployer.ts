@@ -106,6 +106,37 @@ export async function writeFiles(files: FileToWrite[]): Promise<string[]> {
   return written;
 }
 
+/** プロジェクト内のファイルを読み込む（ビルドエラー修正用） */
+export async function readProjectFile(filePath: string): Promise<string | null> {
+  try {
+    const fullPath = path.join(PROJECT_ROOT, filePath);
+    return await fs.readFile(fullPath, 'utf-8');
+  } catch {
+    return null;
+  }
+}
+
+/** ビルドエラー出力からエラーが発生しているファイルパスを抽出 */
+export function extractErrorFiles(buildOutput: string): string[] {
+  const files = new Set<string>();
+  // TypeScript形式: src/foo/bar.ts(10,5): error TS2345
+  const tsMatches = buildOutput.matchAll(/(src\/[^\s:(]+\.ts)\(/g);
+  for (const m of tsMatches) {
+    files.add(m[1]);
+  }
+  // "Cannot find module '../xxx'" からのインポートパス推定
+  const moduleMatches = buildOutput.matchAll(/Cannot find module '([^']+)'/g);
+  for (const m of moduleMatches) {
+    const modPath = m[1].replace(/^\.\.?\//, 'src/').replace(/^src\/src\//, 'src/');
+    if (!modPath.endsWith('.ts')) {
+      files.add(modPath + '.ts');
+    } else {
+      files.add(modPath);
+    }
+  }
+  return [...files];
+}
+
 export async function runBuild(): Promise<DeployResult> {
   return new Promise((resolve) => {
     exec('npm run build', {

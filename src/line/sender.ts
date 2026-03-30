@@ -20,8 +20,13 @@ export async function sendLineMessage(
         messages: [{ type: 'text', text: chunk }],
       });
     }
-  } catch (err) {
-    logger.error('LINE送信エラー', { err, userId });
+  } catch (err: any) {
+    // LINE月間無料枠超過 (429) の場合は明確にログ
+    if (err?.status === 429 || err?.statusCode === 429) {
+      logger.error('LINE送信失敗: 月間メッセージ上限到達', { userId });
+    } else {
+      logger.error('LINE送信エラー', { err: err instanceof Error ? err.message : String(err), userId });
+    }
   }
 }
 
