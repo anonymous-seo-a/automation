@@ -1,6 +1,6 @@
 import { getNextTask, updateTaskStatus, TaskRow } from '../queue/taskQueue';
 import { runInSandbox } from './sandbox';
-import { sendLineMessage } from '../line/sender';
+import { sendMessage, getActiveSendTo } from '../line/sender';
 import { generateResponse } from '../line/responder';
 import { getAgent } from '../agents/router';
 import { Task } from '../agents/baseAgent';
@@ -107,7 +107,7 @@ async function executeTask(task: TaskRow): Promise<void> {
         `予算上限に達しました: ${errMsg}`,
         { rawContext: '予算超過でタスクが停止したことをユーザーに伝え、ダッシュボードで予算を確認するよう促してください。' }
       );
-      await sendLineMessage(config.line.allowedUserId, msg);
+      await sendMessage(getActiveSendTo(), msg);
       return;
     }
 
@@ -133,7 +133,7 @@ async function handleFailure(task: TaskRow, errorMsg: string): Promise<void> {
         rawContext: `タスクID: ${task.id}\nダッシュボードで詳細を確認できます: ${config.admin.baseUrl}/admin/tasks/${task.id}`,
       }
     );
-    await sendLineMessage(config.line.allowedUserId, msg);
+    await sendMessage(getActiveSendTo(), msg);
 
     dbLog('error', 'executor', 'タスク最終失敗', {
       taskId: task.id,
@@ -164,7 +164,7 @@ async function notifySuccess(
       rawContext: `タスクID: ${task.id}\n詳細: ${config.admin.baseUrl}/admin/tasks/${task.id}`,
     }
   );
-  await sendLineMessage(config.line.allowedUserId, msg);
+  await sendMessage(getActiveSendTo(), msg);
 }
 
 function sleep(ms: number): Promise<void> {

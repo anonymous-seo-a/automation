@@ -1,5 +1,5 @@
 import { Router, Request, Response } from 'express';
-import { isAuthorizedTelegramUser } from './client';
+import { isAuthorizedTelegramUser, TELEGRAM_WEBHOOK_SECRET } from './client';
 import { handleMessage } from '../line/webhook';
 import { logger, dbLog } from '../utils/logger';
 
@@ -17,6 +17,16 @@ interface TelegramUpdate {
 }
 
 telegramRouter.post('/', (req: Request, res: Response) => {
+  // シークレットトークン検証（設定されている場合）
+  if (TELEGRAM_WEBHOOK_SECRET) {
+    const token = req.headers['x-telegram-bot-api-secret-token'];
+    if (token !== TELEGRAM_WEBHOOK_SECRET) {
+      logger.warn('Telegram webhook シークレット不一致', { token });
+      res.status(403).end();
+      return;
+    }
+  }
+
   // Telegram は即座に 200 を返す必要がある
   res.status(200).end();
 

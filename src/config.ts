@@ -41,6 +41,7 @@ export const config = {
   telegram: {
     botToken: process.env.TELEGRAM_BOT_TOKEN || '',
     allowedChatId: process.env.TELEGRAM_ALLOWED_CHAT_ID || '',
+    webhookSecret: process.env.TELEGRAM_WEBHOOK_SECRET || '',
   },
   admin: {
     password: process.env.ADMIN_PASSWORD || 'mothership2026',

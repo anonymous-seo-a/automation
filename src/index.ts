@@ -140,3 +140,12 @@ main().catch((err) => {
   logger.error('起動失敗', { err });
   process.exit(1);
 });
+
+process.on('unhandledRejection', (reason) => {
+  logger.error('未処理のPromise拒否', { err: reason instanceof Error ? reason.message : String(reason) });
+});
+
+process.on('uncaughtException', (err) => {
+  logger.error('未キャッチの例外', { err: err.message, stack: err.stack });
+  process.exit(1);
+});

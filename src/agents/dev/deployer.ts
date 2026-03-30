@@ -75,8 +75,10 @@ export async function rollbackGit(branchName: string): Promise<void> {
 
 export async function commitAndStay(branchName: string, message: string): Promise<void> {
   try {
+    // シェルインジェクション防止: メッセージ内の特殊文字をエスケープ
+    const safeMessage = message.replace(/'/g, "'\\''");
     await execAsync('git add -A');
-    await execAsync(`git commit -m "${message}"`);
+    await execAsync(`git commit -m '${safeMessage}'`);
     logger.info(`コミット完了: ${branchName}`);
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);

@@ -9,6 +9,19 @@ const client = new line.messagingApi.MessagingApiClient({
 
 const MAX_LINE_LENGTH = 4900;
 
+// 最後にメッセージを送ってきたユーザーの送信先ID（tg: プレフィックス付き含む）
+let lastActiveSendToId: string = config.line.allowedUserId;
+
+/** 最後にアクティブだったプラットフォームの送信先IDを更新（webhook から呼ぶ） */
+export function setActiveSendTo(userId: string): void {
+  lastActiveSendToId = userId;
+}
+
+/** 最後にアクティブだったプラットフォームの送信先IDを取得 */
+export function getActiveSendTo(): string {
+  return lastActiveSendToId;
+}
+
 /**
  * ユニファイド送信関数: userId が "tg:" プレフィックスならTelegram、それ以外はLINE
  */
@@ -21,7 +34,7 @@ export async function sendMessage(userId: string, text: string): Promise<void> {
   }
 }
 
-/** LINE専用送信（後方互換） */
+/** 後方互換エイリアス（sendMessage と同一） */
 export async function sendLineMessage(userId: string, text: string): Promise<void> {
   await sendMessage(userId, text);
 }

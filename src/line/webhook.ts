@@ -2,7 +2,7 @@ import { Router, Request, Response } from 'express';
 import * as line from '@line/bot-sdk';
 import { config } from '../config';
 import { isAuthorizedUser } from './auth';
-import { sendLineMessage } from './sender';
+import { sendLineMessage, setActiveSendTo } from './sender';
 import { interpretTask } from '../interpreter/taskInterpreter';
 import { enqueueTask } from '../queue/taskQueue';
 import { getActiveConversation, cancelConversation, getConversation } from '../agents/dev/conversation';
@@ -14,6 +14,18 @@ import { saveMemoryWithEmbedding, getAllMemories, searchByMeaning, deleteMemory,
 import { trackMessage, isEndSignal, endSession } from '../memory/session';
 import { consolidateKnowledge, applyPendingUpdate } from '../knowledge/consolidator';
 import { logger, dbLog } from '../utils/logger';
+
+/**
+ * プラットフォーム間のユーザーID統一。
+ * DB操作（記憶・履歴・セッション）は常にLINE IDを使い、
+ * メッセージ送信は元の userId（tg: プレフィックス付き含む）を使う。
+ */
+function getCanonicalUserId(userId: string): string {
+  if (userId.startsWith('tg:')) {
+    return config.line.allowedUserId; // Telegram → LINE IDに統一
+  }
+  return userId;
+}
 
 const devAgent = new DevAgent();
 
@@ -57,8 +69,14 @@ function wantsToExit(text: string): boolean {
 }
 
 export async function handleMessage(userId: string, text: string): Promise<void> {
+  // DB用の正規化ID（LINE/Telegram共通で同一ユーザーの記憶を共有）
+  const dbId = getCanonicalUserId(userId);
+  // 送信用はそのまま userId を使う（tg: プレフィックスで自動切り替え）
+  // 最後にアクティブなプラットフォームを記録（executor等のバックグラウンド通知用）
+  setActiveSendTo(userId);
+
   // セッション追跡
-  trackMessage(userId);
+  trackMessage(dbId);
 
   if (text === 'ping') {
     await sendLineMessage(userId, 'pong');
@@ -67,24 +85,24 @@ export async function handleMessage(userId: string, text: string): Promise<void>
 
   // 終了合図 → セッション要約保存
   if (isEndSignal(text)) {
-    saveMessage(userId, 'user', text);
-    const response = await generateResponse(text, undefined, userId);
+    saveMessage(dbId, 'user', text);
+    const response = await generateResponse(text, undefined, dbId);
     await sendLineMessage(userId, response);
-    saveMessage(userId, 'assistant', response);
-    endSession(userId).catch(err => logger.warn('セッション終了失敗', { err: err instanceof Error ? err.message : String(err) }));
+    saveMessage(dbId, 'assistant', response);
+    endSession(dbId).catch(err => logger.warn('セッション終了失敗', { err: err instanceof Error ? err.message : String(err) }));
     return;
   }
 
   // ★ 記憶コマンド
-  const memoryResult = await handleMemoryCommand(userId, text);
+  const memoryResult = await handleMemoryCommand(userId, dbId, text);
   if (memoryResult) return;
 
   // ★ ナレッジ統合コマンド
   if (/^ナレッジ(更新|統合)$/.test(text)) {
-    saveMessage(userId, 'user', text);
+    saveMessage(dbId, 'user', text);
     await sendLineMessage(userId, 'ナレッジ統合を開始します...');
     try {
-      const result = await consolidateKnowledge(userId);
+      const result = await consolidateKnowledge(dbId);
       for (const diff of result.diffs) {
         await sendLineMessage(userId, diff);
       }
@@ -100,11 +118,11 @@ export async function handleMessage(userId: string, text: string): Promise<void>
 
   // ★ ナレッジ反映承認
   if (/^反映$/.test(text)) {
-    saveMessage(userId, 'user', text);
+    saveMessage(dbId, 'user', text);
     try {
-      const result = await applyPendingUpdate(userId);
+      const result = await applyPendingUpdate(dbId);
       await sendLineMessage(userId, result);
-      saveMessage(userId, 'assistant', result);
+      saveMessage(dbId, 'assistant', result);
     } catch (err) {
       logger.error('ナレッジ反映エラー', { err: err instanceof Error ? err.message : String(err) });
       await sendLineMessage(userId, 'ナレッジ反映でエラーが発生しました。');
@@ -112,6 +130,7 @@ export async function handleMessage(userId: string, text: string): Promise<void>
     return;
   }
 
+  // dev会話はプラットフォーム固有ID（tg:xxx等）で管理される（devAgentが作成時にuserIdを使うため）
   const activeDevConv = getActiveConversation(userId);
 
   // ★ 脱出チェック（最優先）
@@ -140,7 +159,6 @@ export async function handleMessage(userId: string, text: string): Promise<void>
   }
 
   // ★ hearing フェーズ: responderに判断を委ねる（後述のDEV_AGENTトリガー経由）
-  // hearing中のメッセージはauto-captureしない。代わりにresponderが文脈を見て判断。
 
   // ★ 新規開発依頼
   if (!activeDevConv && /開発して|実装して|母艦に.*追加して|新しいエージェントを作って|機能を追加して/.test(text)) {
@@ -150,10 +168,42 @@ export async function handleMessage(userId: string, text: string): Promise<void>
   }
 
   // --- 通常応答（hearing中もここを通る） ---
-  saveMessage(userId, 'user', text);
+  saveMessage(dbId, 'user', text);
   dbLog('info', 'webhook', 'ルーティング → 通常応答');
 
   try {
+    // ★ タスク実行判定を先にチェック（Claude API呼び出しの無駄を防ぐ）
+    if (shouldCreateTask(text)) {
+      dbLog('info', 'webhook', 'タスクキューへ投入');
+      const interpreted = await interpretTask(text);
+
+      if (interpreted.confirmation_needed) {
+        const clarifyResponse = await generateResponse(
+          `ユーザーの指示「${text}」について確認が必要です: ${interpreted.clarification_question}`,
+          { rawContext: '確認事項をユーザーに自然に質問してください。' },
+          dbId,
+        );
+        await sendLineMessage(userId, clarifyResponse);
+        saveMessage(dbId, 'assistant', clarifyResponse);
+        return;
+      }
+
+      for (const task of interpreted.tasks) {
+        enqueueTask(task);
+      }
+
+      const taskNames = interpreted.tasks.map(t => t.description).join('\n');
+      const queueResponse = await generateResponse(
+        `「${text}」を受けて以下のタスクをキューに追加しました:\n${taskNames}\n\n推定API呼び出し: ${interpreted.estimated_api_calls}回`,
+        { rawContext: 'タスクが正常にキューに入ったことをユーザーに伝えてください。' },
+        dbId,
+      );
+      await sendLineMessage(userId, queueResponse);
+      saveMessage(dbId, 'assistant', queueResponse);
+      extractAndSaveMemories(dbId, text, queueResponse).catch(err => logger.warn('自動記憶抽出失敗', { err }));
+      return;
+    }
+
     const systemContext = await gatherSystemContext();
 
     // 進行中の開発情報をコンテキストに含める
@@ -161,7 +211,6 @@ export async function handleMessage(userId: string, text: string): Promise<void>
     if (activeDevConv) {
       devContext = `\n## 進行中の開発\nトピック: ${activeDevConv.topic}\n状態: ${activeDevConv.status}`;
       if (activeDevConv.status === 'hearing') {
-        // 直近のエージェントの質問を含めてresponderに判断材料を与える
         try {
           const log = JSON.parse(activeDevConv.hearing_log) as Array<{ role: string; message: string }>;
           const lastAgentMsg = [...log].reverse().find(e => e.role === 'agent');
@@ -176,7 +225,7 @@ export async function handleMessage(userId: string, text: string): Promise<void>
     const response = await generateResponse(text, {
       systemStatus: systemContext,
       rawContext: devContext || undefined,
-    }, userId);
+    }, dbId);
 
     // DEV_AGENT トリガー
     if (response.trim() === 'DEV_AGENT') {
@@ -185,41 +234,9 @@ export async function handleMessage(userId: string, text: string): Promise<void>
       return;
     }
 
-    // タスク実行判定
-    if (shouldCreateTask(text)) {
-      dbLog('info', 'webhook', 'タスクキューへ投入');
-      const interpreted = await interpretTask(text);
-
-      if (interpreted.confirmation_needed) {
-        const clarifyResponse = await generateResponse(
-          `ユーザーの指示「${text}」について確認が必要です: ${interpreted.clarification_question}`,
-          { rawContext: '確認事項をユーザーに自然に質問してください。' },
-          userId,
-        );
-        await sendLineMessage(userId, clarifyResponse);
-        saveMessage(userId, 'assistant', clarifyResponse);
-        return;
-      }
-
-      for (const task of interpreted.tasks) {
-        enqueueTask(task);
-      }
-
-      const taskNames = interpreted.tasks.map(t => t.description).join('\n');
-      const queueResponse = await generateResponse(
-        `「${text}」を受けて以下のタスクをキューに追加しました:\n${taskNames}\n\n推定API呼び出し: ${interpreted.estimated_api_calls}回`,
-        { rawContext: 'タスクが正常にキューに入ったことをユーザーに伝えてください。' },
-        userId,
-      );
-      await sendLineMessage(userId, queueResponse);
-      saveMessage(userId, 'assistant', queueResponse);
-      extractAndSaveMemories(userId, text, queueResponse).catch(err => logger.warn('自動記憶抽出失敗', { err }));
-    } else {
-      await sendLineMessage(userId, response);
-      saveMessage(userId, 'assistant', response);
-      // バックグラウンドで自動記憶抽出（応答を遅延させない）
-      extractAndSaveMemories(userId, text, response).catch(err => logger.warn('自動記憶抽出失敗', { err }));
-    }
+    await sendLineMessage(userId, response);
+    saveMessage(dbId, 'assistant', response);
+    extractAndSaveMemories(dbId, text, response).catch(err => logger.warn('自動記憶抽出失敗', { err }));
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
     logger.error('メッセージ処理エラー', { err: errMsg, text });
@@ -228,11 +245,11 @@ export async function handleMessage(userId: string, text: string): Promise<void>
     const errorResponse = await generateResponse(
       `エラーが発生しました: ${errMsg.slice(0, 200)}`,
       { rawContext: 'エラーをユーザーに伝え、次に何をすべきか提案してください。' },
-      userId,
+      dbId,
     ).catch(() => `エラーが発生しました。ダッシュボードで確認してください: ${config.admin.baseUrl}/admin`);
 
     await sendLineMessage(userId, errorResponse);
-    saveMessage(userId, 'assistant', errorResponse);
+    saveMessage(dbId, 'assistant', errorResponse);
   }
 }
 
@@ -246,15 +263,19 @@ function shouldCreateTask(userMessage: string): boolean {
   return /分析して|最適化して|チェックして|レポート|調べて|改善して|提案して|比較して|監査して|スクリプト|自動化/.test(userMessage);
 }
 
-/** 記憶関連コマンドの処理。処理したらtrue */
-async function handleMemoryCommand(userId: string, text: string): Promise<boolean> {
+/** 記憶関連コマンドの処理。処理したらtrue
+ * @param sendToId - 送信用ID（tg: プレフィックス含む）
+ * @param dbUserId - DB用正規化ID（常にLINE ID）
+ * @param text - メッセージ本文
+ */
+async function handleMemoryCommand(sendToId: string, dbUserId: string, text: string): Promise<boolean> {
   // ★ 順番が重要: 一覧/検索チェック → 保存 → 削除
 
   // 「何覚えてる？」「覚えてる？」「記憶一覧」→ 記憶の一覧表示
   if (/^(何.{0,2}覚えてる|覚えてる[？?]?$|記憶一覧|メモ一覧|覚えてること)/.test(text)) {
-    const memories = getAllMemories(userId);
+    const memories = getAllMemories(dbUserId);
     if (memories.length === 0) {
-      await sendLineMessage(userId, 'まだ何も覚えていません。\n「覚えて 〇〇」で記憶を追加できます。');
+      await sendLineMessage(sendToId, 'まだ何も覚えていません。\n「覚えて 〇〇」で記憶を追加できます。');
     } else {
       const lines: string[] = [];
       const byType: Record<string, typeof memories> = {};
@@ -282,9 +303,9 @@ async function handleMemoryCommand(userId: string, text: string): Promise<boolea
         for (const m of byType.session_summary.slice(0, 3)) lines.push(`  ${m.key}: ${m.content.slice(0, 60)}`);
         if (byType.session_summary.length > 3) lines.push(`  ...他${byType.session_summary.length - 3}件`);
       }
-      await sendLineMessage(userId, lines.join('\n'));
+      await sendLineMessage(sendToId, lines.join('\n'));
     }
-    saveMessage(userId, 'user', text);
+    saveMessage(dbUserId, 'user', text);
     return true;
   }
 
@@ -293,17 +314,17 @@ async function handleMemoryCommand(userId: string, text: string): Promise<boolea
   if (recallMatch) {
     const query = recallMatch[1].trim();
     try {
-      const found = await searchByMeaning(userId, query, 5);
+      const found = await searchByMeaning(dbUserId, query, 5);
       if (found.length > 0) {
         const lines = found.map(r => `[${r.memory.type}] ${r.memory.key}: ${r.memory.content.slice(0, 80)}`);
-        await sendLineMessage(userId, `「${query}」に関する記憶:\n${lines.join('\n')}`);
+        await sendLineMessage(sendToId, `「${query}」に関する記憶:\n${lines.join('\n')}`);
       } else {
-        await sendLineMessage(userId, `「${query}」に関する記憶はありません。`);
+        await sendLineMessage(sendToId, `「${query}」に関する記憶はありません。`);
       }
     } catch {
-      await sendLineMessage(userId, `記憶検索でエラーが発生しました。`);
+      await sendLineMessage(sendToId, `記憶検索でエラーが発生しました。`);
     }
-    saveMessage(userId, 'user', text);
+    saveMessage(dbUserId, 'user', text);
     return true;
   }
 
@@ -313,11 +334,11 @@ async function handleMemoryCommand(userId: string, text: string): Promise<boolea
     const content = memoMatch[1].trim();
     if (!content) return false;
     const key = content.slice(0, 20).replace(/\s+/g, '_');
-    await saveMemoryWithEmbedding(userId, 'memo', key, content);
-    dbLog('info', 'webhook', `記憶保存: key=${key}`, { userId });
-    await sendLineMessage(userId, `覚えました 📝\n「${content.slice(0, 50)}${content.length > 50 ? '...' : ''}」`);
-    saveMessage(userId, 'user', text);
-    saveMessage(userId, 'assistant', '覚えました');
+    await saveMemoryWithEmbedding(dbUserId, 'memo', key, content);
+    dbLog('info', 'webhook', `記憶保存: key=${key}`, { userId: dbUserId });
+    await sendLineMessage(sendToId, `覚えました 📝\n「${content.slice(0, 50)}${content.length > 50 ? '...' : ''}」`);
+    saveMessage(dbUserId, 'user', text);
+    saveMessage(dbUserId, 'assistant', '覚えました');
     return true;
   }
 
@@ -327,17 +348,17 @@ async function handleMemoryCommand(userId: string, text: string): Promise<boolea
     const query = forgetMatch[1].trim();
     if (!query) return false;
     try {
-      const found = await searchByMeaning(userId, query, 1);
+      const found = await searchByMeaning(dbUserId, query, 1);
       if (found.length > 0) {
-        deleteMemory(userId, found[0].memory.type as MemoryType, found[0].memory.key);
-        await sendLineMessage(userId, `「${found[0].memory.key}」の記憶を削除しました。`);
+        deleteMemory(dbUserId, found[0].memory.type as MemoryType, found[0].memory.key);
+        await sendLineMessage(sendToId, `「${found[0].memory.key}」の記憶を削除しました。`);
       } else {
-        await sendLineMessage(userId, `「${query}」に関する記憶は見つかりませんでした。`);
+        await sendLineMessage(sendToId, `「${query}」に関する記憶は見つかりませんでした。`);
       }
     } catch {
-      await sendLineMessage(userId, `記憶削除でエラーが発生しました。`);
+      await sendLineMessage(sendToId, `記憶削除でエラーが発生しました。`);
     }
-    saveMessage(userId, 'user', text);
+    saveMessage(dbUserId, 'user', text);
     return true;
   }
 

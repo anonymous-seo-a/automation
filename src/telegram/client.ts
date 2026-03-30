@@ -4,6 +4,9 @@ import { logger } from '../utils/logger';
 const API_BASE = `https://api.telegram.org/bot${config.telegram.botToken}`;
 const MAX_MESSAGE_LENGTH = 4096;
 
+/** Telegram webhook シークレットトークン（setWebhook で設定する値と一致させる） */
+export const TELEGRAM_WEBHOOK_SECRET = config.telegram.webhookSecret || '';
+
 /** Telegram にテキストメッセージを送信 */
 export async function sendTelegramMessage(chatId: string, text: string): Promise<void> {
   if (!config.telegram.botToken) {
