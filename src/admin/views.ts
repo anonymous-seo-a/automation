@@ -13,6 +13,7 @@ function layout(title: string, content: string, opts: LayoutOptions = {}): strin
     { href: '/admin/insights', label: '改善', key: 'insights' },
     { href: '/admin/live', label: 'オフィス', key: 'live' },
     { href: '/admin/knowledge', label: 'ナレッジ', key: 'knowledge' },
+    { href: '/admin/memory-map', label: 'メモリ', key: 'memory-map' },
   ];
 
   const breadcrumbHtml = breadcrumbs && breadcrumbs.length > 0
@@ -201,6 +202,8 @@ export function renderPage(page: string, data: Record<string, unknown>): string 
       return layout('改善', renderInsights(data), { activePage: 'insights' });
     case 'knowledge':
       return layout('ナレッジ', renderKnowledge(data), { activePage: 'knowledge' });
+    case 'memory-map':
+      return layout('メモリマップ', renderMemoryMap(data), { activePage: 'memory-map' });
     default:
       return layout('404', '<h1>ページが見つかりません</h1>');
   }
@@ -817,5 +820,74 @@ ${items.map(k => `<tr>
 </tr>
 <tr><td colspan="4"><pre>${escapeHtml((k.content as string).slice(0, 500))}</pre></td></tr>`).join('\n')}
 </table>`;
+}
+
+function renderMemoryMap(data: Record<string, unknown>): string {
+  const userMemories = data.userMemories as Array<Record<string, unknown>>;
+  const sessions = data.sessions as Array<Record<string, unknown>>;
+  const agentMemories = data.agentMemories as Array<Record<string, unknown>>;
+
+  // Group user memories by user_id
+  const byUser = new Map<string, Array<Record<string, unknown>>>();
+  for (const m of userMemories) {
+    const uid = m.user_id as string;
+    if (!byUser.has(uid)) byUser.set(uid, []);
+    byUser.get(uid)!.push(m);
+  }
+
+  const userSections = byUser.size === 0
+    ? '<p style="color:#8b949e;font-size:13px;">記憶データなし</p>'
+    : Array.from(byUser.entries()).map(([uid, mems]) => `
+<div class="section-card">
+  <h3>ユーザー: ${escapeHtml(uid)}</h3>
+  <div class="table-wrap"><table>
+    <tr><th>タイプ</th><th>キー</th><th>内容概要</th><th>更新日</th></tr>
+    ${mems.map(m => `<tr>
+      <td><span class="badge badge-running">${escapeHtml(m.type as string)}</span></td>
+      <td class="truncate">${escapeHtml(m.key as string)}</td>
+      <td class="truncate">${escapeHtml((m.content as string).slice(0, 100))}</td>
+      <td style="white-space:nowrap;font-size:12px;color:#8b949e;">${m.updated_at}</td>
+    </tr>`).join('\n')}
+  </table></div>
+</div>`).join('\n');
+
+  const sessionsHtml = sessions.length === 0
+    ? '<p style="color:#8b949e;font-size:13px;">セッションデータなし</p>'
+    : `<div class="table-wrap"><table>
+  <tr><th>ユーザーID</th><th>開始</th><th>終了</th><th>メッセージ数</th><th>サマリー</th></tr>
+  ${sessions.map(s => `<tr>
+    <td>${escapeHtml(s.user_id as string)}</td>
+    <td style="white-space:nowrap;font-size:12px;">${s.started_at}</td>
+    <td style="white-space:nowrap;font-size:12px;">${s.ended_at || '—'}</td>
+    <td style="text-align:center;">${s.message_count}</td>
+    <td class="truncate">${s.summary ? escapeHtml((s.summary as string).slice(0, 100)) : '—'}</td>
+  </tr>`).join('\n')}
+</table></div>`;
+
+  const agentSections = agentMemories.length === 0
+    ? '<p style="color:#8b949e;font-size:13px;">エージェント記憶なし</p>'
+    : `<div class="table-wrap"><table>
+  <tr><th>エージェント</th><th>タイプ</th><th>キー</th><th>内容概要</th><th>ソース</th><th>更新日</th></tr>
+  ${agentMemories.map(m => `<tr>
+    <td>${escapeHtml(m.agent as string)}</td>
+    <td><span class="badge badge-hearing">${escapeHtml(m.type as string)}</span></td>
+    <td class="truncate">${escapeHtml(m.key as string)}</td>
+    <td class="truncate">${escapeHtml((m.content as string).slice(0, 100))}</td>
+    <td style="font-size:12px;color:#8b949e;">${m.source ? escapeHtml(m.source as string) : '—'}</td>
+    <td style="white-space:nowrap;font-size:12px;color:#8b949e;">${m.updated_at}</td>
+  </tr>`).join('\n')}
+</table></div>`;
+
+  return `
+<h1>メモリマップ</h1>
+
+<h2>ユーザー記憶 (${userMemories.length}件)</h2>
+${userSections}
+
+<h2>会話セッション (${sessions.length}件)</h2>
+${sessionsHtml}
+
+<h2>エージェント記憶 (${agentMemories.length}件)</h2>
+${agentSections}`;
 }
 
