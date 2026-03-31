@@ -171,6 +171,17 @@ export function runMigrations(): void {
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
     CREATE INDEX IF NOT EXISTS idx_task_metrics ON task_metrics(task_id, agent);
+
+    CREATE TABLE IF NOT EXISTS routing_corrections (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id TEXT NOT NULL,
+      message TEXT NOT NULL,
+      dev_phase TEXT NOT NULL,
+      auto_target TEXT NOT NULL,
+      corrected_target TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_routing_corrections_user ON routing_corrections(user_id, created_at);
   `);
 
   // 既存テーブルに embedding 列がなければ追加（マイグレーション互換）
@@ -178,5 +189,18 @@ export function runMigrations(): void {
     db.prepare("SELECT embedding FROM memories LIMIT 1").get();
   } catch {
     db.exec("ALTER TABLE memories ADD COLUMN embedding BLOB");
+  }
+
+  // importance カラム追加（記憶の重要度: 1〜5）
+  try {
+    db.prepare("SELECT importance FROM memories LIMIT 1").get();
+  } catch {
+    db.exec("ALTER TABLE memories ADD COLUMN importance INTEGER NOT NULL DEFAULT 3");
+  }
+
+  try {
+    db.prepare("SELECT importance FROM agent_memories LIMIT 1").get();
+  } catch {
+    db.exec("ALTER TABLE agent_memories ADD COLUMN importance INTEGER NOT NULL DEFAULT 3");
   }
 }

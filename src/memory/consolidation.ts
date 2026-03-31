@@ -83,7 +83,7 @@ export async function consolidateMemories(userId: string): Promise<void> {
       ...result.active_projects.map(p => `- ${p}`),
     ].join('\n');
 
-    await saveMemoryWithEmbedding(userId, 'consolidated', 'user_profile', consolidatedContent);
+    await saveMemoryWithEmbedding(userId, 'consolidated', 'user_profile', consolidatedContent, 5);
 
     // クリーンアップ推奨の記憶を削除
     if (result.cleanup && result.cleanup.length > 0) {

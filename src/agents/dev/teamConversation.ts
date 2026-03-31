@@ -28,7 +28,7 @@ export async function handleConsult(
   ].filter(Boolean).join('\n');
 
   const { text: pmAnswer } = await callClaude({
-    system: buildAgentPersonality('pm') +
+    system: await buildAgentPersonality('pm') +
       '\n\nメンバーからの相談に回答してください。合議が必要なら {"consensus_needed": true, "topic": "議題"} を返してください。それ以外はテキストで回答。',
     messages: [{ role: 'user', content: consultMsg }],
     model: 'default',
@@ -76,7 +76,7 @@ export async function runConsensus(
 
   // PMが議題を提示
   const { text: pmOpening } = await callClaude({
-    system: buildAgentPersonality('pm'),
+    system: await buildAgentPersonality('pm'),
     messages: [{ role: 'user', content: `以下の議題について、チーム全員の意見を聞きます。\n議題: ${topic}\n背景: ${context}\n\n各メンバーに聞くべきポイントを整理して提示してください。` }],
     model: 'default',
   });
@@ -87,7 +87,7 @@ export async function runConsensus(
     try {
       const conversationSoFar = log.map(e => `[${e.role}] ${e.message}`).join('\n');
       const { text: opinion } = await callClaude({
-        system: buildAgentPersonality(member),
+        system: await buildAgentPersonality(member),
         messages: [{ role: 'user', content: `チーム合議中です。\n\n${conversationSoFar}\n\nあなたは${member}です。この議題についてあなたの立場から意見を述べてください。` }],
         model: 'default',
       });
@@ -101,7 +101,7 @@ export async function runConsensus(
   // PMが総合判断
   const allOpinions = log.map(e => `[${e.role}] ${e.message}`).join('\n');
   const { text: decision } = await callClaude({
-    system: buildAgentPersonality('pm'),
+    system: await buildAgentPersonality('pm'),
     messages: [{ role: 'user', content: `全員の意見が出揃いました。\n\n${allOpinions}\n\n最終判断とその理由を述べてください。` }],
     model: 'default',
   });

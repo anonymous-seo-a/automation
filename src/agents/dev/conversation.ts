@@ -127,6 +127,12 @@ export function setGeneratedFiles(id: string, files: string[]): void {
   `).run(JSON.stringify(files), id);
 }
 
+/** updated_at のみ更新（タイムアウト防止用ハートビート） */
+export function touchConversation(id: string): void {
+  const db = getDB();
+  db.prepare(`UPDATE dev_conversations SET updated_at = datetime('now') WHERE id = ?`).run(id);
+}
+
 export function cancelConversation(id: string): void {
   const db = getDB();
   db.prepare(`

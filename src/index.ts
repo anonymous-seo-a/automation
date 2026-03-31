@@ -10,8 +10,10 @@ import { interpretTask } from './interpreter/taskInterpreter';
 import { enqueueTask } from './queue/taskQueue';
 import { checkIdleSessions } from './memory/session';
 import { runDailyConsolidation } from './memory/consolidation';
+import { consolidateAgentMemories, AgentRole } from './agents/dev/teamMemory';
 import { loadKnowledgeCache } from './line/bunshinPrompt';
 import { completePendingDeploy } from './agents/dev/deployer';
+import { initEmbeddingCache } from './memory/embeddingCache';
 import { logger } from './utils/logger';
 import path from 'path';
 
@@ -21,6 +23,9 @@ async function main(): Promise<void> {
   // DB初期化
   runMigrations();
   logger.info('DBマイグレーション完了');
+
+  // Embeddingキャッシュ初期化（DBから全embeddingをメモリにロード）
+  initEmbeddingCache();
 
   // ナレッジファイルロード（DB + 分身プロンプトキャッシュ）
   const knowledgeDir = path.join(__dirname, '..', 'knowledge');
@@ -131,6 +136,12 @@ function scheduleDailyConsolidation(): void {
     setTimeout(async () => {
       try {
         await runDailyConsolidation();
+        // エージェント記憶の統合も実行
+        for (const agent of ['pm', 'engineer', 'reviewer', 'deployer'] as AgentRole[]) {
+          await consolidateAgentMemories(agent).catch(err =>
+            logger.warn(`エージェント記憶統合失敗: ${agent}`, { err: err instanceof Error ? err.message : String(err) })
+          );
+        }
       } catch (err) {
         logger.error('日次記憶統合失敗', { err: err instanceof Error ? err.message : String(err) });
       }

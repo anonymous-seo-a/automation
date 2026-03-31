@@ -3,6 +3,7 @@ import { promises as fs } from 'fs';
 import * as fsSync from 'fs';
 import path from 'path';
 import { logger, dbLog } from '../../utils/logger';
+import { config } from '../../config';
 
 const PROJECT_ROOT = path.resolve(__dirname, '..', '..', '..');
 
@@ -90,7 +91,8 @@ function execAsync(cmd: string, timeoutMs = 30000): Promise<{ stdout: string; st
   return new Promise((resolve, reject) => {
     exec(cmd, { cwd: PROJECT_ROOT, timeout: timeoutMs }, (error, stdout, stderr) => {
       if (error) {
-        reject(new Error(`${cmd} failed: ${error.message}\n${stderr}`));
+        // stdout も含める（git は "nothing to commit" を stdout に出力するため）
+        reject(new Error(`${cmd} failed: ${error.message}\n${stderr}\n${stdout}`));
       } else {
         resolve({ stdout: stdout.toString(), stderr: stderr.toString() });
       }
@@ -117,9 +119,38 @@ export async function prepareGitBranch(): Promise<string> {
     logger.info('git stash: 退避する変更なし');
   }
 
+  // mainブランチに戻ってから新規ブランチを作成（過去の失敗ブランチを引き継がない）
+  try {
+    await execAsync('git checkout main');
+    logger.info('mainブランチに移動');
+  } catch {
+    // mainがなければ dev/initial-build を試す
+    try {
+      await execAsync('git checkout dev/initial-build');
+      logger.info('dev/initial-buildブランチに移動');
+    } catch {
+      logger.warn('ベースブランチへの移動失敗、現在のHEADからブランチ作成');
+    }
+  }
+
+  // rsyncで更新されたファイルをステージングしてベースに反映
+  try {
+    await execAsync('git add -A');
+    await execAsync('git diff --cached --quiet');
+    // 変更なし
+  } catch {
+    // 変更あり → ベースにコミット（rsyncによるデプロイ分を取り込む）
+    try {
+      await execAsync("git commit -m 'chore: sync deployed changes'");
+      logger.info('ベースブランチにrsync分をコミット');
+    } catch {
+      // nothing to commit の場合は無視
+    }
+  }
+
   // 自動ブランチを作成
   await execAsync(`git checkout -b ${branchName}`);
-  logger.info(`ブランチ作成: ${branchName}`);
+  logger.info(`ブランチ作成: ${branchName} (from main)`);
 
   return branchName;
 }
@@ -156,15 +187,29 @@ export interface CommitResult {
 
 export async function commitAndStay(branchName: string, message: string): Promise<CommitResult> {
   try {
-    // シェルインジェクション防止: メッセージ内の特殊文字をエスケープ
-    const safeMessage = message.replace(/'/g, "'\\''");
+    // コミットメッセージのサニタイズ: 改行→スペース、シングルクォートのエスケープ
+    const safeMessage = message
+      .replace(/[\r\n]+/g, ' ')    // 改行をスペースに（シェルコマンド破壊防止）
+      .replace(/'/g, "'\\''")       // シングルクォートのエスケープ
+      .slice(0, 200);               // 長すぎるメッセージを切り詰め
     await execAsync('git add -A');
+
+    // ステージング済み変更の有無を確認（nothing to commit でのエラー防止）
+    try {
+      await execAsync('git diff --cached --quiet');
+      // exit 0 = 変更なし → コミット不要
+      logger.info('git commit スキップ（変更なし）', { branchName });
+      return { success: true };
+    } catch {
+      // exit 1 = 変更あり → コミット実行
+    }
+
     await execAsync(`git commit -m '${safeMessage}'`);
     logger.info(`コミット完了: ${branchName}`);
     return { success: true };
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
-    // "nothing to commit" は正常（変更なし）
+    // "nothing to commit" は正常（変更なし）— フォールバック検出
     if (/nothing to commit|working tree clean/i.test(errMsg)) {
       logger.info('git commit スキップ（変更なし）', { branchName });
       return { success: true };
@@ -389,12 +434,14 @@ export async function completePendingDeploy(): Promise<void> {
 
     dbLog('info', 'deploy', `デプロイ成功: ${pending.branchName}`, { convId: pending.convId, files: generatedFiles });
 
+    const detailUrl = `${config.admin.baseUrl}/admin/dev/${pending.convId}`;
     await sendLineMessage(pending.userId,
       `✅ デプロイ完了!\n\n` +
       `${pending.topic}\n` +
       `ブランチ: ${pending.branchName}\n` +
-      `ファイル: ${generatedFiles.join(', ')}\n\n` +
-      `ビルド・テスト・ヘルスチェック 全て通過。`
+      `ファイル: ${[...new Set(generatedFiles)].join(', ')}\n\n` +
+      `ビルド・テスト・ヘルスチェック 全て通過。\n\n` +
+      `詳細: ${detailUrl}`
     ).catch(err => logger.warn('デプロイ成功通知失敗', { err: err instanceof Error ? err.message : String(err) }));
 
     // レトロスペクティブ（バックグラウンド）
@@ -415,9 +462,20 @@ export async function completePendingDeploy(): Promise<void> {
     await rollbackGit(pending.branchName);
     updateConversationStatus(pending.convId, 'failed');
 
+    const failUrl = `${config.admin.baseUrl}/admin/dev/${pending.convId}`;
     await sendLineMessage(pending.userId,
-      `デプロイ失敗: ヘルスチェックNG\nロールバックしました。\nブランチ: ${pending.branchName}`
+      `デプロイ失敗: ヘルスチェックNG\nロールバックしました。\nブランチ: ${pending.branchName}\n\n詳細: ${failUrl}`
     ).catch(err => logger.warn('デプロイ失敗通知失敗', { err: err instanceof Error ? err.message : String(err) }));
+
+    // 失敗時もレトロスペクティブを実行（学習のため）
+    const failedConv = getConversation(pending.convId);
+    if (failedConv) {
+      import('./retrospective').then(({ runRetrospective }) =>
+        runRetrospective(failedConv).catch(err =>
+          logger.warn('レトロスペクティブ失敗（デプロイ失敗時）', { err: err instanceof Error ? err.message : String(err) })
+        )
+      ).catch(err => logger.warn('レトロスペクティブimport失敗', { err: err instanceof Error ? err.message : String(err) }));
+    }
 
     // ロールバック後に再起動が必要（コードを元に戻したので）
     exec('pm2 restart mothership', { cwd: PROJECT_ROOT, timeout: 15000 }, () => {});

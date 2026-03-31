@@ -2,9 +2,11 @@ import { config } from '../config';
 import { logger } from '../utils/logger';
 import { trackUsage, isOverBudget } from './budgetTracker';
 
-const API_TIMEOUT_MS = 60_000; // 60秒
+const API_TIMEOUT_MS = 60_000; // 60秒（デフォルト）
+const OPUS_TIMEOUT_MS = 120_000; // Opusは応答が遅いため120秒
 const MAX_RETRIES = 4;
-const RETRY_DELAYS = [2000, 5000, 15000, 30000]; // レートリミット対策: 長めのバックオフ
+const RETRY_DELAYS = [2000, 5000, 15000, 30000]; // 通常リトライ
+const OVERLOAD_RETRY_DELAYS = [5000, 15000, 45000, 90000]; // 529（サーバー過負荷）専用: より長いバックオフ
 
 interface ClaudeMessage {
   role: 'user' | 'assistant';
@@ -31,6 +33,7 @@ export async function callClaude(params: {
   model?: 'default' | 'opus';
   maxTokens?: number;
   taskId?: string;
+  timeoutMs?: number;
 }): Promise<{ text: string; usage: { input: number; output: number } }> {
 
   if (await isOverBudget()) {
@@ -41,14 +44,20 @@ export async function callClaude(params: {
     ? config.claude.opusModel
     : config.claude.defaultModel;
 
+  // Opusモデルはデフォルトで長めのタイムアウトを使用
+  const defaultTimeout = params.model === 'opus' ? OPUS_TIMEOUT_MS : API_TIMEOUT_MS;
+
   let lastError: Error | null = null;
   let retryDelayOverride: number | null = null;
+  let lastStatus: number | null = null; // 直前のHTTPステータス（529判定用）
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     if (attempt > 0) {
-      const delay = retryDelayOverride || RETRY_DELAYS[attempt - 1] || 3000;
+      // 529(overloaded)は専用の長いバックオフを使う
+      const baseDelays = lastStatus === 529 ? OVERLOAD_RETRY_DELAYS : RETRY_DELAYS;
+      const delay = retryDelayOverride || baseDelays[attempt - 1] || 3000;
       retryDelayOverride = null; // 使用後リセット
-      logger.warn(`Claude API リトライ ${attempt}/${MAX_RETRIES}（${delay}ms待機）`, { model });
+      logger.warn(`Claude API リトライ ${attempt}/${MAX_RETRIES}（${delay}ms待機, status=${lastStatus}）`, { model });
       await sleep(delay);
     }
 
@@ -56,7 +65,7 @@ export async function callClaude(params: {
       logger.info('Claude API呼び出し', { model, taskId: params.taskId, attempt });
 
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+      const timeoutId = setTimeout(() => controller.abort(), params.timeoutMs || defaultTimeout);
 
       let response: Response;
       try {
@@ -83,6 +92,7 @@ export async function callClaude(params: {
         const errBody = await response.text().catch(() => '(response body unreadable)');
 
         if (isRetryable(response.status) && attempt < MAX_RETRIES) {
+          lastStatus = response.status;
           // Retry-Afterヘッダーがあればそちらを優先（ローカル変数で上書き、定数は汚染しない）
           const retryAfter = response.headers.get('retry-after');
           if (retryAfter && response.status === 429) {
@@ -131,7 +141,7 @@ export async function callClaude(params: {
 
     } catch (err) {
       if (err instanceof Error && err.name === 'AbortError') {
-        lastError = new Error(`Claude API タイムアウト（${API_TIMEOUT_MS / 1000}秒）`);
+        lastError = new Error(`Claude API タイムアウト（${(params.timeoutMs || defaultTimeout) / 1000}秒）`);
         if (attempt < MAX_RETRIES) {
           logger.warn('Claude API タイムアウト → リトライ', { attempt });
           continue;

@@ -26,9 +26,10 @@ export async function runRetrospective(conv: DevConversation): Promise<void> {
 
     // PMが振り返りを開始
     const { text: pmOpening } = await callClaude({
-      system: buildAgentPersonality('pm'),
+      system: await buildAgentPersonality('pm'),
       messages: [{ role: 'user', content: `開発「${conv.topic}」のレトロスペクティブを行います。\n\n${context}\n\n各メンバーに聞くべきポイントを整理してください。` }],
       model: 'default',
+      timeoutMs: 120_000,
     });
     log.push({ role: 'pm', message: pmOpening, timestamp: now() });
 
@@ -37,9 +38,10 @@ export async function runRetrospective(conv: DevConversation): Promise<void> {
       try {
         const conversationSoFar = log.map(e => `[${e.role}] ${e.message}`).join('\n');
         const { text: reflection } = await callClaude({
-          system: buildAgentPersonality(member),
+          system: await buildAgentPersonality(member),
           messages: [{ role: 'user', content: `チームのレトロスペクティブ中です。\n\n${conversationSoFar}\n\n今回の開発について振り返ってください。\n1. 何がうまくいったか\n2. 何を改善すべきか\n3. 次回に向けた学び` }],
           model: 'default',
+          timeoutMs: 120_000,
         });
         log.push({ role: member, message: reflection, timestamp: now() });
 
@@ -54,9 +56,10 @@ export async function runRetrospective(conv: DevConversation): Promise<void> {
     // PMの総括 + 自己評価 + メンバー評価
     const allReflections = log.map(e => `[${e.role}] ${e.message}`).join('\n');
     const { text: pmSummary } = await callClaude({
-      system: buildAgentPersonality('pm'),
+      system: await buildAgentPersonality('pm'),
       messages: [{ role: 'user', content: `全員の振り返りが出揃いました。\n\n${allReflections}\n\n以下を述べてください:\n1. 総括（何がうまくいって、何が問題だったか）\n2. 各メンバーの評価（良い点・改善点）\n3. PM自身の反省点\n4. 次回に向けた改善事項` }],
       model: 'default',
+      timeoutMs: 120_000,
     });
     log.push({ role: 'pm', message: pmSummary, timestamp: now() });
 

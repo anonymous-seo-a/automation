@@ -167,53 +167,63 @@ export async function handleMessage(userId: string, text: string): Promise<void>
     return;
   }
 
-  // ★ stuck フェーズ: ユーザーの指示を直接devへ
-  if (activeDevConv && activeDevConv.status === 'stuck') {
-    dbLog('info', 'webhook', `ルーティング → stuck応答: "${text.slice(0, 20)}"`);
-    await devAgent.handleMessage(userId, text);
-    return;
-  }
-
-  // ★ 実装中/テスト中: 進捗通知（「中止」で脱出可能なことを伝える）
-  if (activeDevConv && ['approved', 'implementing', 'testing'].includes(activeDevConv.status)) {
-    dbLog('info', 'webhook', `実装中メッセージ受信: "${text.slice(0, 20)}" (status=${activeDevConv.status})`);
-    const statusLabel = activeDevConv.status === 'testing' ? 'テスト・デプロイ' : '実装';
-    await sendLineMessage(userId, `現在${statusLabel}中です。完了次第ご報告します。\n（「中止」で開発をキャンセルできます）`);
-    return;
-  }
-
-  // ★ defining フェーズ: OKか修正指示のみdevへ
-  if (activeDevConv && activeDevConv.status === 'defining') {
-    // requirements が未生成（API呼び出し中）の場合はメッセージをブロック
-    if (!activeDevConv.requirements) {
-      dbLog('info', 'webhook', `要件定義書生成中にメッセージ受信（待機通知）: "${text.slice(0, 20)}"`);
-      await sendLineMessage(userId, '要件定義書を作成中です。もう少しお待ちください...\n（完了後に確認いただけます）');
+  // ★ セーフワード検出（最優先 — 自動ルーティングを上書き）
+  const safeWordResult = detectSafeWord(text);
+  if (safeWordResult && activeDevConv) {
+    const { target, cleanText } = safeWordResult;
+    const autoTarget = getAutoRouteTarget(activeDevConv.status);
+    // 自動判定先と違う場合のみ修正を記録（学習用）
+    if (autoTarget !== target) {
+      recordRoutingCorrection(userId, cleanText, activeDevConv.status, autoTarget, target);
+      dbLog('info', 'webhook', `セーフワード: ${target} (自動判定: ${autoTarget}, フェーズ: ${activeDevConv.status})`);
+    }
+    if (target === 'pm') {
+      await devAgent.handleMessage(userId, cleanText);
       return;
     }
-    if (isDefiningResponse(text)) {
-      dbLog('info', 'webhook', `ルーティング → defining応答: "${text.slice(0, 20)}"`);
+    // target === 'bunshin' → 下のresponder処理にフォールスルー（cleanTextで上書き）
+    text = cleanText;
+    // bunshin強制のため、dev固有ルーティングをスキップ
+    saveMessage(dbId, 'user', text);
+    dbLog('info', 'webhook', `セーフワード → 分身: "${text.slice(0, 30)}"`);
+    // responder呼び出しへ直行
+  } else {
+    // ★ 通常のdev会話ルーティング
+
+    // ★ defining フェーズ: OKか修正指示のみdevへ
+    if (activeDevConv && activeDevConv.status === 'defining') {
+      // requirements が未生成（API呼び出し中）の場合はメッセージをブロック
+      if (!activeDevConv.requirements) {
+        dbLog('info', 'webhook', `要件定義書生成中にメッセージ受信（待機通知）: "${text.slice(0, 20)}"`);
+        await sendLineMessage(userId, '要件定義書を作成中です。もう少しお待ちください...\n（完了後に確認いただけます）');
+        return;
+      }
+      if (isDefiningResponse(text)) {
+        dbLog('info', 'webhook', `ルーティング → defining応答: "${text.slice(0, 20)}"`);
+        await devAgent.handleMessage(userId, text);
+        return;
+      }
+      dbLog('info', 'webhook', 'defining中だが無関係 → 通常応答');
+    }
+
+    // ★ hearing / stuck / implementing / testing: responderに判断を委ねる（DEV_AGENTトリガー経由）
+    // （セーフワードなし → 自動ルーティング → 全てresponderが判定）
+
+    // ★ 新規開発依頼（正規表現で即マッチ）
+    if (!activeDevConv && isDevRequest(text)) {
+      dbLog('info', 'webhook', 'ルーティング → 新規開発依頼（パターンマッチ）');
       await devAgent.handleMessage(userId, text);
       return;
     }
-    dbLog('info', 'webhook', 'defining中だが無関係 → 通常応答');
+
+    // --- 通常応答（hearing/stuck/implementing/testing中もここを通る） ---
+    saveMessage(dbId, 'user', text);
+    dbLog('info', 'webhook', 'ルーティング → 通常応答');
   }
-
-  // ★ hearing フェーズ: responderに判断を委ねる（後述のDEV_AGENTトリガー経由）
-
-  // ★ 新規開発依頼（正規表現で即マッチ）
-  if (!activeDevConv && isDevRequest(text)) {
-    dbLog('info', 'webhook', 'ルーティング → 新規開発依頼（パターンマッチ）');
-    await devAgent.handleMessage(userId, text);
-    return;
-  }
-
-  // --- 通常応答（hearing中もここを通る） ---
-  saveMessage(dbId, 'user', text);
-  dbLog('info', 'webhook', 'ルーティング → 通常応答');
 
   try {
     // ★ タスク実行判定を先にチェック（Claude API呼び出しの無駄を防ぐ）
-    if (shouldCreateTask(text)) {
+    if (!activeDevConv && shouldCreateTask(text)) {
       dbLog('info', 'webhook', 'タスクキューへ投入');
       const interpreted = await interpretTask(text);
 
@@ -246,20 +256,10 @@ export async function handleMessage(userId: string, text: string): Promise<void>
 
     const systemContext = await gatherSystemContext();
 
-    // 進行中の開発情報をコンテキストに含める
+    // 進行中の開発情報をコンテキストに含める + DEV_AGENTトリガー指示
     let devContext = '';
     if (activeDevConv) {
-      devContext = `\n## 進行中の開発\nトピック: ${activeDevConv.topic}\n状態: ${activeDevConv.status}`;
-      if (activeDevConv.status === 'hearing') {
-        try {
-          const log = JSON.parse(activeDevConv.hearing_log) as Array<{ role: string; message: string }>;
-          const lastAgentMsg = [...log].reverse().find(e => e.role === 'agent');
-          if (lastAgentMsg) {
-            devContext += `\nエージェントの最後の質問:\n${lastAgentMsg.message}`;
-          }
-        } catch { /* ignore */ }
-        devContext += '\n\nユーザーのメッセージがこの開発への回答であれば "DEV_AGENT" と返してください。無関係な話題なら普通に回答してください。';
-      }
+      devContext = buildDevRoutingContext(activeDevConv, userId);
     } else {
       // 開発会話がない時も、新規開発依頼を検出する
       devContext = '\n\n## 開発エージェント\nこのシステムには開発チーム（PM→エンジニア→レビュアー）が組み込まれています。' +
@@ -322,6 +322,114 @@ function isDefiningResponse(text: string): boolean {
 
 function shouldCreateTask(userMessage: string): boolean {
   return /分析して|最適化して|チェックして|レポート|調べて|改善して|提案して|比較して|監査して|スクリプト|自動化/.test(userMessage);
+}
+
+// ========================================
+// セーフワード & ルーティング学習
+// ========================================
+
+/** セーフワードを検出してターゲットとクリーンテキストを返す */
+function detectSafeWord(text: string): { target: 'bunshin' | 'pm'; cleanText: string } | null {
+  // @分身 / @PM をメッセージ先頭で検出
+  const bunshinMatch = text.match(/^@分身\s*([\s\S]*)/);
+  if (bunshinMatch) {
+    return { target: 'bunshin', cleanText: bunshinMatch[1].trim() || text };
+  }
+  const pmMatch = text.match(/^@PM\s*([\s\S]*)/i);
+  if (pmMatch) {
+    return { target: 'pm', cleanText: pmMatch[1].trim() || text };
+  }
+  return null;
+}
+
+/** 各フェーズで自動ルーティングが向かう先を返す */
+function getAutoRouteTarget(status: string): 'bunshin' | 'pm' {
+  // stuck → 従来はPMに全メッセージ直行だった
+  // implementing/testing/approved → 従来はブロック（PMでも分身でもない）だが、概念上はPM側
+  // hearing/defining → 分身が判定
+  if (['stuck', 'implementing', 'testing', 'approved'].includes(status)) return 'pm';
+  return 'bunshin';
+}
+
+/** ルーティング修正をDBに記録（自己学習用） */
+function recordRoutingCorrection(
+  userId: string, message: string, devPhase: string,
+  autoTarget: string, correctedTarget: string,
+): void {
+  try {
+    const db = getDB();
+    db.prepare(`
+      INSERT INTO routing_corrections (user_id, message, dev_phase, auto_target, corrected_target)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(userId, message.slice(0, 300), devPhase, autoTarget, correctedTarget);
+  } catch (err) {
+    logger.warn('ルーティング修正記録失敗', { err: err instanceof Error ? err.message : String(err) });
+  }
+}
+
+/** 直近のルーティング修正履歴を取得（プロンプト注入用） */
+function getRecentRoutingCorrections(userId: string, limit = 10): Array<{ message: string; dev_phase: string; corrected_target: string }> {
+  try {
+    const db = getDB();
+    return db.prepare(`
+      SELECT message, dev_phase, corrected_target
+      FROM routing_corrections
+      WHERE user_id = ?
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).all(userId, limit) as Array<{ message: string; dev_phase: string; corrected_target: string }>;
+  } catch {
+    return [];
+  }
+}
+
+/** 開発会話の状態に応じたルーティングコンテキストを構築 */
+function buildDevRoutingContext(conv: { id: string; topic: string; status: string; hearing_log: string }, userId: string): string {
+  let ctx = `\n## 進行中の開発\nトピック: ${conv.topic}\n状態: ${conv.status}`;
+
+  // フェーズ別のコンテキスト追加
+  if (conv.status === 'hearing') {
+    try {
+      const log = JSON.parse(conv.hearing_log) as Array<{ role: string; message: string }>;
+      const lastAgentMsg = [...log].reverse().find(e => e.role === 'agent');
+      if (lastAgentMsg) {
+        ctx += `\nPMの最後の質問:\n${lastAgentMsg.message}`;
+      }
+    } catch { /* ignore */ }
+  } else if (conv.status === 'stuck') {
+    ctx += '\nPMがユーザーに質問/提案しています。ユーザーの返答がPMへの指示（リトライ、中止、技術的な相談など）であればPMに転送が必要です。';
+  } else if (['implementing', 'testing', 'approved'].includes(conv.status)) {
+    const label = conv.status === 'testing' ? 'テスト・デプロイ' : conv.status === 'approved' ? '準備' : '実装';
+    ctx += `\n現在${label}がバックグラウンドで進行中。完了時に自動通知されます。`;
+  }
+
+  // 過去のルーティング修正を学習例として注入
+  const corrections = getRecentRoutingCorrections(userId);
+  if (corrections.length > 0) {
+    const bunshinExamples = corrections.filter(c => c.corrected_target === 'bunshin');
+    const pmExamples = corrections.filter(c => c.corrected_target === 'pm');
+    ctx += '\n\n## ルーティング学習（過去の修正例）';
+    if (bunshinExamples.length > 0) {
+      ctx += '\n開発中でも分身（あなた）が答えるべきだったメッセージ:';
+      for (const ex of bunshinExamples.slice(0, 5)) {
+        ctx += `\n- 「${ex.message.slice(0, 60)}」(${ex.dev_phase}中)`;
+      }
+    }
+    if (pmExamples.length > 0) {
+      ctx += '\nPM（開発チーム）に転送すべきだったメッセージ:';
+      for (const ex of pmExamples.slice(0, 5)) {
+        ctx += `\n- 「${ex.message.slice(0, 60)}」(${ex.dev_phase}中)`;
+      }
+    }
+  }
+
+  // DEV_AGENTトリガー指示
+  ctx += '\n\n## ルーティング判定ルール' +
+    '\nユーザーのメッセージが開発チーム（PM）への指示・回答・相談であれば "DEV_AGENT" とだけ返してください。' +
+    '\n雑談・質問・相談など開発に無関係なメッセージには普通に回答してください。' +
+    '\n迷ったら普通に回答してください（ユーザーは @PM で明示的にPMに切り替えられます）。';
+
+  return ctx;
 }
 
 /** 記憶関連コマンドの処理。処理したらtrue

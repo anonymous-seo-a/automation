@@ -357,7 +357,11 @@ body{
     <h1><span class="logo">🏢</span> 母艦開発オフィス</h1>
     <div class="header-right">
       <div id="conn" class="conn-badge"><span class="conn-dot"></span> <span id="conn-text">接続中...</span></div>
-      <a href="/admin">管理画面</a>
+      <a href="/admin">ダッシュボード</a>
+      <a href="/admin/dev">開発</a>
+      <a href="/admin/insights">改善</a>
+      <a href="/admin/knowledge">ナレッジ</a>
+      <a href="/admin/mindmap">記憶マップ</a>
     </div>
   </header>
 
