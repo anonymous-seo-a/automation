@@ -13,6 +13,7 @@ function layout(title: string, content: string, opts: LayoutOptions = {}): strin
     { href: '/admin/insights', label: '改善', key: 'insights' },
     { href: '/admin/live', label: 'オフィス', key: 'live' },
     { href: '/admin/knowledge', label: 'ナレッジ', key: 'knowledge' },
+    { href: '/admin/mindmap', label: '🧠 マインドマップ', key: 'mindmap' },
   ];
 
   const breadcrumbHtml = breadcrumbs && breadcrumbs.length > 0
