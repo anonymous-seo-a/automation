@@ -190,4 +190,17 @@ export function runMigrations(): void {
   } catch {
     db.exec("ALTER TABLE memories ADD COLUMN embedding BLOB");
   }
+
+  // 既存テーブルに importance 列がなければ追加（マイグレーション互換）
+  try {
+    db.prepare("SELECT importance FROM memories LIMIT 1").get();
+  } catch {
+    db.exec("ALTER TABLE memories ADD COLUMN importance INTEGER DEFAULT 3");
+  }
+
+  try {
+    db.prepare("SELECT importance FROM agent_memories LIMIT 1").get();
+  } catch {
+    db.exec("ALTER TABLE agent_memories ADD COLUMN importance INTEGER DEFAULT 3");
+  }
 }
