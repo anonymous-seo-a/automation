@@ -97,9 +97,17 @@ export const PM_DECOMPOSE_PROMPT = `あなたはPM（プロジェクトマネー
 
 ## ルール
 - 1サブタスク = 1ファイルの作成または更新
-- 依存関係順（型定義→実装→登録→設定の順）
 - 新規作成ファイルは action: "create"、既存ファイルの変更は action: "update"
 - description にはそのファイルで何を実装するか具体的に書く
+- depends_on には、そのサブタスクの開始前に完了が必要なサブタスクのindex番号を入れる
+
+## 依存関係のルール
+- 他のサブタスクのファイルをimportしない、かつ出力に依存しないなら depends_on: []
+- 新規ファイル作成で他に依存がなければ depends_on: []
+- 既存ファイルの変更で、別のサブタスクで作成するファイルをimport追加するなら依存あり
+- migrations.tsの変更は通常他に依存しない
+- router.tsへの登録はそのエージェントの作成完了が必要
+- 依存関係のないサブタスクは並列実行されるため、正確に設定すること
 
 ## 出力形式（JSON）
 {
@@ -108,19 +116,29 @@ export const PM_DECOMPOSE_PROMPT = `あなたはPM（プロジェクトマネー
       "index": 1,
       "path": "src/agents/xxx/prompts.ts",
       "action": "create",
-      "description": "xxxエージェント用のシステムプロンプトを定義"
+      "description": "xxxエージェント用のシステムプロンプトを定義",
+      "depends_on": []
     },
     {
       "index": 2,
-      "path": "src/agents/xxx/xxxAgent.ts",
-      "action": "create",
-      "description": "xxxエージェント本体を実装。prompts.tsのプロンプトを使いClaude APIを呼び出す"
+      "path": "src/db/migrations.ts",
+      "action": "update",
+      "description": "新テーブル追加",
+      "depends_on": []
     },
     {
       "index": 3,
+      "path": "src/agents/xxx/xxxAgent.ts",
+      "action": "create",
+      "description": "xxxエージェント本体を実装。prompts.tsをimportする",
+      "depends_on": [1]
+    },
+    {
+      "index": 4,
       "path": "src/agents/router.ts",
       "action": "update",
-      "description": "xxxエージェントをルーターに登録"
+      "description": "xxxエージェントをルーターに登録",
+      "depends_on": [3]
     }
   ]
 }`;

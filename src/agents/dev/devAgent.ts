@@ -50,6 +50,7 @@ import { runPreflightChecks, autoFixEnvironment } from './preflight';
 import { classifyError, categoryLabel } from './errorClassifier';
 import { runTeamDiagnosis, DiagnosisResult } from './teamDiagnosis';
 import { emitDevEvent } from '../../events/devEvents';
+import { buildExecutionBatches, formatBatchPlan } from './scheduler';
 import { config } from '../../config';
 
 const MAX_BUILD_RETRIES = 5;
@@ -84,6 +85,7 @@ interface Subtask {
   path: string;
   action: 'create' | 'update';
   description: string;
+  depends_on: number[];  // 依存するサブタスクのindex（空配列 = 独立）
 }
 
 interface StuckContext {
@@ -616,101 +618,168 @@ export class DevAgent implements Agent {
         await sendLineMessage(conv.user_id, `サブタスク ${startIndex + 1} から再開します...`);
       }
 
-      // サブタスクごとに エンジニア→レビュアー のループ
-      for (let i = startIndex; i < subtasks.length; i++) {
-        const subtask = subtasks[i];
-        // ハートビート: サブタスク開始時にもタイムアウト防止
+      // depends_onフィールドがないサブタスク（PMが古い形式で返した場合）は空配列として扱う
+      for (const st of subtasks) {
+        if (!st.depends_on) st.depends_on = [];
+      }
+
+      // 再開時: startIndexから始まる未完了サブタスクのみ対象
+      const remainingSubtasks = startIndex > 0
+        ? subtasks.filter((_, idx) => idx >= startIndex)
+        : subtasks;
+
+      const batches = buildExecutionBatches(remainingSubtasks);
+      dbLog('info', 'dev-agent', `[PM] バッチ計画: ${batches.length}バッチ`, { convId: conv.id });
+      const batchPlan = formatBatchPlan(batches);
+      await sendLineMessage(conv.user_id, `⚡ 実行計画（${batches.length}バッチ）:\n${batchPlan}`);
+      emitDevEvent({ type: 'agent_message', convId: conv.id, agent: 'pm', data: { message: `実行計画:\n${batchPlan}` } });
+
+      // バッチごとに実行
+      for (const batch of batches) {
         touchConversation(conv.id);
-        dbLog('info', 'dev-agent', `[エンジニア] サブタスク ${subtask.index}/${subtasks.length}: ${subtask.path}`, { convId: conv.id });
 
-        try {
-          const file = await this.engineerAndReview(conv, subtask, subtasks, completedFiles);
-          allFiles.push(file);
-          completedFiles.push({ path: file.path, content: file.content });
+        if (batch.subtasks.length === 1) {
+          // === 単一サブタスク → 従来通り直列実行 ===
+          const subtask = batch.subtasks[0];
+          dbLog('info', 'dev-agent', `[バッチ${batch.batchIndex}] 直列: ${subtask.path}`, { convId: conv.id });
 
-          // CLIが直接ファイルを書くのでwriteFiles不要、commitのみ
-          const commitResult = await commitAndStay(branchName, `feat: ${subtask.path}`);
-          if (!commitResult.success) {
-            // コミット失敗 → エラー分類 → 環境問題なら自動修正してリトライ
-            const classified = classifyError(commitResult.error || '');
-            dbLog('warn', 'dev-agent', `[チーム] コミット失敗: ${categoryLabel(classified.category)} - ${classified.subcategory}`, { convId: conv.id });
+          try {
+            const file = await this.engineerAndReview(conv, subtask, subtasks, completedFiles);
+            allFiles.push(file);
+            completedFiles.push({ path: file.path, content: file.content });
 
-            if (classified.autoFixable) {
-              const fixed = await autoFixEnvironment(classified);
-              if (fixed) {
-                const retryResult = await commitAndStay(branchName, `feat: ${subtask.path}`);
-                if (!retryResult.success) {
-                  throw new Error(`コミット失敗（自動修正後も解決せず）: ${retryResult.error}`);
+            const commitResult = await commitAndStay(branchName, `feat: ${subtask.path}`);
+            if (!commitResult.success) {
+              const classified = classifyError(commitResult.error || '');
+              dbLog('warn', 'dev-agent', `[チーム] コミット失敗: ${categoryLabel(classified.category)} - ${classified.subcategory}`, { convId: conv.id });
+              if (classified.autoFixable) {
+                const fixed = await autoFixEnvironment(classified);
+                if (fixed) {
+                  const retryResult = await commitAndStay(branchName, `feat: ${subtask.path}`);
+                  if (!retryResult.success) throw new Error(`コミット失敗（自動修正後も解決せず）: ${retryResult.error}`);
+                  dbLog('info', 'dev-agent', `[チーム] コミット: 自動修正後に成功`, { convId: conv.id });
+                } else {
+                  throw new Error(`コミット失敗（自動修正失敗）: ${commitResult.error}`);
                 }
-                dbLog('info', 'dev-agent', `[チーム] コミット: 自動修正後に成功`, { convId: conv.id });
               } else {
-                throw new Error(`コミット失敗（自動修正失敗）: ${commitResult.error}`);
+                throw new Error(`コミット失敗: ${commitResult.error}`);
               }
+            }
+
+            touchConversation(conv.id);
+            await sendLineMessage(conv.user_id, `${subtask.index}/${subtasks.length} 完了: ${subtask.path}`);
+          } catch (subtaskErr) {
+            const errMsg = subtaskErr instanceof Error ? subtaskErr.message : String(subtaskErr);
+            dbLog('error', 'dev-agent', `[チーム] サブタスク失敗: ${errMsg.slice(0, 200)}`, { convId: conv.id, subtaskIndex: subtask.index });
+
+            const isEscalation = subtaskErr instanceof EscalationError;
+            const triedActions = isEscalation
+              ? [`サブタスク${subtask.index}の実装を複数回試行`, 'チーム合議の結果、ユーザー判断が必要と判断']
+              : [`サブタスク${subtask.index}の実装を${MAX_REVIEW_RETRIES > 0 ? 'レビュー差し戻し含め複数回' : '1回'}試行`];
+
+            const failIdx = subtasks.findIndex(s => s.index === subtask.index);
+            this.stuckContextMap.set(conv.id, {
+              branchName, subtasks, completedFiles: [...completedFiles],
+              failedSubtaskIndex: failIdx >= 0 ? failIdx : 0,
+              errorMessage: errMsg, phase: 'implementing', triedActions, dialogueLog: [],
+            });
+            updateConversationStatus(conv.id, 'stuck');
+            if (gitLockAcquired) { releaseGitLock(conv.id); gitLockAcquired = false; }
+
+            const stuckUrl1 = `${config.admin.baseUrl}/admin/dev/${conv.id}`;
+            if (isEscalation) {
+              saveTeamConversation('pm_escalation', ['pm', 'user'], [
+                { role: 'pm', message: errMsg, timestamp: new Date().toISOString() },
+              ], conv.id, 'ユーザーへエスカレーション');
+              await sendLineMessage(conv.user_id,
+                `📋 PMからの相談\n\n■ 状況: サブタスク ${subtask.index}/${subtasks.length} (${subtask.path}) で方針判断が必要です\n■ 進捗: ${completedFiles.length}/${subtasks.length} ファイル完了済み\n\n■ 経緯:\n${errMsg}\n\nどう進めるべきか、方針を教えてください。\n「リトライ」「スキップ」「中止」も選べます。\n\n詳細: ${stuckUrl1}`
+              );
             } else {
-              throw new Error(`コミット失敗: ${commitResult.error}`);
+              const { category: errCat1, explanation: errExp1 } = classifyStuckError(errMsg, 'implementing');
+              await sendLineMessage(conv.user_id,
+                `📋 PMからの報告\n\n■ 状況: サブタスク ${subtask.index}/${subtasks.length} (${subtask.path}) で問題発生\n■ 進捗: ${completedFiles.length}/${subtasks.length} ファイル完了済み（コミット済み）\n■ エラー種別: ${errCat1}\n■ 原因: ${errExp1}\n\n■ 試したこと:\n${triedActions.map(a => `・${a}`).join('\n')}\n\n何か気になる点や指示があれば送ってください。「リトライ」「スキップ」「中止」も選べます。\n\n詳細: ${stuckUrl1}`
+              );
+            }
+            return; // stuckで一旦停止
+          }
+
+        } else {
+          // === 複数サブタスク → 並列実行 ===
+          const parallelPaths = batch.subtasks.map(s => s.path.split('/').pop()).join(', ');
+          dbLog('info', 'dev-agent', `[バッチ${batch.batchIndex}] ⚡並列(${batch.subtasks.length}): ${parallelPaths}`, { convId: conv.id });
+          await sendLineMessage(conv.user_id, `⚡ バッチ${batch.batchIndex}: ${batch.subtasks.length}ファイルを並列実装中...\n${parallelPaths}`);
+          emitDevEvent({ type: 'agent_activity', convId: conv.id, agent: 'engineer', data: { status: 'coding', message: `並列実装中: ${batch.subtasks.length}ファイル` } });
+
+          // Promise.allSettledで並列実行（1つ失敗しても他は続行）
+          // 並列バッチではビルドスキップ（バッチ完了後に一括ビルド）
+          const results = await Promise.allSettled(
+            batch.subtasks.map(subtask =>
+              this.engineerAndReview(conv, subtask, subtasks, completedFiles, true)
+            )
+          );
+
+          const succeeded: FileToWrite[] = [];
+          const failed: Array<{ subtask: Subtask; error: string }> = [];
+
+          for (let j = 0; j < results.length; j++) {
+            const result = results[j];
+            const subtask = batch.subtasks[j];
+            if (result.status === 'fulfilled') {
+              succeeded.push(result.value);
+              dbLog('info', 'dev-agent', `[バッチ${batch.batchIndex}] ✅ ${subtask.path}`, { convId: conv.id });
+            } else {
+              const errMsg = result.reason instanceof Error ? result.reason.message : String(result.reason);
+              failed.push({ subtask, error: errMsg });
+              dbLog('error', 'dev-agent', `[バッチ${batch.batchIndex}] ❌ ${subtask.path}: ${errMsg.slice(0, 200)}`, { convId: conv.id });
             }
           }
 
-          // ハートビート: updated_at を更新してタイムアウト（30分）を防止
+          // 成功分を記録・コミット
+          for (const file of succeeded) {
+            allFiles.push(file);
+            completedFiles.push({ path: file.path, content: file.content });
+          }
+          if (succeeded.length > 0) {
+            const commitResult = await commitAndStay(
+              branchName,
+              `feat: batch${batch.batchIndex} - ${succeeded.map(f => f.path.split('/').pop()).join(', ')}`
+            );
+            if (!commitResult.success) {
+              throw new Error(`バッチコミット失敗: ${commitResult.error}`);
+            }
+          }
+
           touchConversation(conv.id);
-          await sendLineMessage(conv.user_id, `${subtask.index}/${subtasks.length} 完了: ${subtask.path}`);
-        } catch (subtaskErr) {
-          const errMsg = subtaskErr instanceof Error ? subtaskErr.message : String(subtaskErr);
-          dbLog('error', 'dev-agent', `[チーム] サブタスク失敗: ${errMsg.slice(0, 200)}`, { convId: conv.id, subtaskIndex: subtask.index });
+          await sendLineMessage(conv.user_id,
+            `バッチ${batch.batchIndex} 完了: ✅${succeeded.length} ${failed.length > 0 ? `❌${failed.length}` : ''}\n全体進捗: ${completedFiles.length}/${subtasks.length}`
+          );
 
-          // F3: エスカレーションエラーの場合は相談メッセージを変える
-          const isEscalation = subtaskErr instanceof EscalationError;
-          const triedActions = isEscalation
-            ? [`サブタスク${subtask.index}の実装を複数回試行`, 'チーム合議の結果、ユーザー判断が必要と判断']
-            : [`サブタスク${subtask.index}の実装を${MAX_REVIEW_RETRIES > 0 ? 'レビュー差し戻し含め複数回' : '1回'}試行`];
+          // 失敗があった場合 → stuckモードに移行
+          if (failed.length > 0) {
+            const firstFail = failed[0];
+            const failIdx = subtasks.findIndex(s => s.index === firstFail.subtask.index);
 
-          this.stuckContextMap.set(conv.id, {
-            branchName,
-            subtasks,
-            completedFiles: [...completedFiles],
-            failedSubtaskIndex: i,
-            errorMessage: errMsg,
-            phase: 'implementing',
-            triedActions,
-            dialogueLog: [],
-          });
-          updateConversationStatus(conv.id, 'stuck');
+            this.stuckContextMap.set(conv.id, {
+              branchName, subtasks, completedFiles: [...completedFiles],
+              failedSubtaskIndex: failIdx >= 0 ? failIdx : 0,
+              errorMessage: `バッチ${batch.batchIndex}で${failed.length}件失敗:\n${failed.map(f => `- ${f.subtask.path}: ${f.error.slice(0, 100)}`).join('\n')}`,
+              phase: 'implementing',
+              triedActions: [`バッチ${batch.batchIndex}の並列実行で${failed.length}件失敗`],
+              dialogueLog: [],
+            });
+            updateConversationStatus(conv.id, 'stuck');
+            if (gitLockAcquired) { releaseGitLock(conv.id); gitLockAcquired = false; }
 
-          // ロック解放（finallyで二重解放されないようフラグを落とす）
-          if (gitLockAcquired) {
-            releaseGitLock(conv.id);
-            gitLockAcquired = false;
-          }
-
-          const stuckUrl1 = `${config.admin.baseUrl}/admin/dev/${conv.id}`;
-
-          if (isEscalation) {
-            // F3: PMからの方針相談
-            saveTeamConversation('pm_escalation', ['pm', 'user'], [
-              { role: 'pm', message: errMsg, timestamp: new Date().toISOString() },
-            ], conv.id, 'ユーザーへエスカレーション');
+            const stuckUrl2 = `${config.admin.baseUrl}/admin/dev/${conv.id}`;
             await sendLineMessage(conv.user_id,
-              `📋 PMからの相談\n\n` +
-              `■ 状況: サブタスク ${subtask.index}/${subtasks.length} (${subtask.path}) で方針判断が必要です\n` +
-              `■ 進捗: ${completedFiles.length}/${subtasks.length} ファイル完了済み\n\n` +
-              `■ 経緯:\n${errMsg}\n\n` +
-              `どう進めるべきか、方針を教えてください。\n「リトライ」「スキップ」「中止」も選べます。\n\n` +
-              `詳細: ${stuckUrl1}`
+              `⚠️ バッチ${batch.batchIndex}で${failed.length}件失敗\n\n` +
+              `成功（コミット済み）:\n${succeeded.map(f => `✅ ${f.path}`).join('\n')}\n\n` +
+              `失敗:\n${failed.map(f => `❌ ${f.subtask.path}: ${f.error.slice(0, 100)}`).join('\n')}\n\n` +
+              `「リトライ」で失敗分を再実行、「スキップ」で次へ、「中止」で終了\n\n` +
+              `詳細: ${stuckUrl2}`
             );
-          } else {
-            const { category: errCat1, explanation: errExp1 } = classifyStuckError(errMsg, 'implementing');
-            await sendLineMessage(conv.user_id,
-              `📋 PMからの報告\n\n` +
-              `■ 状況: サブタスク ${subtask.index}/${subtasks.length} (${subtask.path}) で問題発生\n` +
-              `■ 進捗: ${completedFiles.length}/${subtasks.length} ファイル完了済み（コミット済み）\n` +
-              `■ エラー種別: ${errCat1}\n` +
-              `■ 原因: ${errExp1}\n\n` +
-              `■ 試したこと:\n${triedActions.map(a => `・${a}`).join('\n')}\n\n` +
-              `何か気になる点や指示があれば送ってください。「リトライ」「スキップ」「中止」も選べます。\n\n` +
-              `詳細: ${stuckUrl1}`
-            );
+            return; // stuckで一旦停止
           }
-          return; // stuckで一旦停止
         }
       }
 
@@ -1063,7 +1132,11 @@ export class DevAgent implements Agent {
 
       const parsed = safeParseJson(text);
       if (parsed && parsed.subtasks && Array.isArray(parsed.subtasks) && parsed.subtasks.length > 0) {
-        return parsed.subtasks as Subtask[];
+        // depends_onがない場合は空配列をデフォルト設定
+        return (parsed.subtasks as Subtask[]).map(s => ({
+          ...s,
+          depends_on: Array.isArray(s.depends_on) ? s.depends_on : [],
+        }));
       }
 
       dbLog('warn', 'dev-agent', `[PM] サブタスク分解パース失敗 (${attempt}/${MAX_DECOMPOSE_RETRIES}): ${text.slice(0, 200)}`, { convId: conv.id });
@@ -1081,6 +1154,7 @@ export class DevAgent implements Agent {
     subtask: Subtask,
     allSubtasks: Subtask[],
     completedFiles: Array<{ path: string; content: string }>,
+    skipBuild: boolean = false,
   ): Promise<FileToWrite> {
 
     let reviewRetry = 0;
@@ -1101,7 +1175,7 @@ export class DevAgent implements Agent {
 
     while (reviewRetry <= MAX_REVIEW_RETRIES) {
       // --- エンジニア（Claude CLI） ---
-      const cliPrompt = this.buildCLIPrompt(conv, subtask, allSubtasks, completedFiles, reviewFeedback);
+      const cliPrompt = this.buildCLIPrompt(conv, subtask, allSubtasks, completedFiles, reviewFeedback, skipBuild);
 
       dbLog('info', 'dev-agent', `[エンジニア/CLI] コード生成開始 (レビュー試行 ${reviewRetry + 1})`, { convId: conv.id, path: subtask.path });
       emitDevEvent({ type: 'agent_activity', convId: conv.id, agent: 'engineer', data: { status: 'coding', message: `コーディング中: ${subtask.path}`, file: subtask.path } });
@@ -1261,6 +1335,7 @@ export class DevAgent implements Agent {
     _allSubtasks: Subtask[],
     completedFiles: Array<{ path: string; content: string }>,
     reviewFeedback: string,
+    skipBuild: boolean = false,
   ): string {
     let prompt = `CLAUDE.md を読んでから、以下のサブタスクを実装してください。
 
@@ -1285,9 +1360,15 @@ ${conv.requirements}
     }
 
     prompt += `\n## 指示
-- このサブタスク（1ファイル）だけを作成/変更してください
-- npm run build でビルドが通ることを確認してください
-- 不明点や設計判断に迷った場合、以下のJSONを出力に含めるとPMに相談できます:
+- このサブタスク（1ファイル）だけを作成/変更してください`;
+
+    if (skipBuild) {
+      prompt += `\n- ⚠️ npm run build は実行しないでください。ビルドは後で一括で行います。ファイルの作成/変更のみ行ってください`;
+    } else {
+      prompt += `\n- npm run build でビルドが通ることを確認してください`;
+    }
+
+    prompt += `\n- 不明点や設計判断に迷った場合、以下のJSONを出力に含めるとPMに相談できます:
   {"consult": {"question": "相談内容"}}`;
 
     return prompt;
