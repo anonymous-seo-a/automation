@@ -250,6 +250,13 @@ function renderDashboard(data: Record<string, unknown>): string {
     <div class="value">${agents.length}</div>
     <div class="sub">${agents.join(', ')}</div>
   </div>
+  <div class="card" style="border-color:#3d2e6b;background:#1a1530;">
+    <div class="label" style="color:#bc8cff;">記憶・知識</div>
+    <div class="value" style="font-size:18px;margin-top:4px;">
+      <a href="${data.mindmapLink || '/admin/mindmap'}" style="color:#bc8cff;text-decoration:none;">🧠 記憶マインドマップ</a>
+    </div>
+    <div class="sub">AIの記憶と知識構造を可視化</div>
+  </div>
 </div>
 
 <h2>直近のタスク</h2>
