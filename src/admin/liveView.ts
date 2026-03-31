@@ -359,6 +359,7 @@ body{
       <div id="conn" class="conn-badge"><span class="conn-dot"></span> <span id="conn-text">接続中...</span></div>
       <a href="/admin">ダッシュボード</a>
       <a href="/admin/dev">開発</a>
+      <a href="/admin/mindmap">🧠 記憶マインドマップ</a>
     </div>
   </header>
 
