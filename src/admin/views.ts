@@ -694,9 +694,11 @@ ${Object.keys(metricsByAgent).length > 0 ? `
 ${Object.keys(evalByAgent).length > 0 ? `
 <h2>📊 エージェント評価サマリー</h2>
 <div class="grid">
-  ${Object.entries(evalByAgent).map(([agent, evals]) => `
+  ${Object.entries(evalByAgent).map(([agent, evals]) => {
+    const agentLabel: Record<string, string> = { pm: 'PM（進行管理）', engineer: 'Engineer（実装）', reviewer: 'Reviewer（レビュー）', deployer: 'Deployer（デプロイ）' };
+    return `
     <div class="card">
-      <div class="label">${agent}</div>
+      <div class="label">${agentLabel[agent] || agent}</div>
       <div style="margin-top:8px">
         ${evals.map(e => {
           const avg = e.avg_sentiment as number;
@@ -708,7 +710,7 @@ ${Object.keys(evalByAgent).length > 0 ? `
         }).join('')}
       </div>
     </div>
-  `).join('')}
+  `}).join('')}
 </div>` : ''}
 
 ${rejectReasons.length > 0 ? `

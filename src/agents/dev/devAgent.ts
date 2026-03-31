@@ -261,10 +261,12 @@ export class DevAgent implements Agent {
       // hearing/defining フェーズはstuckに移行せず、即座にfailed + 通知
       if (phaseName === 'hearing' || phaseName === 'defining') {
         updateConversationStatus(conv.id, 'failed');
-        await sendLineMessage(conv.user_id,
-          `${phaseName}フェーズでエラーが発生しました:\n${errMsg.slice(0, 300)}\n\n` +
-          `新しい開発依頼を送り直してください。`
-        ).catch(() => {});
+        // 529/500エラーは人間向けメッセージに変換
+        const isOverloaded = /529|overloaded|500.*Internal server/i.test(errMsg);
+        const userMessage = isOverloaded
+          ? 'Claude Opus が一時的に混雑しています（Anthropic側の障害）。\n数分後に再度お試しください。\n\n※ 状況確認: status.anthropic.com'
+          : `${phaseName}フェーズでエラーが発生しました:\n${errMsg.slice(0, 300)}\n\n新しい開発依頼を送り直してください。`;
+        await sendLineMessage(conv.user_id, userMessage).catch(() => {});
         return;
       }
 
@@ -289,12 +291,11 @@ export class DevAgent implements Agent {
         ctx.phase = phaseName;
       }
 
-      await sendLineMessage(conv.user_id,
-        `${phaseName}フェーズでエラーが発生しました:\n${errMsg.slice(0, 300)}\n\n` +
-        `選択肢:\n` +
-        `・「リトライ」→ 再試行\n` +
-        `・「中止」→ 開発を中止（完了分はブランチに残ります）`
-      ).catch(() => {});
+      const isOverloaded = /529|overloaded|500.*Internal server/i.test(errMsg);
+      const stuckMessage = isOverloaded
+        ? 'Claude Opus が一時的に混雑しています。\n\n・「リトライ」→ 再試行\n・「中止」→ 開発を中止'
+        : `${phaseName}フェーズでエラーが発生しました:\n${errMsg.slice(0, 300)}\n\n選択肢:\n・「リトライ」→ 再試行\n・「中止」→ 開発を中止（完了分はブランチに残ります）`;
+      await sendLineMessage(conv.user_id, stuckMessage).catch(() => {});
     }
   }
 
@@ -425,6 +426,13 @@ export class DevAgent implements Agent {
   }
 
   private async processHearingResponse(conv: DevConversation, text: string): Promise<void> {
+    // キャンセル済みの会話はスキップ（Opusリトライ中にユーザーがキャンセルした場合）
+    const freshConv = getConversation(conv.id);
+    if (!freshConv || freshConv.status === 'failed' || freshConv.status === 'deployed') {
+      dbLog('info', 'dev-agent', `[PM] 会話終了済み(${freshConv?.status || 'deleted'}) → ヒアリング応答スキップ`, { convId: conv.id });
+      return;
+    }
+
     const parsed = safeParseJson(text);
 
     if (parsed && parsed.hearing_complete) {

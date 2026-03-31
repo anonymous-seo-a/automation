@@ -168,25 +168,38 @@ export async function handleMessage(userId: string, text: string): Promise<void>
   }
 
   // ★ セーフワード検出（最優先 — 自動ルーティングを上書き）
+  let forceBunshin = false;
   const safeWordResult = detectSafeWord(text);
-  if (safeWordResult && activeDevConv) {
-    const { target, cleanText } = safeWordResult;
-    const autoTarget = getAutoRouteTarget(activeDevConv.status);
-    // 自動判定先と違う場合のみ修正を記録（学習用）
-    if (autoTarget !== target) {
-      recordRoutingCorrection(userId, cleanText, activeDevConv.status, autoTarget, target);
-      dbLog('info', 'webhook', `セーフワード: ${target} (自動判定: ${autoTarget}, フェーズ: ${activeDevConv.status})`);
-    }
-    if (target === 'pm') {
-      await devAgent.handleMessage(userId, cleanText);
+  if (safeWordResult) {
+    // @分身/@PM はdev会話の有無に関係なく機能する
+    if (!activeDevConv && safeWordResult.target === 'bunshin') {
+      // dev会話なし + @分身 → テキスト整形だけして通常応答へ
+      text = safeWordResult.cleanText;
+      forceBunshin = true;
+      saveMessage(dbId, 'user', text);
+      dbLog('info', 'webhook', `セーフワード → 分身（dev会話なし）: "${text.slice(0, 30)}"`);
+    } else if (!activeDevConv && safeWordResult.target === 'pm') {
+      // dev会話なし + @PM → 新規dev会話開始
+      dbLog('info', 'webhook', `セーフワード → PM（新規開発）: "${safeWordResult.cleanText.slice(0, 30)}"`);
+      await devAgent.handleMessage(userId, safeWordResult.cleanText);
       return;
+    } else if (activeDevConv) {
+      const { target, cleanText } = safeWordResult;
+      const autoTarget = getAutoRouteTarget(activeDevConv.status);
+      if (autoTarget !== target) {
+        recordRoutingCorrection(userId, cleanText, activeDevConv.status, autoTarget, target);
+        dbLog('info', 'webhook', `セーフワード: ${target} (自動判定: ${autoTarget}, フェーズ: ${activeDevConv.status})`);
+      }
+      if (target === 'pm') {
+        await devAgent.handleMessage(userId, cleanText);
+        return;
+      }
+      // target === 'bunshin' → responder処理へ（DEV_AGENTトリガー無効化）
+      text = cleanText;
+      forceBunshin = true;
+      saveMessage(dbId, 'user', text);
+      dbLog('info', 'webhook', `セーフワード → 分身: "${text.slice(0, 30)}"`);
     }
-    // target === 'bunshin' → 下のresponder処理にフォールスルー（cleanTextで上書き）
-    text = cleanText;
-    // bunshin強制のため、dev固有ルーティングをスキップ
-    saveMessage(dbId, 'user', text);
-    dbLog('info', 'webhook', `セーフワード → 分身: "${text.slice(0, 30)}"`);
-    // responder呼び出しへ直行
   } else {
     // ★ 通常のdev会話ルーティング
 
@@ -263,8 +276,13 @@ export async function handleMessage(userId: string, text: string): Promise<void>
     } else {
       // 開発会話がない時も、新規開発依頼を検出する
       devContext = '\n\n## 開発エージェント\nこのシステムには開発チーム（PM→エンジニア→レビュアー）が組み込まれています。' +
-        'ユーザーが「何かを作って欲しい」「機能を追加したい」「ページ/ツール/エージェントを開発して」のような開発依頼をしている場合は、"DEV_AGENT" とだけ返してください。' +
-        '雑談・質問・相談など開発依頼でないメッセージには普通に回答してください。';
+        '\nユーザーが明確に「何かを新しく作って欲しい」「機能を追加・修正して」「ページ/ツール/エージェントを開発して」と依頼している場合のみ "DEV_AGENT" とだけ返してください。' +
+        '\n\n以下は DEV_AGENT にしないでください（普通に回答）:' +
+        '\n- 挨拶（こんにちは、おはよう等）' +
+        '\n- システムについての質問・感想（「〇〇ってどうなった？」「〇〇が良くなった？」等）' +
+        '\n- 雑談・相談・日常会話' +
+        '\n- 過去の開発結果への感想やフィードバック' +
+        '\n\n迷ったら普通に回答してください。ユーザーは @PM で明示的に開発モードに切り替えられます。';
     }
 
     const response = await generateResponse(text, {
@@ -272,10 +290,21 @@ export async function handleMessage(userId: string, text: string): Promise<void>
       rawContext: devContext || undefined,
     }, dbId);
 
-    // DEV_AGENT トリガー
-    if (response.trim() === 'DEV_AGENT') {
+    // DEV_AGENT トリガー（@分身セーフワード時はスキップ）
+    if (!forceBunshin && response.trim() === 'DEV_AGENT') {
       dbLog('info', 'webhook', 'responder判定 → DEV_AGENT');
       await devAgent.handleMessage(userId, text);
+      return;
+    }
+    if (forceBunshin && response.trim() === 'DEV_AGENT') {
+      dbLog('info', 'webhook', 'responder判定DEV_AGENTだが@分身セーフワードにより無視');
+      // DEV_AGENTの代わりに分身に再応答
+      const bunshinResponse = await generateResponse(text, {
+        systemStatus: systemContext,
+      }, dbId);
+      await sendLineMessage(userId, bunshinResponse);
+      saveMessage(dbId, 'assistant', bunshinResponse);
+      extractAndSaveMemories(dbId, text, bunshinResponse).catch(err => logger.warn('自動記憶抽出失敗', { err }));
       return;
     }
 
@@ -425,9 +454,12 @@ function buildDevRoutingContext(conv: { id: string; topic: string; status: strin
 
   // DEV_AGENTトリガー指示
   ctx += '\n\n## ルーティング判定ルール' +
-    '\nユーザーのメッセージが開発チーム（PM）への指示・回答・相談であれば "DEV_AGENT" とだけ返してください。' +
-    '\n雑談・質問・相談など開発に無関係なメッセージには普通に回答してください。' +
-    '\n迷ったら普通に回答してください（ユーザーは @PM で明示的にPMに切り替えられます）。';
+    '\nユーザーのメッセージが「PMのヒアリング質問への直接の回答」または「開発指示の続き」であれば "DEV_AGENT" とだけ返してください。' +
+    '\n\n以下は DEV_AGENT にしないでください:' +
+    '\n- 挨拶や雑談' +
+    '\n- システムについての感想・質問（「〇〇どう？」「〇〇良くなった？」等）' +
+    '\n- 開発とは無関係な会話' +
+    '\n\n迷ったら普通に回答してください（ユーザーは @PM で明示的にPMに切り替えられます）。';
 
   return ctx;
 }

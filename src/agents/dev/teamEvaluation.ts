@@ -11,8 +11,14 @@ export async function extractDaikiEvaluation(
     const { text } = await callClaude({
       system: `ユーザーの発言が、直前の開発タスクやチーム成果への評価を含んでいるか判定してください。
 
-含んでいる場合:
-{"is_evaluation":true,"target":"pm","sentiment":-2〜+2の整数,"aspect":"品質/速度/設計/要件定義/コミュニケーション","summary":"評価の要約"}
+チームメンバー:
+- pm: 要件定義・タスク分解・進行管理を担当
+- engineer: コード生成を担当
+- reviewer: コードレビューを担当
+- deployer: ビルド・テスト・デプロイを担当
+
+含んでいる場合（targetは最も関連するメンバーを選択。全体的な評価ならpm）:
+{"is_evaluation":true,"target":"pm|engineer|reviewer|deployer","sentiment":-2〜+2の整数,"aspect":"品質/速度/設計/要件定義/コミュニケーション","summary":"評価の要約"}
 
 含んでいない場合:
 {"is_evaluation":false}
