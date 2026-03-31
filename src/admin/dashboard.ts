@@ -76,13 +76,18 @@ adminRouter.get('/', (_req: Request, res: Response) => {
 
 // タスク詳細
 adminRouter.get('/tasks/:id', (req: Request, res: Response) => {
-  const db = getDB();
-  const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(req.params.id) as Record<string, unknown> | undefined;
-  if (!task) {
-    res.status(404).send('タスクが見つかりません');
-    return;
+  try {
+    const db = getDB();
+    const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(req.params.id) as Record<string, unknown> | undefined;
+    if (!task) {
+      res.status(404).send('タスクが見つかりません');
+      return;
+    }
+    res.send(renderPage('task-detail', { task }));
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    res.status(500).send(`<h1>エラー</h1><pre>${errMsg}</pre>`);
   }
-  res.send(renderPage('task-detail', { task }));
 });
 
 // 開発結果一覧
@@ -271,31 +276,76 @@ adminRouter.get('/insights', (_req: Request, res: Response) => {
   }
 });
 
-// 開発会話の強制キャンセル
-adminRouter.post('/dev/:id/cancel', (req: Request, res: Response) => {
-  const db = getDB();
-  const conv = db.prepare('SELECT * FROM dev_conversations WHERE id = ?').get(req.params.id) as Record<string, unknown> | undefined;
-  if (!conv) {
-    res.status(404).send('会話が見つかりません');
-    return;
+// 全開発会話の強制リセット（/dev/:id/cancel より先に登録）
+adminRouter.post('/dev/reset-all', (_req: Request, res: Response) => {
+  try {
+    const db = getDB();
+    db.prepare("UPDATE dev_conversations SET status = 'failed', updated_at = datetime('now') WHERE status NOT IN ('deployed', 'failed')").run();
+    res.redirect('/admin/dev');
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    res.status(500).send(`<h1>エラー</h1><pre>${errMsg}</pre>`);
   }
-  db.prepare("UPDATE dev_conversations SET status = 'failed', updated_at = datetime('now') WHERE id = ?").run(req.params.id);
-  res.redirect('/admin/dev');
 });
 
-// 全開発会話の強制リセット
-adminRouter.post('/dev/reset-all', (_req: Request, res: Response) => {
-  const db = getDB();
-  db.prepare("UPDATE dev_conversations SET status = 'failed', updated_at = datetime('now') WHERE status NOT IN ('deployed', 'failed')").run();
-  res.redirect('/admin/dev');
+// 開発会話の強制キャンセル
+adminRouter.post('/dev/:id/cancel', (req: Request, res: Response) => {
+  try {
+    const db = getDB();
+    const conv = db.prepare('SELECT * FROM dev_conversations WHERE id = ?').get(req.params.id) as Record<string, unknown> | undefined;
+    if (!conv) {
+      res.status(404).send('会話が見つかりません');
+      return;
+    }
+    db.prepare("UPDATE dev_conversations SET status = 'failed', updated_at = datetime('now') WHERE id = ?").run(req.params.id);
+    res.redirect('/admin/dev');
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    res.status(500).send(`<h1>エラー</h1><pre>${errMsg}</pre>`);
+  }
+});
+
+// メモリマップ
+adminRouter.get('/memory-map', (_req: Request, res: Response) => {
+  try {
+    const db = getDB();
+
+    const userMemories = db.prepare(`
+      SELECT user_id, type, key, content, updated_at
+      FROM memories
+      ORDER BY user_id, type, updated_at DESC
+    `).all() as Array<Record<string, unknown>>;
+
+    const sessions = db.prepare(`
+      SELECT id, user_id, started_at, ended_at, summary
+      FROM conversation_sessions
+      ORDER BY started_at DESC LIMIT 50
+    `).all() as Array<Record<string, unknown>>;
+
+    const agentMemories = db.prepare(`
+      SELECT agent, type, key, content, source, updated_at
+      FROM agent_memories
+      ORDER BY agent, type, updated_at DESC
+    `).all() as Array<Record<string, unknown>>;
+
+    res.send(renderPage('memory-map', { userMemories, sessions, agentMemories }));
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    res.status(500).send(`<h1>メモリマップエラー</h1><pre>${errMsg}</pre>`);
+  }
 });
 
 // ナレッジ一覧
 adminRouter.get('/knowledge', (_req: Request, res: Response) => {
-  const db = getDB();
-  const items = db.prepare(`
-    SELECT id, file_name, section, content, version, updated_at
-    FROM knowledge ORDER BY file_name, rowid
-  `).all() as Array<Record<string, unknown>>;
-  res.send(renderPage('knowledge', { items }));
+  try {
+    const db = getDB();
+    const items = db.prepare(`
+      SELECT id, file_name, section, content, version, updated_at
+      FROM knowledge ORDER BY file_name, rowid
+    `).all() as Array<Record<string, unknown>>;
+    res.send(renderPage('knowledge', { items }));
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    res.status(500).send(`<h1>エラー</h1><pre>${errMsg}</pre>`);
+  }
 });
