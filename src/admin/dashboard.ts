@@ -5,6 +5,7 @@ import { config } from '../config';
 import { listAgents } from '../agents/router';
 import { renderPage } from './views';
 import { setupLiveRoutes } from './liveView';
+import { mindmapRouter } from './mindmap';
 
 export const adminRouter = Router();
 
@@ -14,6 +15,7 @@ adminRouter.use(express.json());
 
 // ライブオフィスビュー
 setupLiveRoutes(adminRouter);
+adminRouter.use('/mindmap', mindmapRouter);
 
 // ダッシュボードトップ
 adminRouter.get('/', (_req: Request, res: Response) => {
