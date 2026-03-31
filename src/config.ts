@@ -17,8 +17,8 @@ export const config = {
     apiKey: required('CLAUDE_API_KEY'),
     defaultModel: process.env.CLAUDE_MODEL_DEFAULT || 'claude-sonnet-4-6',
     opusModel: process.env.CLAUDE_MODEL_OPUS || 'claude-opus-4-6',
-    dailyBudgetUsd: parseFloat(process.env.CLAUDE_DAILY_BUDGET_USD || '1.50'),
-    monthlyBudgetUsd: parseFloat(process.env.CLAUDE_MONTHLY_BUDGET_USD || '30.00'),
+    dailyBudgetUsd: parseFloat(process.env.CLAUDE_DAILY_BUDGET_USD || '5.00'),
+    monthlyBudgetUsd: parseFloat(process.env.CLAUDE_MONTHLY_BUDGET_USD || '60.00'),
   },
   server: {
     port: parseInt(process.env.PORT || '3000', 10),
@@ -33,6 +33,21 @@ export const config = {
   sandbox: {
     dir: process.env.SANDBOX_DIR || '/tmp/mothership/sandbox',
     timeoutMs: 30000,
+  },
+  voyage: {
+    apiKey: process.env.VOYAGE_API_KEY || '',
+    model: process.env.VOYAGE_MODEL || 'voyage-3.5',
+  },
+  telegram: {
+    botToken: process.env.TELEGRAM_BOT_TOKEN || '',
+    allowedChatId: process.env.TELEGRAM_ALLOWED_CHAT_ID || '',
+    webhookSecret: process.env.TELEGRAM_WEBHOOK_SECRET || '',
+  },
+  github: {
+    token: process.env.GITHUB_TOKEN || '',
+    owner: process.env.GITHUB_OWNER || 'anonymous-seo-a',
+    repo: process.env.GITHUB_REPO || 'automation',
+    branch: process.env.GITHUB_BRANCH || 'dev/initial-build',
   },
   admin: {
     password: process.env.ADMIN_PASSWORD || 'mothership2026',

@@ -7,6 +7,7 @@ export type ConversationStatus =
   | 'approved'
   | 'implementing'
   | 'testing'
+  | 'stuck'
   | 'deployed'
   | 'failed';
 
@@ -24,12 +25,40 @@ export interface DevConversation {
 
 export function getActiveConversation(userId: string): DevConversation | null {
   const db = getDB();
+  // ステータス別タイムアウト:
+  //   hearing/defining: 10分（ユーザー応答待ち）
+  //   approved/implementing/testing/stuck: 30分（処理中 or クラッシュ復旧）
   const row = db.prepare(`
     SELECT * FROM dev_conversations
-    WHERE user_id = ? AND status NOT IN ('deployed', 'failed')
+    WHERE user_id = ?
+      AND status NOT IN ('deployed', 'failed')
+      AND NOT (
+        status IN ('hearing', 'defining')
+        AND updated_at < datetime('now', '-10 minutes')
+      )
+      AND NOT (
+        status IN ('approved', 'implementing', 'testing', 'stuck')
+        AND updated_at < datetime('now', '-30 minutes')
+      )
     ORDER BY created_at DESC
     LIMIT 1
   `).get(userId) as DevConversation | undefined;
+
+  // タイムアウトした会話を failed に遷移（次回の新規会話をブロックしないよう）
+  if (!row) {
+    db.prepare(`
+      UPDATE dev_conversations
+      SET status = 'failed', updated_at = datetime('now')
+      WHERE user_id = ?
+        AND status NOT IN ('deployed', 'failed')
+        AND (
+          (status IN ('hearing', 'defining') AND updated_at < datetime('now', '-10 minutes'))
+          OR
+          (status IN ('approved', 'implementing', 'testing', 'stuck') AND updated_at < datetime('now', '-30 minutes'))
+        )
+    `).run(userId);
+  }
+
   return row || null;
 }
 
@@ -65,7 +94,12 @@ export function appendHearingLog(id: string, role: 'user' | 'agent', message: st
   const conv = getConversation(id);
   if (!conv) return;
 
-  const log = JSON.parse(conv.hearing_log) as Array<{ role: string; message: string }>;
+  let log: Array<{ role: string; message: string }> = [];
+  try {
+    log = JSON.parse(conv.hearing_log);
+  } catch {
+    log = [];
+  }
   log.push({ role, message });
 
   db.prepare(`
@@ -93,6 +127,12 @@ export function setGeneratedFiles(id: string, files: string[]): void {
   `).run(JSON.stringify(files), id);
 }
 
+/** updated_at のみ更新（タイムアウト防止用ハートビート） */
+export function touchConversation(id: string): void {
+  const db = getDB();
+  db.prepare(`UPDATE dev_conversations SET updated_at = datetime('now') WHERE id = ?`).run(id);
+}
+
 export function cancelConversation(id: string): void {
   const db = getDB();
   db.prepare(`
@@ -105,6 +145,10 @@ export function cancelConversation(id: string): void {
 export function getHearingRound(id: string): number {
   const conv = getConversation(id);
   if (!conv) return 0;
-  const log = JSON.parse(conv.hearing_log) as Array<{ role: string }>;
-  return log.filter(e => e.role === 'user').length;
+  try {
+    const log = JSON.parse(conv.hearing_log) as Array<{ role: string }>;
+    return log.filter(e => e.role === 'user').length;
+  } catch {
+    return 0;
+  }
 }

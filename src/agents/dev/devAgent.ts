@@ -7,6 +7,7 @@ import {
   createConversation,
   getConversation,
   updateConversationStatus,
+  touchConversation,
   appendHearingLog,
   setRequirements,
   setGeneratedFiles,
@@ -16,9 +17,12 @@ import {
 } from './conversation';
 import {
   DEV_SYSTEM_PROMPT,
-  HEARING_PROMPT,
-  REQUIREMENTS_PROMPT,
-  IMPLEMENTATION_PROMPT,
+  PM_HEARING_PROMPT,
+  PM_REQUIREMENTS_PROMPT,
+  PM_DECOMPOSE_PROMPT,
+  ENGINEER_PROMPT,
+  REVIEWER_PROMPT,
+  buildAgentPersonality,
 } from './prompts';
 import {
   writeFiles,
@@ -27,16 +31,141 @@ import {
   prepareGitBranch,
   rollbackGit,
   commitAndStay,
+  readProjectFile,
   FileToWrite,
+  acquireGitLock,
+  releaseGitLock,
 } from './deployer';
+import {
+  runAllTests,
+  formatTestResults,
+  TestResult,
+} from './tester';
+import { runClaudeCLI } from './cliRunner';
+import { getSourceTree } from '../../github/client';
+import { recordMetric } from './teamEvaluation';
+import { recordReject, handleConsult, runConsensus } from './teamConversation';
+import { recordBuildLearning, recordRejectLearning, recordReviewerLearning, recordDeployerLearning, recordTestLearning, recordPmLearning } from './teamMemory';
+import { runPreflightChecks, autoFixEnvironment } from './preflight';
+import { classifyError, categoryLabel } from './errorClassifier';
+import { runTeamDiagnosis, DiagnosisResult } from './teamDiagnosis';
+import { emitDevEvent } from '../../events/devEvents';
+import { config } from '../../config';
 
 const MAX_BUILD_RETRIES = 5;
+const MAX_TEST_FIX_RETRIES = 5;
 const MAX_HEARING_ROUNDS = 3;
+const MAX_REVIEW_RETRIES = 3;
+const MAX_ENGINEER_PARSE_RETRIES = 3;
+const MAX_DIAGNOSIS_ROUNDS = 2;   // チーム診断→リトライの最大サイクル数
+const MAX_TRANSIENT_WAITS = 3;    // 一時的エラー待機の最大回数（autoFix内）
+const PHASE_TIMEOUT_MS = 5 * 60 * 1000; // 各フェーズ最大5分
+
+// レビュアーに常に提供するシステム基盤ファイル（コンテキスト不足による無限差し戻し防止）
+const SYSTEM_REFERENCE_FILES = [
+  'src/db/migrations.ts',
+  'src/config.ts',
+  'package.json',
+];
+
+/** 2つの差し戻し理由が同一パターンかを判定（単語重複率ベース） */
+function isSimilarReject(prev: string, curr: string): boolean {
+  const normalize = (s: string) =>
+    s.toLowerCase().replace(/[^\w\u3000-\u9fff]+/g, ' ').split(/\s+/).filter(w => w.length > 2);
+  const prevWords = new Set(normalize(prev));
+  const currWords = normalize(curr);
+  if (prevWords.size === 0 || currWords.length === 0) return false;
+  const overlap = currWords.filter(w => prevWords.has(w)).length;
+  return overlap / Math.min(prevWords.size, currWords.length) > 0.4;
+}
+
+interface Subtask {
+  index: number;
+  path: string;
+  action: 'create' | 'update';
+  description: string;
+}
+
+interface StuckContext {
+  branchName: string;
+  subtasks: Subtask[];
+  completedFiles: Array<{ path: string; content: string }>;
+  failedSubtaskIndex: number;
+  errorMessage: string;
+  phase: string; // エラーが起きたフェーズ名
+  lastFiles?: FileToWrite[]; // build/testフェーズで使用したファイル（リカバリ用）
+  // エスカレーション強化: 対話と状況のコンテキスト
+  triedActions?: string[];         // これまでに試したこと
+  teamDiagnosis?: string;          // チーム診断結果のサマリー
+  dialogueLog?: Array<{ role: 'pm' | 'user'; message: string }>;  // ユーザーとの対話履歴
+  awaitingConfirmation?: boolean;  // PMがアクション確認待ち
+  proposedAction?: string;         // PM提案のアクション（retry/skip/cancel/custom）
+  errorCategory?: string;          // エラーの分類（git/build/test/api/unknown）
+  errorExplanation?: string;       // 人間向けのエラー説明
+}
+
+/** エラーメッセージを人間が分かる分類と説明に変換 */
+function classifyStuckError(errorMessage: string, phase: string): { category: string; explanation: string } {
+  const msg = errorMessage.toLowerCase();
+
+  if (/git commit.*failed|git.*nothing to commit/i.test(errorMessage)) {
+    if (/[\r\n]/.test(errorMessage) && /commit -m/.test(errorMessage)) {
+      return { category: 'git（コミットメッセージ）', explanation: 'コミットメッセージに改行や特殊文字が含まれていてgitコマンドが失敗しました。メッセージの書式を修正する必要があります。' };
+    }
+    if (/nothing to commit/.test(msg)) {
+      return { category: 'git（変更なし）', explanation: 'コミットしようとしましたが、ファイルに変更がありませんでした。コード生成が正しく動作していない可能性があります。' };
+    }
+    return { category: 'git', explanation: 'gitのコミット操作が失敗しました。ブランチの状態やファイルの権限に問題がある可能性があります。' };
+  }
+  if (/tsc|typescript|type error|ts\(\d+\)/i.test(msg)) {
+    return { category: 'ビルド（TypeScriptエラー）', explanation: 'TypeScriptのコンパイルエラーが発生しています。生成されたコードに型の不整合やimportの問題があります。' };
+  }
+  if (/npm run build|build failed/i.test(msg)) {
+    return { category: 'ビルド', explanation: 'プロジェクトのビルドが失敗しました。生成されたコードにエラーがあります。' };
+  }
+  if (/429|rate.?limit|too many requests/i.test(msg)) {
+    return { category: 'API制限', explanation: 'Claude APIの呼び出し回数が上限に達しました。しばらく待ってからリトライすれば解決します。' };
+  }
+  if (/health.?check|pm2|restart|deploy/i.test(msg)) {
+    return { category: 'デプロイ', explanation: 'サーバーの再起動やヘルスチェックが失敗しました。サーバーの状態を確認する必要があります。' };
+  }
+  if (/test.*fail|assert|expect/i.test(msg)) {
+    return { category: 'テスト', explanation: '自動テストが失敗しています。生成されたコードの動作が期待と異なります。' };
+  }
+  if (/cli.*fail|timeout/i.test(msg)) {
+    return { category: 'コード生成', explanation: 'Claude CLIでのコード生成に失敗しました。タイムアウトや接続エラーの可能性があります。' };
+  }
+  if (phase === 'implementing') {
+    return { category: '実装エラー', explanation: 'コードの実装中にエラーが発生しました。' };
+  }
+  return { category: '不明', explanation: 'エラーの詳細を確認中です。' };
+}
+
+/**
+ * タイムアウト付きでPromiseを実行するヘルパー
+ */
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label}: ${ms / 1000}秒でタイムアウト`)), ms);
+    promise.then(
+      val => { clearTimeout(timer); resolve(val); },
+      err => { clearTimeout(timer); reject(err); },
+    );
+  });
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
 export class DevAgent implements Agent {
   name = 'dev';
 
-  // タスクキュー経由の実行（互換性のため）
+  // 会話ID → stuckコンテキストのマッピング（シングルトンでも安全）
+  private stuckContextMap = new Map<string, StuckContext>();
+  // リトライ/スキップ実行中の会話IDセット（二重実行防止）
+  private resumingSet = new Set<string>();
+
   async execute(task: Task): Promise<TaskResult> {
     return {
       success: true,
@@ -45,15 +174,15 @@ export class DevAgent implements Agent {
     };
   }
 
-  // LINE会話経由のメイン処理
   async handleMessage(userId: string, text: string): Promise<void> {
     try {
-      // キャンセル処理
-      if (/^(開発キャンセル|開発中止)$/.test(text.trim())) {
+      if (/開発(キャンセル|中止|やめ)|やめて|やめる|キャンセル|別の話/.test(text.trim())) {
         const conv = getActiveConversation(userId);
         if (conv) {
+          this.cleanupConversation(conv.id, conv.user_id);
           cancelConversation(conv.id);
-          await sendLineMessage(userId, '🛑 開発を中止しました。');
+          dbLog('info', 'dev-agent', `開発キャンセル: ${conv.topic}`, { convId: conv.id });
+          await sendLineMessage(userId, '開発を中止しました。');
         } else {
           await sendLineMessage(userId, '進行中の開発はありません。');
         }
@@ -64,80 +193,222 @@ export class DevAgent implements Agent {
 
       if (!conv) {
         conv = createConversation(userId, text);
-        await sendLineMessage(userId, `🔧 開発モード起動\n「${text}」を承りました。\nいくつか確認させてください。`);
-        await this.runHearing(conv, text);
+        dbLog('info', 'dev-agent', `新規開発会話: ${text.slice(0, 60)}`, { convId: conv.id });
+        await sendLineMessage(userId,
+          `🛠 開発モード開始\n「${text.slice(0, 40)}」について、いくつか確認させてください。\n\n` +
+          `（「やめる」「中止」でいつでも開発モードを終了できます）`
+        );
+        await this.safeExecutePhase(conv, 'hearing', () => this.runHearing(conv!, text));
         return;
       }
 
+      dbLog('info', 'dev-agent', `handleMessage: status=${conv.status}`, { convId: conv.id, text: text.slice(0, 60) });
+
       switch (conv.status) {
         case 'hearing':
-          await this.handleHearing(conv, text);
+          await this.safeExecutePhase(conv, 'hearing', () => this.handleHearing(conv!, text));
           break;
         case 'defining':
-          await this.handleDefining(conv, text);
+          await this.safeExecutePhase(conv, 'defining', () => this.handleDefining(conv!, text));
+          break;
+        case 'stuck':
+          await this.safeExecutePhase(conv, 'stuck', () => this.handleStuck(conv!, text));
           break;
         case 'approved':
         case 'implementing':
         case 'testing':
-          await sendLineMessage(userId, '⏳ 現在実装中です。完了次第ご報告します。');
+          dbLog('info', 'dev-agent', `実装中メッセージ受信（無視）: ${text.slice(0, 30)}`, { convId: conv.id });
+          await sendLineMessage(userId, '現在実装中です。完了次第ご報告します。');
           break;
-        case 'deployed':
-          await sendLineMessage(userId, '✅ 前回の開発は完了済みです。新しい依頼を送ってください。');
-          break;
-        case 'failed':
-          await sendLineMessage(userId, '❌ 前回の開発は失敗しています。新しい依頼を送ってください。');
+        default:
+          dbLog('warn', 'dev-agent', `想定外ステータス: ${conv.status}`, { convId: conv.id });
+          updateConversationStatus(conv.id, 'failed');
+          await sendLineMessage(userId, `開発が不整合な状態になっています（ステータス: ${conv.status}）。新しい開発依頼を送ってください。`);
           break;
       }
     } catch (err) {
+      // 最終安全弁: ここに来たら何かが本当におかしい
       const errMsg = err instanceof Error ? err.message : String(err);
-      logger.error('DevAgent処理エラー', { err: errMsg, userId });
-      await sendLineMessage(userId, `❌ 開発エージェントエラー:\n${errMsg.slice(0, 300)}`);
+      logger.error('DevAgent最終エラーハンドラ', { err: errMsg, userId });
+      dbLog('error', 'dev-agent', `最終エラー: ${errMsg.slice(0, 200)}`, { userId });
+      try {
+        await sendLineMessage(userId, `開発エージェントでエラーが発生しました:\n${errMsg.slice(0, 300)}\n\n新しい開発依頼を送ってリトライできます。`);
+      } catch {
+        // 送信も失敗した場合はログだけ
+        logger.error('エラー通知送信も失敗', { userId });
+      }
     }
   }
 
-  // Phase 1: ヒアリング（初回）
+  /**
+   * 各フェーズをtry/catchで安全に実行。
+   * エラー時は途中作業を保全しつつ、ユーザーに選択肢を提示する。
+   */
+  private async safeExecutePhase(
+    conv: DevConversation,
+    phaseName: string,
+    fn: () => Promise<void>,
+  ): Promise<void> {
+    try {
+      await withTimeout(fn(), PHASE_TIMEOUT_MS, `${phaseName}フェーズ`);
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      dbLog('error', 'dev-agent', `[${phaseName}] フェーズエラー: ${errMsg.slice(0, 200)}`, { convId: conv.id });
+
+      // hearing/defining フェーズはstuckに移行せず、即座にfailed + 通知
+      if (phaseName === 'hearing' || phaseName === 'defining') {
+        updateConversationStatus(conv.id, 'failed');
+        await sendLineMessage(conv.user_id,
+          `${phaseName}フェーズでエラーが発生しました:\n${errMsg.slice(0, 300)}\n\n` +
+          `新しい開発依頼を送り直してください。`
+        ).catch(() => {});
+        return;
+      }
+
+      // implementing/stuck フェーズは途中作業を保全してstuckに移行
+      if (conv.status !== 'stuck') {
+        updateConversationStatus(conv.id, 'stuck');
+      }
+
+      // stuckコンテキストが無ければ作成
+      if (!this.stuckContextMap.has(conv.id)) {
+        this.stuckContextMap.set(conv.id, {
+          branchName: '',
+          subtasks: [],
+          completedFiles: [],
+          failedSubtaskIndex: 0,
+          errorMessage: errMsg,
+          phase: phaseName,
+        });
+      } else {
+        const ctx = this.stuckContextMap.get(conv.id)!;
+        ctx.errorMessage = errMsg;
+        ctx.phase = phaseName;
+      }
+
+      await sendLineMessage(conv.user_id,
+        `${phaseName}フェーズでエラーが発生しました:\n${errMsg.slice(0, 300)}\n\n` +
+        `選択肢:\n` +
+        `・「リトライ」→ 再試行\n` +
+        `・「中止」→ 開発を中止（完了分はブランチに残ります）`
+      ).catch(() => {});
+    }
+  }
+
+  /** 会話に関連するリソースのクリーンアップ */
+  private cleanupConversation(convId: string, _userId: string): void {
+    this.stuckContextMap.delete(convId);
+  }
+
+  // ========================================
+  // コードベースコンテキスト（PM用）
+  // ========================================
+
+  /**
+   * PMがプロジェクト構造を理解するためのコンテキストを構築。
+   * GitHubのファイルツリー + 主要ファイルの内容を含む。
+   */
+  private async buildCodebaseContext(): Promise<string> {
+    const [fileTree, migrations, routerCode, indexCode, adminCode] = await Promise.all([
+      getSourceTree(),
+      readProjectFile('src/db/migrations.ts'),
+      readProjectFile('src/agents/router.ts'),
+      readProjectFile('src/index.ts'),
+      readProjectFile('src/admin/dashboard.ts'),
+    ]);
+
+    let ctx = '## 現在のプロジェクト構造（GitHub リポジトリから取得）\n\n';
+    ctx += '### ソースファイル一覧\n' + fileTree + '\n\n';
+
+    if (migrations) {
+      ctx += '### DBスキーマ (src/db/migrations.ts)\n```typescript\n' + migrations + '\n```\n\n';
+    }
+
+    if (routerCode) {
+      ctx += '### エージェントルーター (src/agents/router.ts)\n```typescript\n' + routerCode + '\n```\n\n';
+    }
+
+    if (indexCode) {
+      const truncated = indexCode.length > 3000 ? indexCode.slice(0, 3000) + '\n// ...(以下省略)' : indexCode;
+      ctx += '### エントリポイント (src/index.ts)\n```typescript\n' + truncated + '\n```\n\n';
+    }
+
+    if (adminCode) {
+      const truncated = adminCode.length > 3000 ? adminCode.slice(0, 3000) + '\n// ...(以下省略)' : adminCode;
+      ctx += '### 管理ダッシュボード (src/admin/dashboard.ts)\n```typescript\n' + truncated + '\n```\n\n';
+    }
+
+    ctx += '※ PMはこの情報を基にユーザーに質問不要な項目は自分で判断すること。コード構造の質問をユーザーにしないこと。\n';
+
+    return ctx;
+  }
+
+  // ========================================
+  // Phase 1: ヒアリング（PM）
+  // ========================================
+
   private async runHearing(conv: DevConversation, initialMessage: string): Promise<void> {
     appendHearingLog(conv.id, 'user', initialMessage);
+    dbLog('info', 'dev-agent', `[PM] ヒアリング開始: round 1/${MAX_HEARING_ROUNDS}`, { convId: conv.id });
+    emitDevEvent({ type: 'phase_change', convId: conv.id, agent: 'system', data: { phase: 'hearing', topic: initialMessage.slice(0, 60) } });
+    emitDevEvent({ type: 'agent_activity', convId: conv.id, agent: 'pm', data: { status: 'thinking', message: 'ヒアリング分析中...' } });
 
     const updatedConv = getConversation(conv.id);
-    if (!updatedConv) return;
-    const hearingLog = JSON.parse(updatedConv.hearing_log);
+    if (!updatedConv) {
+      dbLog('error', 'dev-agent', `[PM] 会話データ消失: ${conv.id}`, { convId: conv.id });
+      updateConversationStatus(conv.id, 'failed');
+      await sendLineMessage(conv.user_id, '会話データの読み込みに失敗しました。もう一度開発依頼を送ってください。').catch(() => {});
+      return;
+    }
+    const hearingLog = safeParseJson(updatedConv.hearing_log) || [];
+
+    const codebaseCtx = await this.buildCodebaseContext();
 
     const { text } = await callClaude({
-      system: DEV_SYSTEM_PROMPT + '\n\n' + HEARING_PROMPT,
+      system: DEV_SYSTEM_PROMPT + '\n\n' + PM_HEARING_PROMPT,
       messages: [
-        { role: 'user', content: `開発依頼: ${initialMessage}\n\nヒアリングログ:\n${JSON.stringify(hearingLog)}\n\n現在のヒアリング回数: 1/${MAX_HEARING_ROUNDS}` },
+        { role: 'user', content: `${codebaseCtx}\n\n開発依頼: ${initialMessage}\n\nヒアリングログ:\n${JSON.stringify(hearingLog)}\n\n現在のヒアリング回数: 1/${MAX_HEARING_ROUNDS}` },
       ],
-      model: 'default',
+      model: 'opus',
     });
 
+    dbLog('info', 'dev-agent', `[PM] ヒアリング応答: ${text.slice(0, 100)}`, { convId: conv.id });
     await this.processHearingResponse(conv, text);
   }
 
-  // Phase 1: ヒアリング（2回目以降）
   private async handleHearing(conv: DevConversation, userReply: string): Promise<void> {
     appendHearingLog(conv.id, 'user', userReply);
 
     const round = getHearingRound(conv.id);
-    const updatedConv = getConversation(conv.id);
-    if (!updatedConv) return;
-    const hearingLog = JSON.parse(updatedConv.hearing_log);
+    dbLog('info', 'dev-agent', `[PM] ヒアリング回答受信: round ${round}/${MAX_HEARING_ROUNDS}`, { convId: conv.id });
 
-    // 最大回数に達したら強制的に要件定義へ
+    const updatedConv = getConversation(conv.id);
+    if (!updatedConv) {
+      dbLog('error', 'dev-agent', `[PM] 会話データ消失: ${conv.id}`, { convId: conv.id });
+      updateConversationStatus(conv.id, 'failed');
+      await sendLineMessage(conv.user_id, '会話データの読み込みに失敗しました。もう一度開発依頼を送ってください。').catch(() => {});
+      return;
+    }
+    const hearingLog = safeParseJson(updatedConv.hearing_log) || [];
+
     if (round >= MAX_HEARING_ROUNDS) {
-      appendHearingLog(conv.id, 'agent', 'ヒアリング最大回数到達。収集済み情報で要件定義に進みます。');
+      dbLog('info', 'dev-agent', '[PM] ヒアリング最大回数到達 → 要件定義へ', { convId: conv.id });
+      appendHearingLog(conv.id, 'agent', 'ヒアリング最大回数到達。要件定義に進みます。');
       await this.transitionToDefining(conv);
       return;
     }
 
+    const codebaseCtx = await this.buildCodebaseContext();
+
     const { text } = await callClaude({
-      system: DEV_SYSTEM_PROMPT + '\n\n' + HEARING_PROMPT,
+      system: DEV_SYSTEM_PROMPT + '\n\n' + PM_HEARING_PROMPT,
       messages: [
-        { role: 'user', content: `開発依頼: ${conv.topic}\n\nヒアリングログ:\n${JSON.stringify(hearingLog)}\n\nユーザーの最新回答: ${userReply}\n\n現在のヒアリング回数: ${round}/${MAX_HEARING_ROUNDS}` },
+        { role: 'user', content: `${codebaseCtx}\n\n開発依頼: ${conv.topic}\n\nヒアリングログ:\n${JSON.stringify(hearingLog)}\n\nユーザーの最新回答: ${userReply}\n\n現在のヒアリング回数: ${round}/${MAX_HEARING_ROUNDS}` },
       ],
-      model: 'default',
+      model: 'opus',
     });
 
+    dbLog('info', 'dev-agent', `[PM] ヒアリング応答: ${text.slice(0, 100)}`, { convId: conv.id });
     await this.processHearingResponse(conv, text);
   }
 
@@ -145,216 +416,1360 @@ export class DevAgent implements Agent {
     const parsed = safeParseJson(text);
 
     if (parsed && parsed.hearing_complete) {
+      dbLog('info', 'dev-agent', '[PM] ヒアリング完了 → 要件定義へ', { convId: conv.id });
       appendHearingLog(conv.id, 'agent', parsed.summary || 'ヒアリング完了');
       await this.transitionToDefining(conv);
-    } else if (parsed && parsed.questions && parsed.questions.length > 0) {
+    } else if (parsed && parsed.questions && Array.isArray(parsed.questions) && parsed.questions.length > 0) {
       const questions = (parsed.questions as string[]).slice(0, 3);
-      const msg = `📝 確認事項:\n${questions.map((q: string, i: number) => `${i + 1}. ${q}`).join('\n')}`;
+      const msg = questions.map((q: string, i: number) => `${i + 1}. ${q}`).join('\n') + '\n\n（「やめる」で中止できます）';
       appendHearingLog(conv.id, 'agent', msg);
+      emitDevEvent({ type: 'agent_message', convId: conv.id, agent: 'pm', data: { message: questions[0]?.slice(0, 80) || 'ヒアリング質問' } });
       await sendLineMessage(conv.user_id, msg);
     } else {
+      dbLog('warn', 'dev-agent', `[PM] ヒアリング応答がJSON外: ${text.slice(0, 80)}`, { convId: conv.id });
       appendHearingLog(conv.id, 'agent', text);
       await sendLineMessage(conv.user_id, text);
     }
   }
 
-  // Phase 2: 要件定義
+  // ========================================
+  // Phase 2: 要件定義（PM - Opus）
+  // ========================================
+
   private async transitionToDefining(conv: DevConversation): Promise<void> {
     updateConversationStatus(conv.id, 'defining');
+    dbLog('info', 'dev-agent', '[PM] 要件定義書作成開始', { convId: conv.id });
+    emitDevEvent({ type: 'phase_change', convId: conv.id, agent: 'system', data: { phase: 'defining' } });
+    emitDevEvent({ type: 'agent_activity', convId: conv.id, agent: 'pm', data: { status: 'thinking', message: '要件定義書作成中...' } });
 
     const updatedConv = getConversation(conv.id);
-    if (!updatedConv) return;
-    const hearingLog = JSON.parse(updatedConv.hearing_log);
+    if (!updatedConv) {
+      dbLog('error', 'dev-agent', `[PM] 会話データ消失: ${conv.id}`, { convId: conv.id });
+      updateConversationStatus(conv.id, 'failed');
+      await sendLineMessage(conv.user_id, '会話データの読み込みに失敗しました。もう一度開発依頼を送ってください。').catch(() => {});
+      return;
+    }
+    const hearingLog = safeParseJson(updatedConv.hearing_log) || [];
 
-    await sendLineMessage(conv.user_id, '📋 ヒアリング完了。要件定義書を作成中...');
+    await sendLineMessage(conv.user_id, 'ヒアリング完了。要件定義書を作成中...');
+
+    const codebaseCtx = await this.buildCodebaseContext();
 
     const { text } = await callClaude({
-      system: DEV_SYSTEM_PROMPT + '\n\n' + REQUIREMENTS_PROMPT,
+      system: DEV_SYSTEM_PROMPT + '\n\n' + PM_REQUIREMENTS_PROMPT,
       messages: [
-        { role: 'user', content: `開発依頼: ${conv.topic}\n\nヒアリング内容:\n${JSON.stringify(hearingLog)}` },
+        { role: 'user', content: `${codebaseCtx}\n\n開発依頼: ${conv.topic}\n\nヒアリング内容:\n${JSON.stringify(hearingLog)}` },
       ],
       model: 'opus',
     });
 
     setRequirements(conv.id, text);
+    dbLog('info', 'dev-agent', `[PM] 要件定義書作成完了 (${text.length}文字)`, { convId: conv.id });
     await sendLineMessage(conv.user_id, text);
-    await sendLineMessage(conv.user_id, '「OK」で実装開始、修正指示があれば伝えてください。');
+    await sendLineMessage(conv.user_id, '「OK」で実装開始。修正指示も可。\n（「やめる」で中止、別の話題はそのまま送れます）');
   }
 
   private async handleDefining(conv: DevConversation, userReply: string): Promise<void> {
-    const normalized = userReply.trim().toLowerCase();
+    dbLog('info', 'dev-agent', `[PM] 要件定義フェーズ応答: ${userReply.slice(0, 40)}`, { convId: conv.id });
 
-    if (/^(ok|おk|はい|いいよ|お願い|問題ない|大丈夫)$/.test(normalized)) {
-      updateConversationStatus(conv.id, 'approved');
-      await sendLineMessage(conv.user_id, '🚀 実装を開始します。完了まで数分お待ちください...');
-      await this.runImplementation(conv);
+    // 要件が未生成の場合は何もしない（webhookで弾くが二重安全）
+    const freshConv = getConversation(conv.id);
+    if (!freshConv?.requirements) {
+      dbLog('warn', 'dev-agent', '[PM] 要件未生成のまま handleDefining に到達', { convId: conv.id });
+      await sendLineMessage(conv.user_id, '要件定義書を作成中です。完了までお待ちください。');
+      return;
+    }
+
+    if (/^(ok|おk|はい|いいよ|お願い|問題ない|大丈夫|進めて|実装して|それで|それでいい|いいと思う|よさそう|良さそう)$/i.test(userReply.trim())) {
+      updateConversationStatus(freshConv.id, 'approved');
+      dbLog('info', 'dev-agent', '[PM] 要件承認 → 実装開始', { convId: conv.id });
+      emitDevEvent({ type: 'phase_change', convId: conv.id, agent: 'system', data: { phase: 'approved' } });
+      await sendLineMessage(conv.user_id, '実装を開始します。チーム体制で進めます。\n（PM → エンジニア → レビュアー の順で各ファイルを処理）');
+      // 実装は非同期で実行（safeExecutePhaseの5分タイムアウトを回避）
+      // runImplementation は独自のtry/catch/finallyで全てのエラーを処理する
+      this.runImplementation(conv).catch(err => {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        dbLog('error', 'dev-agent', `[チーム] 実装未捕捉エラー: ${errMsg}`, { convId: conv.id });
+        updateConversationStatus(conv.id, 'failed');
+        sendLineMessage(conv.user_id, `実装中に予期しないエラー:\n${errMsg.slice(0, 300)}\n\n新しい開発依頼でリトライできます。`).catch(() => {});
+      });
     } else {
-      await sendLineMessage(conv.user_id, '📝 要件を修正中...');
+      dbLog('info', 'dev-agent', '[PM] 要件修正指示を受信', { convId: conv.id });
+      await sendLineMessage(conv.user_id, '要件を修正中...');
 
-      const updatedConv = getConversation(conv.id);
+      const requirements = freshConv.requirements;
+      const codebaseCtx = await this.buildCodebaseContext();
       const { text } = await callClaude({
-        system: DEV_SYSTEM_PROMPT + '\n\n' + REQUIREMENTS_PROMPT,
+        system: DEV_SYSTEM_PROMPT + '\n\n' + PM_REQUIREMENTS_PROMPT,
         messages: [
-          { role: 'user', content: `元の要件:\n${updatedConv?.requirements || conv.requirements}\n\n修正指示: ${userReply}` },
+          { role: 'user', content: `${codebaseCtx}\n\n元の要件:\n${requirements}\n\n修正指示: ${userReply}` },
         ],
         model: 'opus',
       });
 
       setRequirements(conv.id, text);
+      dbLog('info', 'dev-agent', `[PM] 要件修正完了 (${text.length}文字)`, { convId: conv.id });
       await sendLineMessage(conv.user_id, text);
-      await sendLineMessage(conv.user_id, '「OK」で実装開始、修正指示があれば伝えてください。');
+      await sendLineMessage(conv.user_id, '「OK」で実装開始。修正指示も可。\n（「やめる」で中止、別の話題はそのまま送れます）');
     }
   }
 
-  // Phase 3: 実装（git安全策付き）
-  private async runImplementation(conv: DevConversation): Promise<void> {
+  // ========================================
+  // Phase 3: 実装（チーム体制）
+  // ========================================
+
+  private async runImplementation(conv: DevConversation, resumeFrom?: { branchName: string; subtasks: Subtask[]; completedFiles: Array<{ path: string; content: string }>; startIndex: number }): Promise<void> {
     updateConversationStatus(conv.id, 'implementing');
+    dbLog('info', 'dev-agent', '[チーム] 実装フェーズ開始', { convId: conv.id });
+    emitDevEvent({ type: 'phase_change', convId: conv.id, agent: 'system', data: { phase: 'implementing', topic: conv.topic } });
 
     const updatedConv = getConversation(conv.id);
-    if (!updatedConv) return;
+    if (!updatedConv) {
+      dbLog('error', 'dev-agent', `[チーム] 会話データ消失: ${conv.id}`, { convId: conv.id });
+      updateConversationStatus(conv.id, 'failed');
+      await sendLineMessage(conv.user_id, '会話データが見つかりません。新しい開発依頼を送ってください。').catch(() => {});
+      return;
+    }
 
-    let branchName = '';
+    let branchName = resumeFrom?.branchName || '';
+    let subtasks: Subtask[] = resumeFrom?.subtasks || [];
+    const allFiles: FileToWrite[] = [];
+    const completedFiles: Array<{ path: string; content: string }> = resumeFrom?.completedFiles || [];
+    let startIndex = resumeFrom?.startIndex || 0;
+    let gitLockAcquired = false;
 
     try {
-      // git安全策: ブランチ作成
-      branchName = await prepareGitBranch();
-      await sendLineMessage(conv.user_id, `🌿 ブランチ作成: ${branchName}`);
+      // 新規開始の場合
+      if (!resumeFrom) {
+        // ── プリフライトチェック ──
+        emitDevEvent({ type: 'agent_activity', convId: conv.id, agent: 'system', data: { status: 'working', message: '環境チェック中...' } });
+        await sendLineMessage(conv.user_id, '🔍 環境チェック中...');
+        const preflight = await runPreflightChecks();
+        if (preflight.fixedIssues.length > 0) {
+          await sendLineMessage(conv.user_id, `🔧 自動修正: ${preflight.fixedIssues.join(', ')}`);
+        }
+        if (!preflight.passed) {
+          const errorMsgs = preflight.issues.filter(i => i.severity === 'error').map(i => `・${i.message}`).join('\n');
+          throw new Error(`環境チェック失敗（自動修正不可）:\n${errorMsgs}`);
+        }
+        if (preflight.issues.length > 0) {
+          const warnMsgs = preflight.issues.filter(i => i.severity === 'warning').map(i => `⚠️ ${i.message}`).join('\n');
+          await sendLineMessage(conv.user_id, `警告:\n${warnMsgs}\n\n続行します。`);
+        }
 
-      const { text } = await callClaude({
-        system: DEV_SYSTEM_PROMPT + '\n\n' + IMPLEMENTATION_PROMPT,
-        messages: [
-          { role: 'user', content: `以下の要件を実装してください:\n\n${updatedConv.requirements}` },
-        ],
-        model: 'opus',
-        maxTokens: 8192,
-      });
+        // Gitロック取得（キュー待ち）
+        await sendLineMessage(conv.user_id, 'Gitロック取得中...');
+        gitLockAcquired = await acquireGitLock(conv.id, 60_000);
+        if (!gitLockAcquired) {
+          throw new Error('Git操作のロック取得に失敗しました（他の開発が進行中の可能性）');
+        }
 
-      const parsed = safeParseJson(text);
-      if (!parsed || !parsed.files || !Array.isArray(parsed.files)) {
-        throw new Error('実装コードのパースに失敗しました');
+        branchName = await prepareGitBranch();
+        dbLog('info', 'dev-agent', `[チーム] ブランチ作成: ${branchName}`, { convId: conv.id });
+        emitDevEvent({ type: 'agent_activity', convId: conv.id, agent: 'deployer', data: { status: 'working', message: `ブランチ作成: ${branchName}` } });
+        await sendLineMessage(conv.user_id, `ブランチ: ${branchName}`);
+
+        emitDevEvent({ type: 'agent_activity', convId: conv.id, agent: 'pm', data: { status: 'thinking', message: 'サブタスク分解中...' } });
+        subtasks = await this.pmDecompose(updatedConv);
+        dbLog('info', 'dev-agent', `[PM] サブタスク分解完了: ${subtasks.length}件`, { convId: conv.id });
+        emitDevEvent({ type: 'agent_message', convId: conv.id, agent: 'pm', data: { message: `${subtasks.length}個のサブタスクに分解` } });
+        await sendLineMessage(conv.user_id, `${subtasks.length}個のサブタスクに分解しました:\n${subtasks.map(s => `${s.index}. ${s.path}`).join('\n')}`);
+      } else {
+        // 再開時もロック取得
+        gitLockAcquired = await acquireGitLock(conv.id, 60_000);
+        if (!gitLockAcquired) {
+          throw new Error('Git操作のロック取得に失敗しました');
+        }
+        await sendLineMessage(conv.user_id, `サブタスク ${startIndex + 1} から再開します...`);
       }
 
-      const files = parsed.files as FileToWrite[];
-      const writtenFiles = await writeFiles(files);
-      setGeneratedFiles(conv.id, writtenFiles);
+      // サブタスクごとに エンジニア→レビュアー のループ
+      for (let i = startIndex; i < subtasks.length; i++) {
+        const subtask = subtasks[i];
+        // ハートビート: サブタスク開始時にもタイムアウト防止
+        touchConversation(conv.id);
+        dbLog('info', 'dev-agent', `[エンジニア] サブタスク ${subtask.index}/${subtasks.length}: ${subtask.path}`, { convId: conv.id });
 
-      // Phase 4: ビルド & デプロイ
+        try {
+          const file = await this.engineerAndReview(conv, subtask, subtasks, completedFiles);
+          allFiles.push(file);
+          completedFiles.push({ path: file.path, content: file.content });
+
+          // CLIが直接ファイルを書くのでwriteFiles不要、commitのみ
+          const commitResult = await commitAndStay(branchName, `feat: ${subtask.path}`);
+          if (!commitResult.success) {
+            // コミット失敗 → エラー分類 → 環境問題なら自動修正してリトライ
+            const classified = classifyError(commitResult.error || '');
+            dbLog('warn', 'dev-agent', `[チーム] コミット失敗: ${categoryLabel(classified.category)} - ${classified.subcategory}`, { convId: conv.id });
+
+            if (classified.autoFixable) {
+              const fixed = await autoFixEnvironment(classified);
+              if (fixed) {
+                const retryResult = await commitAndStay(branchName, `feat: ${subtask.path}`);
+                if (!retryResult.success) {
+                  throw new Error(`コミット失敗（自動修正後も解決せず）: ${retryResult.error}`);
+                }
+                dbLog('info', 'dev-agent', `[チーム] コミット: 自動修正後に成功`, { convId: conv.id });
+              } else {
+                throw new Error(`コミット失敗（自動修正失敗）: ${commitResult.error}`);
+              }
+            } else {
+              throw new Error(`コミット失敗: ${commitResult.error}`);
+            }
+          }
+
+          // ハートビート: updated_at を更新してタイムアウト（30分）を防止
+          touchConversation(conv.id);
+          await sendLineMessage(conv.user_id, `${subtask.index}/${subtasks.length} 完了: ${subtask.path}`);
+        } catch (subtaskErr) {
+          const errMsg = subtaskErr instanceof Error ? subtaskErr.message : String(subtaskErr);
+          dbLog('error', 'dev-agent', `[チーム] サブタスク失敗: ${errMsg.slice(0, 200)}`, { convId: conv.id, subtaskIndex: subtask.index });
+
+          // stuckモードに移行（ロールバックしない、ブランチと完了分を保全）
+          const triedActions = [`サブタスク${subtask.index}の実装を${MAX_REVIEW_RETRIES > 0 ? 'レビュー差し戻し含め複数回' : '1回'}試行`];
+          this.stuckContextMap.set(conv.id, {
+            branchName,
+            subtasks,
+            completedFiles: [...completedFiles],
+            failedSubtaskIndex: i,
+            errorMessage: errMsg,
+            phase: 'implementing',
+            triedActions,
+            dialogueLog: [],
+          });
+          updateConversationStatus(conv.id, 'stuck');
+
+          // ロック解放（finallyで二重解放されないようフラグを落とす）
+          if (gitLockAcquired) {
+            releaseGitLock(conv.id);
+            gitLockAcquired = false;
+          }
+
+          const stuckUrl1 = `${config.admin.baseUrl}/admin/dev/${conv.id}`;
+          const { category: errCat1, explanation: errExp1 } = classifyStuckError(errMsg, 'implementing');
+          await sendLineMessage(conv.user_id,
+            `📋 PMからの報告\n\n` +
+            `■ 状況: サブタスク ${subtask.index}/${subtasks.length} (${subtask.path}) で問題発生\n` +
+            `■ 進捗: ${completedFiles.length}/${subtasks.length} ファイル完了済み（コミット済み）\n` +
+            `■ エラー種別: ${errCat1}\n` +
+            `■ 原因: ${errExp1}\n\n` +
+            `■ 試したこと:\n${triedActions.map(a => `・${a}`).join('\n')}\n\n` +
+            `何か気になる点や指示があれば送ってください。「リトライ」「スキップ」「中止」も選べます。\n\n` +
+            `詳細: ${stuckUrl1}`
+          );
+          return; // stuckで一旦停止
+        }
+      }
+
+      setGeneratedFiles(conv.id, [...new Set(completedFiles.map(f => f.path))]);
+
+      // ビルド → デプロイ
       updateConversationStatus(conv.id, 'testing');
-      await this.runBuildAndDeploy(conv, files, 0, branchName);
+      dbLog('info', 'dev-agent', '[チーム] 全サブタスク完了 → ビルド開始', { convId: conv.id });
+      emitDevEvent({ type: 'phase_change', convId: conv.id, agent: 'system', data: { phase: 'testing' } });
+      await sendLineMessage(conv.user_id, `全${subtasks.length}ファイル完了。ビルド開始...`);
+      await this.runBuildAndDeploy(conv, allFiles, 0, branchName);
 
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
+      dbLog('error', 'dev-agent', `[チーム] 実装失敗: ${errMsg.slice(0, 200)}`, { convId: conv.id });
 
-      // ビルド失敗 → ロールバック
-      if (branchName) {
-        await rollbackGit(branchName);
-        await sendLineMessage(conv.user_id, '🔙 コードをロールバックしました。');
+      // 完了済みサブタスクがある場合はブランチを残してstuckへ
+      if (completedFiles.length > 0 && branchName) {
+        await commitAndStay(branchName, `partial: ${completedFiles.length} files completed before error`).catch(() => {});
+
+        this.stuckContextMap.set(conv.id, {
+          branchName,
+          subtasks,
+          completedFiles: [...completedFiles],
+          failedSubtaskIndex: startIndex,
+          errorMessage: errMsg,
+          phase: 'implementing',
+          triedActions: [`${completedFiles.length}ファイルまで実装完了後にエラー発生`],
+          dialogueLog: [],
+        });
+        updateConversationStatus(conv.id, 'stuck');
+
+        const stuckUrl2 = `${config.admin.baseUrl}/admin/dev/${conv.id}`;
+        const { category: errCat2, explanation: errExp2 } = classifyStuckError(errMsg, 'implementing');
+        await sendLineMessage(conv.user_id,
+          `📋 PMからの報告\n\n` +
+          `■ 状況: 実装フェーズで予期しないエラーが発生\n` +
+          `■ 進捗: ${completedFiles.length}/${subtasks.length} ファイル完了（ブランチ ${branchName} に保存済み）\n` +
+          `■ エラー種別: ${errCat2}\n` +
+          `■ 原因: ${errExp2}\n\n` +
+          `完了分のコードは安全に保存されています。\n方針を一緒に決めましょう。質問も歓迎です。\n\n` +
+          `詳細: ${stuckUrl2}`
+        ).catch(() => {});
+      } else {
+        // 何も進んでいない場合はロールバック
+        if (branchName) {
+          await rollbackGit(branchName).catch(() => {});
+        }
+        updateConversationStatus(conv.id, 'failed');
+        await sendLineMessage(conv.user_id,
+          `実装中にエラーが発生しました:\n${errMsg.slice(0, 400)}\n\n` +
+          `コードをロールバックしました。新しい依頼を送ってリトライできます。`
+        ).catch(() => {});
+
+        // C: 失敗時もレトロスペクティブを実行（学習蓄積のため）
+        const failedConv = getConversation(conv.id);
+        if (failedConv) {
+          import('./retrospective').then(({ runRetrospective }) =>
+            runRetrospective(failedConv).catch(() => {})
+          ).catch(() => {});
+        }
       }
-
-      updateConversationStatus(conv.id, 'failed');
-      dbLog('error', 'dev-agent', '実装失敗', { convId: conv.id, error: errMsg });
-      await sendLineMessage(conv.user_id,
-        `❌ 実装に失敗しました:\n${errMsg.slice(0, 500)}\n\n新しい依頼を送ってリトライできます。`
-      );
+    } finally {
+      if (gitLockAcquired) releaseGitLock(conv.id);
     }
   }
 
-  // Phase 4: ビルド＆デプロイ（git安全策付き）
+  private async handleStuck(conv: DevConversation, userReply: string): Promise<void> {
+    // 二重実行防止
+    if (this.resumingSet.has(conv.id)) {
+      await sendLineMessage(conv.user_id, '再試行を処理中です。完了までお待ちください。');
+      return;
+    }
+
+    const ctx = this.stuckContextMap.get(conv.id);
+    if (!ctx) {
+      await sendLineMessage(conv.user_id, 'スタック情報が失われました。新しい開発依頼を送ってください。');
+      updateConversationStatus(conv.id, 'failed');
+      return;
+    }
+
+    // 対話ログにユーザー発言を記録
+    if (!ctx.dialogueLog) ctx.dialogueLog = [];
+    ctx.dialogueLog.push({ role: 'user', message: userReply });
+
+    const normalizedReply = userReply.trim().toLowerCase();
+
+    // 明確な中止コマンドのみ即時実行
+    if (/^(中止|キャンセル|やめ)/.test(normalizedReply)) {
+      dbLog('info', 'dev-agent', '[stuck] ユーザーが中止を選択', { convId: conv.id });
+      this.stuckContextMap.delete(conv.id);
+      updateConversationStatus(conv.id, 'failed');
+      const branchMsg = ctx.branchName ? `\n完了済みファイルはブランチ ${ctx.branchName} に残っています。` : '';
+      await sendLineMessage(conv.user_id, `承知しました。開発を中止します。${branchMsg}`);
+      return;
+    }
+
+    // PMが対話を通じて状況を分析し、アクションを提案 or 実行
+    await this.pmDialogue(conv, ctx, userReply);
+  }
+
+  /** PMがユーザーと対話して合意形成した上でアクションを決定する */
+  private async pmDialogue(conv: DevConversation, ctx: StuckContext, userReply: string): Promise<void> {
+    const dialogueHistory = (ctx.dialogueLog || [])
+      .map(e => `${e.role === 'user' ? 'Daiki' : 'PM'}: ${e.message}`)
+      .join('\n');
+
+    // エラーを分類して人間向けの説明を生成
+    const { category: errCategory, explanation: errExplanation } = classifyStuckError(ctx.errorMessage, ctx.phase);
+
+    const situationSummary = [
+      `フェーズ: ${ctx.phase}`,
+      `エラー分類: ${errCategory}`,
+      `原因の説明: ${errExplanation}`,
+      `エラー詳細: ${ctx.errorMessage.slice(0, 300)}`,
+      ctx.triedActions?.length ? `試行済み: ${ctx.triedActions.join('、')}` : '',
+      ctx.teamDiagnosis ? `チーム診断: ${ctx.teamDiagnosis}` : '',
+      ctx.subtasks.length > 0 ? `サブタスク: ${ctx.failedSubtaskIndex + 1}/${ctx.subtasks.length} (${ctx.subtasks[ctx.failedSubtaskIndex]?.path || '不明'})` : '',
+      ctx.completedFiles.length > 0 ? `完了済み: ${ctx.completedFiles.length}ファイル` : '',
+      ctx.branchName ? `ブランチ: ${ctx.branchName}` : '',
+    ].filter(Boolean).join('\n');
+
+    const availableActions = ctx.phase === 'build' || ctx.phase === 'test'
+      ? '・retry: ビルド/テストを再試行\n・retry_with_hint: ユーザーのヒントを元に修正して再試行\n・cancel: 開発中止'
+      : '・retry: 失敗したサブタスクを再試行\n・retry_with_hint: ユーザーのヒントを元に修正して再試行\n・skip: このサブタスクをスキップして次へ\n・cancel: 開発中止';
+
+    const { text: pmResponse } = await callClaude({
+      system: buildAgentPersonality('pm') + `\n\n` +
+        `あなたはPMとして、開発で詰まった状況についてDaiki（ユーザー）と対話しています。\n` +
+        `目標: Daikiと合意を形成してから作業に戻ること。1回のやり取りで判断を急がない。\n\n` +
+        `## 行動ルール\n` +
+        `1. Daikiの発言を理解し、質問があれば答え、必要なら追加の質問をする\n` +
+        `2. 状況を正確に伝える。曖昧にしない。何を試して何がダメだったかを明示する\n` +
+        `3. アクションを実行する場合は、必ずDaikiの明確な同意を得てから\n` +
+        `4. Daikiが「いいよ」「お願い」「それで」等の同意を示した場合のみアクションを実行\n` +
+        `5. 判断に必要な情報が足りなければ聞く。推測で動かない\n\n` +
+        `## 出力形式\n` +
+        `JSON形式で出力:\n` +
+        `対話を続ける場合: {"action":"dialogue","message":"PMとしてのメッセージ"}\n` +
+        `アクションを提案する場合: {"action":"propose","proposed_action":"retry|retry_with_hint|skip|cancel","message":"提案の説明"}\n` +
+        `合意が得られてアクションを実行する場合: {"action":"execute","execute_action":"retry|retry_with_hint|skip|cancel","hint":"追加指示（あれば）","message":"実行前の確認メッセージ"}\n\n` +
+        `利用可能なアクション:\n${availableActions}`,
+      messages: [{
+        role: 'user',
+        content: `## 現在の状況\n${situationSummary}\n\n` +
+          `## これまでの対話\n${dialogueHistory || '（初回）'}\n\n` +
+          `## Daikiの最新メッセージ\n${userReply}`,
+      }],
+      model: 'default',
+      maxTokens: 500,
+    });
+
+    const parsed = safeParseJson(pmResponse);
+    if (!parsed) {
+      // パース失敗時はPMの応答をそのまま返す
+      ctx.dialogueLog!.push({ role: 'pm', message: pmResponse });
+      await sendLineMessage(conv.user_id, pmResponse);
+      return;
+    }
+
+    const pmMessage = parsed.message || pmResponse;
+    ctx.dialogueLog!.push({ role: 'pm', message: pmMessage });
+
+    switch (parsed.action) {
+      case 'dialogue':
+      case 'propose': {
+        // 対話 or 提案 → メッセージを送って待機（stuckのまま）
+        if (parsed.proposed_action) {
+          ctx.proposedAction = parsed.proposed_action;
+          ctx.awaitingConfirmation = true;
+        }
+        await sendLineMessage(conv.user_id, pmMessage);
+        break;
+      }
+      case 'execute': {
+        // 合意が得られた → アクションを実行
+        const action = parsed.execute_action || ctx.proposedAction || 'retry';
+        const hint = parsed.hint || '';
+        await sendLineMessage(conv.user_id, pmMessage);
+        await this.executeStuckAction(conv, ctx, action, hint);
+        break;
+      }
+      default: {
+        // 不明なアクション → 対話として扱う
+        await sendLineMessage(conv.user_id, pmMessage);
+        break;
+      }
+    }
+  }
+
+  /**
+   * レビュー差し戻し2回目でPMが介入し、レビュー指摘を分析して
+   * エンジニアへの追加指示を生成する
+   */
+  private async pmReviewIntervention(
+    conv: DevConversation,
+    subtask: Subtask,
+    reviewFeedback: string,
+  ): Promise<string | null> {
+    try {
+      const { text: pmAdvice } = await callClaude({
+        system: buildAgentPersonality('pm') +
+          '\n\nレビュアーが同じ指摘を繰り返しています。あなたはPMとして、エンジニアに具体的な修正指示を出してください。' +
+          '\n\n## ルール' +
+          '\n- レビュアーの指摘を分析し、根本原因を特定する' +
+          '\n- エンジニアが「何をどう変えればいいか」が明確に分かる指示を出す' +
+          '\n- ファイルパスや関数名など、具体的な情報を含める' +
+          '\n- プロジェクトのコーディング規約（config.ts経由の環境変数、認証ミドルウェア等）を踏まえる' +
+          '\n- テキストのみで回答。JSON不要。',
+        messages: [{
+          role: 'user',
+          content: `サブタスク: ${subtask.path} - ${subtask.description}\n\n` +
+            `レビュアーの指摘（2回差し戻し済み）:\n${reviewFeedback}\n\n` +
+            `エンジニアが同じミスを繰り返しています。根本原因を分析し、具体的な修正指示を出してください。`,
+        }],
+        model: 'default',
+        maxTokens: 500,
+      });
+      dbLog('info', 'dev-agent', `[PM介入] レビュー分析完了: ${pmAdvice.slice(0, 100)}`, { convId: conv.id });
+      await sendLineMessage(conv.user_id, `🔍 PM介入: 同じ指摘が繰り返されたため、PMがレビュー内容を分析してエンジニアに追加指示を出しました。`);
+      return pmAdvice;
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      dbLog('warn', 'dev-agent', `[PM介入] 分析失敗: ${errMsg.slice(0, 100)}`, { convId: conv.id });
+      return null;
+    }
+  }
+
+  /** stuck状態からの具体的なアクション実行 */
+  private async executeStuckAction(
+    conv: DevConversation, ctx: StuckContext, action: string, hint: string
+  ): Promise<void> {
+    dbLog('info', 'dev-agent', `[stuck] アクション実行: ${action} (hint: ${hint.slice(0, 50)})`, { convId: conv.id });
+
+    if (action === 'cancel') {
+      this.stuckContextMap.delete(conv.id);
+      updateConversationStatus(conv.id, 'failed');
+      const branchMsg = ctx.branchName ? `\n完了済みファイルはブランチ ${ctx.branchName} に残っています。` : '';
+      await sendLineMessage(conv.user_id, `承知しました。開発を中止します。${branchMsg}`);
+      return;
+    }
+
+    // build/testフェーズ
+    if (ctx.phase === 'build' || ctx.phase === 'test') {
+      if (action === 'skip') {
+        await sendLineMessage(conv.user_id, 'ビルド/テストフェーズではスキップできません。リトライまたは中止を選んでください。');
+        return;
+      }
+      this.stuckContextMap.delete(conv.id);
+      this.resumingSet.add(conv.id);
+      // ヒントがある場合はエラーメッセージに追記してautoFixに渡す
+      if (hint) ctx.errorMessage += `\n\nDaikiからの追加情報: ${hint}`;
+      this.resumeBuildTest(conv, ctx).catch(err => {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        dbLog('error', 'dev-agent', `[チーム] ${ctx.phase}再試行失敗: ${errMsg}`, { convId: conv.id });
+        updateConversationStatus(conv.id, 'failed');
+        sendLineMessage(conv.user_id, `再試行中にエラーが発生しました:\n${errMsg.slice(0, 300)}`).catch(() => {});
+      }).finally(() => this.resumingSet.delete(conv.id));
+      return;
+    }
+
+    // implementingフェーズ
+    if (action === 'skip') {
+      dbLog('info', 'dev-agent', `[stuck] サブタスク ${ctx.failedSubtaskIndex + 1} をスキップ`, { convId: conv.id });
+      this.stuckContextMap.delete(conv.id);
+      this.resumingSet.add(conv.id);
+      this.runImplementation(conv, {
+        branchName: ctx.branchName,
+        subtasks: ctx.subtasks,
+        completedFiles: ctx.completedFiles,
+        startIndex: ctx.failedSubtaskIndex + 1,
+      }).catch(err => {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        dbLog('error', 'dev-agent', `[チーム] 再開エラー: ${errMsg}`, { convId: conv.id });
+        updateConversationStatus(conv.id, 'failed');
+        sendLineMessage(conv.user_id, `再開中にエラー:\n${errMsg.slice(0, 300)}`).catch(() => {});
+      }).finally(() => this.resumingSet.delete(conv.id));
+      return;
+    }
+
+    // retry or retry_with_hint
+    const failedSubtask = ctx.subtasks[ctx.failedSubtaskIndex];
+    if (failedSubtask && hint) {
+      failedSubtask.description += `\n\nDaikiからの追加指示: ${hint}`;
+    }
+
+    this.stuckContextMap.delete(conv.id);
+    this.resumingSet.add(conv.id);
+    this.runImplementation(conv, {
+      branchName: ctx.branchName,
+      subtasks: ctx.subtasks,
+      completedFiles: ctx.completedFiles,
+      startIndex: ctx.failedSubtaskIndex,
+    }).catch(err => {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      dbLog('error', 'dev-agent', `[チーム] リトライエラー: ${errMsg}`, { convId: conv.id });
+      updateConversationStatus(conv.id, 'failed');
+      sendLineMessage(conv.user_id, `リトライ中にエラー:\n${errMsg.slice(0, 300)}`).catch(() => {});
+    }).finally(() => this.resumingSet.delete(conv.id));
+  }
+
+  /** build/testフェーズからの復帰（Gitロック管理付き） */
+  private async resumeBuildTest(conv: DevConversation, ctx: StuckContext): Promise<void> {
+    let gitLockAcquired = false;
+    try {
+      gitLockAcquired = await acquireGitLock(conv.id, 60_000);
+      if (!gitLockAcquired) throw new Error('Gitロック取得失敗');
+      updateConversationStatus(conv.id, 'testing');
+      const phaseName = ctx.phase === 'build' ? 'ビルド' : 'テスト';
+      await sendLineMessage(conv.user_id, `🔄 ${phaseName}から再試行中...`);
+      await this.runBuildAndDeploy(conv, ctx.lastFiles || [], 0, ctx.branchName);
+    } finally {
+      if (gitLockAcquired) releaseGitLock(conv.id);
+    }
+  }
+
+  // ========================================
+  // PM: サブタスク分解
+  // ========================================
+
+  private async pmDecompose(conv: DevConversation): Promise<Subtask[]> {
+    dbLog('info', 'dev-agent', '[PM] サブタスク分解開始', { convId: conv.id });
+
+    // 要件が短すぎる場合は壊れている可能性が高い → エラー
+    if (!conv.requirements || conv.requirements.length < 100) {
+      throw new Error(`PM: 要件定義書が不正です (${conv.requirements?.length || 0}文字)。要件定義からやり直してください。`);
+    }
+
+    const codebaseCtx = await this.buildCodebaseContext();
+    const MAX_DECOMPOSE_RETRIES = 3;
+
+    for (let attempt = 1; attempt <= MAX_DECOMPOSE_RETRIES; attempt++) {
+      const retryHint = attempt > 1 ? '\n\n⚠️ 前回の出力がJSON形式ではありませんでした。必ず {"subtasks": [...]} のJSON形式のみを出力してください。説明文は不要です。' : '';
+
+      const { text } = await callClaude({
+        system: DEV_SYSTEM_PROMPT + '\n\n' + PM_DECOMPOSE_PROMPT,
+        messages: [
+          { role: 'user', content: `${codebaseCtx}\n\n以下の要件をサブタスクに分解してください:\n\n${conv.requirements}${retryHint}` },
+        ],
+        model: 'opus',
+      });
+
+      const parsed = safeParseJson(text);
+      if (parsed && parsed.subtasks && Array.isArray(parsed.subtasks) && parsed.subtasks.length > 0) {
+        return parsed.subtasks as Subtask[];
+      }
+
+      dbLog('warn', 'dev-agent', `[PM] サブタスク分解パース失敗 (${attempt}/${MAX_DECOMPOSE_RETRIES}): ${text.slice(0, 200)}`, { convId: conv.id });
+    }
+
+    throw new Error(`PM: サブタスク分解のパースに${MAX_DECOMPOSE_RETRIES}回失敗しました`);
+  }
+
+  // ========================================
+  // エンジニア + レビュアー ループ
+  // ========================================
+
+  private async engineerAndReview(
+    conv: DevConversation,
+    subtask: Subtask,
+    allSubtasks: Subtask[],
+    completedFiles: Array<{ path: string; content: string }>,
+  ): Promise<FileToWrite> {
+
+    let reviewRetry = 0;
+    let reviewFeedback = '';
+    let previousRejectReason = ''; // 同一理由差し戻し検出用
+
+    // A: レビュアー用にシステム基盤ファイルを事前読み込み（コンテキスト不足防止）
+    const systemFiles: Array<{ path: string; content: string }> = [];
+    for (const sysPath of SYSTEM_REFERENCE_FILES) {
+      // サブタスク対象ファイルや完了済みファイルと重複しない場合のみ
+      if (sysPath !== subtask.path && !completedFiles.some(f => f.path === sysPath)) {
+        const sysContent = await readProjectFile(sysPath);
+        if (sysContent) {
+          systemFiles.push({ path: sysPath, content: sysContent });
+        }
+      }
+    }
+
+    while (reviewRetry <= MAX_REVIEW_RETRIES) {
+      // --- エンジニア（Claude CLI） ---
+      const cliPrompt = this.buildCLIPrompt(conv, subtask, allSubtasks, completedFiles, reviewFeedback);
+
+      dbLog('info', 'dev-agent', `[エンジニア/CLI] コード生成開始 (レビュー試行 ${reviewRetry + 1})`, { convId: conv.id, path: subtask.path });
+      emitDevEvent({ type: 'agent_activity', convId: conv.id, agent: 'engineer', data: { status: 'coding', message: `コーディング中: ${subtask.path}`, file: subtask.path } });
+
+      const cliResult = await runClaudeCLI(cliPrompt);
+
+      if (!cliResult.success) {
+        throw new Error(`CLI実行失敗: ${cliResult.output.slice(-300)}`);
+      }
+
+      dbLog('info', 'dev-agent', `[エンジニア/CLI] コード生成完了`, { convId: conv.id, path: subtask.path });
+
+      // エンジニアがPMに相談したい場合の検出（CLI出力にconsultが含まれるか）
+      const consultMatch = cliResult.output.match(/"consult"\s*:\s*\{[^}]*"question"\s*:\s*"([^"]+)"/);
+      if (consultMatch) {
+        dbLog('info', 'dev-agent', `[エンジニア→PM] 相談検出: ${consultMatch[1].slice(0, 100)}`, { convId: conv.id });
+        const pmAnswer = await handleConsult('engineer', consultMatch[1], undefined, undefined, subtask.description);
+        reviewFeedback += `\n\n## PMからの回答\n${pmAnswer}`;
+        dbLog('info', 'dev-agent', `[PM→エンジニア] 回答: ${pmAnswer.slice(0, 100)}`, { convId: conv.id });
+      }
+
+      emitDevEvent({ type: 'code_write', convId: conv.id, agent: 'engineer', data: { file: subtask.path, action: subtask.action } });
+
+      // CLIが書いたファイルの内容を読み取り
+      const content = await readProjectFile(subtask.path);
+      if (!content) {
+        throw new Error(`CLIがファイルを生成しませんでした: ${subtask.path}`);
+      }
+
+      const fileToWrite: FileToWrite = {
+        path: subtask.path,
+        content,
+        action: subtask.action,
+      };
+
+      // --- レビュアー（Claude API, Sonnet） ---
+      dbLog('info', 'dev-agent', `[レビュアー] レビュー開始: ${subtask.path}`, { convId: conv.id });
+      emitDevEvent({ type: 'agent_activity', convId: conv.id, agent: 'reviewer', data: { status: 'reviewing', message: `レビュー中: ${subtask.path}`, file: subtask.path } });
+
+      // A: システム基盤ファイルを含むレビューコンテキストを構築
+      const reviewContext = this.buildReviewContext(subtask, fileToWrite, completedFiles, systemFiles);
+
+      const { text: reviewOutput } = await callClaude({
+        system: buildAgentPersonality('reviewer') + '\n\n' + REVIEWER_PROMPT,
+        messages: [{ role: 'user', content: reviewContext }],
+        model: 'default',
+      });
+
+      const reviewParsed = safeParseJson(reviewOutput);
+
+      // パース成功 & 承認 → 通過
+      if (reviewParsed && reviewParsed.approved) {
+        dbLog('info', 'dev-agent', `[レビュアー] 承認: ${subtask.path} - ${reviewParsed.summary}`, { convId: conv.id });
+        emitDevEvent({ type: 'agent_message', convId: conv.id, agent: 'reviewer', data: { message: `承認: ${subtask.path}`, verdict: 'approved' } });
+        return fileToWrite;
+      }
+
+      // パース失敗 or レビューNG → 差し戻し
+      reviewRetry++;
+      let currentRejectReason = '';
+
+      if (!reviewParsed) {
+        dbLog('warn', 'dev-agent', `[レビュアー] レビュー結果パース失敗 → 差し戻し扱い (${reviewRetry}/${MAX_REVIEW_RETRIES})`, { convId: conv.id });
+        currentRejectReason = reviewOutput.slice(0, 500);
+        reviewFeedback = `レビュアーの応答（JSON解析不可）:\n${currentRejectReason}`;
+        recordMetric(conv.id, 'reviewer', 'review_reject');
+        recordReject('reviewer', 'engineer', 'レビュー結果パース失敗',
+          reviewFeedback.slice(0, 300), 'major', false, conv.id);
+      } else {
+        recordMetric(conv.id, 'reviewer', 'review_reject');
+        const issues = (reviewParsed.issues || []) as Array<{ severity: string; message: string; fix: string }>;
+        currentRejectReason = (reviewParsed.summary || '') + ' ' + issues.map(i => i.message).join(' ');
+        reviewFeedback = issues.map(i => `[${i.severity}] ${i.message}\n修正: ${i.fix}`).join('\n\n');
+        recordReject('reviewer', 'engineer', reviewParsed.summary || 'レビューNG',
+          reviewFeedback.slice(0, 300), 'major',
+          reviewRetry >= 2, conv.id);
+        recordRejectLearning('engineer', reviewParsed.summary || 'レビューNG', reviewFeedback.slice(0, 200));
+        for (const issue of issues.filter(i => i.severity === 'error')) {
+          recordReviewerLearning(issue.message, issue.severity, subtask.path);
+        }
+        dbLog('warn', 'dev-agent', `[レビュアー] NG → エンジニアに差し戻し (${reviewRetry}/${MAX_REVIEW_RETRIES}): ${reviewParsed.summary}`, { convId: conv.id });
+        emitDevEvent({ type: 'agent_message', convId: conv.id, agent: 'reviewer', data: { message: `差し戻し: ${(reviewParsed.summary || '').slice(0, 60)}`, verdict: 'rejected', file: subtask.path } });
+      }
+
+      // B: 同一理由の差し戻し検出 → 合議発動（無限ループ防止）
+      if (previousRejectReason && isSimilarReject(previousRejectReason, currentRejectReason)) {
+        dbLog('info', 'dev-agent', `[チーム] 同一理由の差し戻し検出 → 合議発動`, { convId: conv.id, file: subtask.path });
+        emitDevEvent({ type: 'agent_message', convId: conv.id, agent: 'pm', data: { message: '同一差し戻しパターン検出 → チーム合議を開催' } });
+        try {
+          const { decision } = await runConsensus(
+            `レビュー差し戻しの繰り返し: ${subtask.path}`,
+            `レビュアーが同じ理由で差し戻しを繰り返しています。\n差し戻し理由: ${currentRejectReason.slice(0, 300)}\nサブタスク: ${subtask.description}\n\nこの問題をどう解決すべきか議論してください。レビュー基準を緩和すべきか、実装アプローチを変えるべきか、あるいはレビュアーが見えていない情報があるのかを判断してください。`,
+            conv.id,
+          );
+          reviewFeedback += `\n\n## チーム合議の結論\n${decision}`;
+          dbLog('info', 'dev-agent', `[チーム] 合議完了: ${decision.slice(0, 100)}`, { convId: conv.id });
+        } catch (consensusErr) {
+          dbLog('warn', 'dev-agent', `[チーム] 合議実行エラー: ${consensusErr instanceof Error ? consensusErr.message : String(consensusErr)}`, { convId: conv.id });
+        }
+      } else if (reviewRetry === 2) {
+        // 異なる理由の2回目差し戻し → PM介入（従来動作）
+        dbLog('info', 'dev-agent', `[PM介入] 差し戻し2回目 → PMがレビュー指摘を分析`, { convId: conv.id });
+        const pmAdvice = await this.pmReviewIntervention(conv, subtask, reviewFeedback);
+        if (pmAdvice) {
+          reviewFeedback += `\n\n## PMからの指示\n${pmAdvice}`;
+        }
+      }
+      previousRejectReason = currentRejectReason;
+
+      if (reviewRetry > MAX_REVIEW_RETRIES) {
+        dbLog('warn', 'dev-agent', `[レビュアー] 最大リトライ到達。最終版で続行`, { convId: conv.id });
+        return fileToWrite;
+      }
+    }
+
+    throw new Error(`レビューループ異常終了: ${subtask.path}`);
+  }
+
+  private buildCLIPrompt(
+    conv: DevConversation,
+    subtask: Subtask,
+    _allSubtasks: Subtask[],
+    completedFiles: Array<{ path: string; content: string }>,
+    reviewFeedback: string,
+  ): string {
+    let prompt = `CLAUDE.md を読んでから、以下のサブタスクを実装してください。
+
+## サブタスク
+- ファイル: ${subtask.path}
+- 内容: ${subtask.description}
+- アクション: ${subtask.action}
+
+## 全体の要件定義
+${conv.requirements}
+`;
+
+    if (completedFiles.length > 0) {
+      prompt += `\n## 完了済みファイル（参照用）\n`;
+      for (const f of completedFiles) {
+        prompt += `- ${f.path}\n`;
+      }
+    }
+
+    if (reviewFeedback) {
+      prompt += `\n## レビュアーからのフィードバック（必ず反映すること）\n${reviewFeedback}\n`;
+    }
+
+    prompt += `\n## 指示
+- このサブタスク（1ファイル）だけを作成/変更してください
+- npm run build でビルドが通ることを確認してください
+- 不明点や設計判断に迷った場合、以下のJSONを出力に含めるとPMに相談できます:
+  {"consult": {"question": "相談内容"}}`;
+
+    return prompt;
+  }
+
+  private buildReviewContext(
+    subtask: Subtask,
+    file: FileToWrite,
+    completedFiles: Array<{ path: string; content: string }>,
+    systemFiles: Array<{ path: string; content: string }> = [],
+  ): string {
+    let ctx = `## レビュー対象\npath: ${file.path}\naction: ${file.action}\n\n`;
+    ctx += `## コード\n\`\`\`typescript\n${file.content}\n\`\`\`\n\n`;
+    ctx += `## サブタスクの説明\n${subtask.description}\n\n`;
+
+    // A: システム基盤ファイル（DBスキーマ、設定等）をレビュアーに提供
+    if (systemFiles.length > 0) {
+      ctx += `## システム基盤ファイル（参照用 — DBスキーマ・設定等）\n`;
+      ctx += `※ これらのファイルは既にプロジェクトに存在します。レビュー対象コードがこれらを参照している場合の整合性チェックに使ってください。\n\n`;
+      for (const f of systemFiles) {
+        ctx += `### ${f.path}\n\`\`\`\n${f.content}\n\`\`\`\n\n`;
+      }
+    }
+
+    if (completedFiles.length > 0) {
+      ctx += `## 関連する完了済みファイル\n`;
+      for (const f of completedFiles) {
+        ctx += `### ${f.path}\n\`\`\`typescript\n${f.content}\n\`\`\`\n\n`;
+      }
+    }
+
+    return ctx;
+  }
+
+  // ========================================
+  // Phase 4: ビルド → テスト → 自己修正 → デプロイ
+  // ========================================
+
   private async runBuildAndDeploy(
     conv: DevConversation,
     lastFiles: FileToWrite[],
     retryCount: number,
     branchName: string,
+    diagnosisRound = 0,
   ): Promise<void> {
+    // ── Step 1: ビルド ──
+    dbLog('info', 'dev-agent', `[チーム] ビルド開始 (試行 ${retryCount + 1})`, { convId: conv.id });
+    emitDevEvent({ type: 'build', convId: conv.id, agent: 'deployer', data: { status: 'building' } });
     const buildResult = await runBuild();
 
-    if (buildResult.success) {
-      // コミット
-      await commitAndStay(branchName, `feat(dev-agent): ${conv.topic}`);
+    if (!buildResult.success) {
+      recordMetric(conv.id, 'engineer', 'build_fail');
+      const classified = classifyError(buildResult.buildOutput || '');
+      dbLog('info', 'dev-agent', `[チーム] ビルド失敗: ${categoryLabel(classified.category)}/${classified.subcategory}`, { convId: conv.id });
+      emitDevEvent({ type: 'build', convId: conv.id, agent: 'deployer', data: { status: 'failed', error: (buildResult.buildOutput || '').slice(0, 200) } });
 
-      // デプロイ（ヘルスチェック付き）
-      const deployResult = await deployWithHealthCheck(branchName);
-      if (deployResult.success) {
-        updateConversationStatus(conv.id, 'deployed');
-        const updatedConv = getConversation(conv.id) || conv;
-        const generatedFiles = JSON.parse(updatedConv.generated_files || '[]') as string[];
-
-        await sendLineMessage(conv.user_id,
-          `✅ 開発完了！\n\n` +
-          `📋 ${conv.topic}\n` +
-          `🌿 ブランチ: ${branchName}\n\n` +
-          `📁 ファイル一覧:\n${generatedFiles.map(f => `  - ${f}`).join('\n')}\n\n` +
-          `🔨 ビルド: 成功\n` +
-          `🚀 デプロイ: 完了（ヘルスチェック通過）\n\n` +
-          `正常に反映されました。`
-        );
-        dbLog('info', 'dev-agent', '開発完了・デプロイ成功', { convId: conv.id, branch: branchName });
-      } else {
-        updateConversationStatus(conv.id, 'failed');
-        await sendLineMessage(conv.user_id,
-          `❌ ${deployResult.message}\n前の状態に復帰済みです。`
-        );
-      }
-    } else if (retryCount < MAX_BUILD_RETRIES) {
-      // ビルドエラー自己修正
-      await sendLineMessage(conv.user_id,
-        `🔧 ビルドエラー検出。自動修正中... (${retryCount + 1}/${MAX_BUILD_RETRIES})`
-      );
-
-      try {
-        const { text } = await callClaude({
-          system: DEV_SYSTEM_PROMPT + '\n\n' + IMPLEMENTATION_PROMPT,
-          messages: [
-            {
-              role: 'user',
-              content: `以下のコードにビルドエラーがあります。修正してください。\n\n` +
-                `## ビルドエラー\n${buildResult.buildOutput}\n\n` +
-                `## 現在のコード\n${lastFiles.map(f => `### ${f.path}\n\`\`\`typescript\n${f.content}\n\`\`\``).join('\n\n')}`,
-            },
-          ],
-          model: 'opus',
-          maxTokens: 8192,
-        });
-
-        const parsed = safeParseJson(text);
-        if (parsed && parsed.files && Array.isArray(parsed.files)) {
-          const files = parsed.files as FileToWrite[];
-          await writeFiles(files);
-          await this.runBuildAndDeploy(conv, files, retryCount + 1, branchName);
-        } else {
-          throw new Error('修正コードのパースに失敗');
+      if (retryCount < MAX_BUILD_RETRIES) {
+        // エラー種別に応じた修正
+        if (classified.category === 'transient') {
+          const waitMs = classified.waitMs || 30_000;
+          await sendLineMessage(conv.user_id, `⏳ 一時的エラー（${classified.subcategory}）。${waitMs / 1000}秒後にリトライ...`);
+          await sleep(waitMs);
+          await this.runBuildAndDeploy(conv, lastFiles, retryCount + 1, branchName);
+          return;
         }
-      } catch (err) {
-        const errMsg = err instanceof Error ? err.message : String(err);
-        // ロールバック
-        await rollbackGit(branchName);
-        await sendLineMessage(conv.user_id, '🔙 コードをロールバックしました。');
-        updateConversationStatus(conv.id, 'failed');
-        await sendLineMessage(conv.user_id,
-          `❌ ビルドエラーの自動修正に失敗しました:\n${errMsg.slice(0, 300)}`
-        );
+        if (classified.category === 'environment' && classified.autoFixable) {
+          const fixed = await autoFixEnvironment(classified);
+          if (fixed) {
+            await sendLineMessage(conv.user_id, `🔧 環境問題を自動修正。リビルド中...`);
+            await this.runBuildAndDeploy(conv, lastFiles, retryCount + 1, branchName);
+            return;
+          }
+        }
+        // コードエラー or 修正不可な環境エラー → エンジニアに自動修正させる
+        await this.autoFixBuildError(conv, lastFiles, retryCount, branchName, buildResult.buildOutput || '', undefined, diagnosisRound);
+      } else {
+        // ── リトライ上限到達 → チーム診断 ──
+        await this.handleExhaustedRetries(conv, branchName, 'build', buildResult.buildOutput || '', classified, lastFiles, undefined, diagnosisRound);
+      }
+      return;
+    }
+
+    await sendLineMessage(conv.user_id, '🔨 ビルド: OK');
+    dbLog('info', 'dev-agent', '[チーム] ビルド成功 → テスト開始', { convId: conv.id });
+    emitDevEvent({ type: 'build', convId: conv.id, agent: 'deployer', data: { status: 'success' } });
+
+    // ── Step 2-3: 起動テスト + 機能テスト ──
+    await sendLineMessage(conv.user_id, '🧪 自動テスト実行中...');
+    emitDevEvent({ type: 'test', convId: conv.id, agent: 'deployer', data: { status: 'testing' } });
+    const testResults = await runAllTests();
+    const allPassed = testResults.every(r => r.passed);
+
+    if (allPassed) {
+      emitDevEvent({ type: 'test', convId: conv.id, agent: 'deployer', data: { status: 'passed' } });
+      for (const r of testResults) {
+        const icon = r.stage === 'startup' ? '🚀' : '🧪';
+        const name = r.stage === 'startup' ? '起動テスト' : '機能テスト';
+        await sendLineMessage(conv.user_id, `${icon} ${name}: OK`);
       }
     } else {
-      // 最大リトライ超過 → ロールバック
-      await rollbackGit(branchName);
-      await sendLineMessage(conv.user_id, '🔙 コードをロールバックしました。');
-      updateConversationStatus(conv.id, 'failed');
+      const failedResult = testResults.find(r => !r.passed)!;
+      const failedName = failedResult.stage === 'startup' ? '起動テスト' : '機能テスト';
+      const errorText = `${failedResult.message}\n${failedResult.details || ''}`;
+      const classified = classifyError(errorText);
+
+      dbLog('warn', 'dev-agent', `[デプロイヤー] ${failedName}失敗: ${categoryLabel(classified.category)}/${classified.subcategory}`, { convId: conv.id });
+      emitDevEvent({ type: 'test', convId: conv.id, agent: 'deployer', data: { status: 'failed', message: failedResult.message.slice(0, 100) } });
+      recordMetric(conv.id, 'deployer', 'test_fail');
+      recordDeployerLearning(failedResult.stage, failedResult.message.slice(0, 150), retryCount >= MAX_TEST_FIX_RETRIES ? 'escalated' : 'fixed');
+      recordReject('deployer', 'engineer', failedResult.message,
+        failedResult.details || '修正してください', 'major', false, conv.id);
+
+      if (retryCount < MAX_TEST_FIX_RETRIES) {
+        // 一時的エラー → 待機してリトライ
+        if (classified.category === 'transient') {
+          const waitMs = classified.waitMs || 30_000;
+          await sendLineMessage(conv.user_id, `⏳ テスト中の一時的エラー（${classified.subcategory}）。${waitMs / 1000}秒後にリトライ...`);
+          await sleep(waitMs);
+          await this.runBuildAndDeploy(conv, lastFiles, retryCount + 1, branchName);
+          return;
+        }
+        // 環境エラー → 自動修正してリトライ
+        if (classified.category === 'environment' && classified.autoFixable) {
+          const fixed = await autoFixEnvironment(classified);
+          if (fixed) {
+            await sendLineMessage(conv.user_id, `🔧 環境問題を自動修正。再テスト中...`);
+            await this.runBuildAndDeploy(conv, lastFiles, retryCount + 1, branchName);
+            return;
+          }
+        }
+        // コードエラー → エンジニアに差し戻し
+        await sendLineMessage(conv.user_id,
+          `🧪 ${failedName}失敗 → エンジニアに差し戻し (${retryCount + 1}/${MAX_TEST_FIX_RETRIES})\n${failedResult.message}\n${failedResult.details?.slice(0, 200) || ''}`
+        );
+        await this.autoFixTestError(conv, lastFiles, retryCount, branchName, testResults, undefined, diagnosisRound);
+      } else {
+        // ── リトライ上限到達 → チーム診断 ──
+        await this.handleExhaustedRetries(conv, branchName, 'test', errorText, classified, lastFiles, testResults, diagnosisRound);
+      }
+      return;
+    }
+
+    // ── Step 4: デプロイ ──
+    dbLog('info', 'dev-agent', '[チーム] 全テスト通過 → デプロイ開始', { convId: conv.id });
+
+    // デプロイ前コミット（失敗を検知）
+    const finalCommit = await commitAndStay(branchName, `feat: complete ${conv.id.slice(0, 8)}`);
+    if (!finalCommit.success) {
+      const classified = classifyError(finalCommit.error || '');
+      if (classified.autoFixable) {
+        const fixed = await autoFixEnvironment(classified);
+        if (fixed) {
+          const retry = await commitAndStay(branchName, `feat: complete ${conv.id.slice(0, 8)}`);
+          if (!retry.success) {
+            throw new Error(`デプロイ前コミット失敗（自動修正後も解決せず）: ${retry.error}`);
+          }
+        } else {
+          throw new Error(`デプロイ前コミット失敗: ${finalCommit.error}`);
+        }
+      } else {
+        throw new Error(`デプロイ前コミット失敗: ${finalCommit.error}`);
+      }
+    }
+
+    this.stuckContextMap.delete(conv.id);
+
+    // pm2 restartでプロセスが死ぬためfinallyが実行されない → 先にロック解放
+    releaseGitLock(conv.id);
+
+    emitDevEvent({ type: 'deploy', convId: conv.id, agent: 'deployer', data: { status: 'deploying' } });
+    await sendLineMessage(conv.user_id, '🚀 全テスト通過。デプロイ中（再起動します）...');
+
+    await deployWithHealthCheck(branchName, {
+      convId: conv.id,
+      branchName,
+      userId: conv.user_id,
+      topic: conv.topic,
+    });
+    // ↑ 通常ここには到達しない（pm2がプロセスを殺すため）
+  }
+
+  // ── リトライ上限到達時のチーム診断 ──
+
+  private async handleExhaustedRetries(
+    conv: DevConversation,
+    branchName: string,
+    phase: 'build' | 'test',
+    errorOutput: string,
+    classified: ReturnType<typeof classifyError>,
+    lastFiles: FileToWrite[],
+    testResults?: TestResult[],
+    diagnosisRound = 0,
+  ): Promise<void> {
+    const maxRetries = phase === 'build' ? MAX_BUILD_RETRIES : MAX_TEST_FIX_RETRIES;
+    const phaseName = phase === 'build' ? 'ビルド' : 'テスト';
+
+    // ── 診断ラウンド上限チェック ──
+    if (diagnosisRound >= MAX_DIAGNOSIS_ROUNDS) {
+      dbLog('error', 'dev-agent', `[チーム診断] 診断${MAX_DIAGNOSIS_ROUNDS}ラウンド到達 → 強制エスカレーション`, { convId: conv.id });
+      const triedActions = [
+        `${phaseName}の自動修正を${maxRetries}回試行`,
+        `チーム診断会議を${diagnosisRound}ラウンド実施`,
+        `診断に基づく修正を試みたが解決に至らず`,
+      ];
+      const { category: errCatDiag, explanation: errExpDiag } = classifyStuckError(errorOutput, phase);
+      this.stuckContextMap.set(conv.id, {
+        branchName, subtasks: [], completedFiles: [],
+        failedSubtaskIndex: 0, errorMessage: errorOutput.slice(0, 500),
+        phase, lastFiles,
+        triedActions,
+        dialogueLog: [],
+        errorCategory: errCatDiag,
+        errorExplanation: errExpDiag,
+      });
+      updateConversationStatus(conv.id, 'stuck');
+      const diagUrl = `${config.admin.baseUrl}/admin/dev/${conv.id}`;
       await sendLineMessage(conv.user_id,
-        `❌ ビルドエラーを${MAX_BUILD_RETRIES}回修正しましたが解決できませんでした:\n${buildResult.buildOutput?.slice(0, 500)}\n\n手動での修正が必要です。`
-      );
+        `📋 PMからの報告\n\n` +
+        `■ 状況: ${phaseName}エラーが${MAX_DIAGNOSIS_ROUNDS}ラウンドの診断・修正でも解決できませんでした\n\n` +
+        `■ 試したこと:\n${triedActions.map(a => `・${a}`).join('\n')}\n\n` +
+        `■ エラー概要:\n${errorOutput.slice(0, 300)}\n\n` +
+        `■ PM所見: 自動修正の範囲では解決が難しいエラーです。エラーの内容を見て、何か心当たりや追加の情報があれば教えてください。\n` +
+        `一緒に方針を考えましょう。\n\n` +
+        `詳細: ${diagUrl}`
+      ).catch(() => {});
+      return;
+    }
+
+    dbLog('info', 'dev-agent', `[チーム診断] ${phaseName}修正${maxRetries}回失敗 → チーム診断開始 (round ${diagnosisRound + 1}/${MAX_DIAGNOSIS_ROUNDS})`, { convId: conv.id });
+    await sendLineMessage(conv.user_id, `🏥 ${phaseName}修正が上限に達しました。チーム診断会議を開始... (${diagnosisRound + 1}/${MAX_DIAGNOSIS_ROUNDS})`);
+    emitDevEvent({ type: 'diagnosis', convId: conv.id, agent: 'system', data: { status: 'meeting', message: 'チーム診断会議開始' } });
+
+    const diagnosis = await runTeamDiagnosis({
+      convId: conv.id,
+      phase,
+      error: errorOutput,
+      classifiedError: classified,
+      buildOutput: phase === 'build' ? errorOutput : undefined,
+      testResults: testResults,
+      filesChanged: lastFiles.map(f => f.path),
+      retryCount: maxRetries,
+      maxRetries,
+    });
+
+    dbLog('info', 'dev-agent', `[チーム診断] 結果: ${diagnosis.recommendation} - ${diagnosis.rootCause.slice(0, 100)}`, { convId: conv.id });
+    emitDevEvent({ type: 'diagnosis', convId: conv.id, agent: 'system', data: { recommendation: diagnosis.recommendation, rootCause: diagnosis.rootCause.slice(0, 100) } });
+    // PMが診断結果を学びとして記憶
+    recordPmLearning(`diagnosis_${phase}_${conv.id.slice(0, 8)}`,
+      `${phaseName}障害(${conv.topic.slice(0, 30)}): ${diagnosis.rootCause.slice(0, 200)}\n判断: ${diagnosis.recommendation}\n対処: ${diagnosis.actionPlan.slice(0, 150)}`,
+      'team_diagnosis');
+
+    // チーム分析の報告
+    const analysisReport = diagnosis.teamAnalysis
+      ? `\n\n📋 チーム分析:\n` +
+        `PM: ${diagnosis.teamAnalysis.pm}\n` +
+        `エンジニア: ${diagnosis.teamAnalysis.engineer}\n` +
+        `デプロイヤー: ${diagnosis.teamAnalysis.deployer}`
+      : '';
+
+    switch (diagnosis.recommendation) {
+      case 'retry_after_wait': {
+        const waitMs = diagnosis.waitMs || 60_000;
+        await sendLineMessage(conv.user_id, `⏳ チーム診断: ${diagnosis.actionPlan}\n${waitMs / 1000}秒待機後にリトライ...${analysisReport}`);
+        await sleep(waitMs);
+        // リトライカウントをリセット（診断を経たので新しい試行として扱う）
+        await this.runBuildAndDeploy(conv, lastFiles, 0, branchName, diagnosisRound + 1);
+        break;
+      }
+      case 'retry_with_fix': {
+        await sendLineMessage(conv.user_id, `🔧 チーム診断: ${diagnosis.actionPlan}${analysisReport}`);
+        // 診断の修正指示をもとに再修正を試みる
+        if (phase === 'build') {
+          await this.autoFixBuildError(conv, lastFiles, 0, branchName, errorOutput, diagnosis.fixInstructions, diagnosisRound + 1);
+        } else {
+          await this.autoFixTestError(conv, lastFiles, 0, branchName, testResults || [], diagnosis.fixInstructions, diagnosisRound + 1);
+        }
+        break;
+      }
+      case 'rollback': {
+        await rollbackGit(branchName).catch(() => {});
+        updateConversationStatus(conv.id, 'failed');
+        this.stuckContextMap.delete(conv.id);
+        await sendLineMessage(conv.user_id,
+          `🏥 チーム診断結果: ロールバック\n` +
+          `根本原因: ${diagnosis.rootCause}\n` +
+          `対処: ${diagnosis.actionPlan}${analysisReport}\n\n` +
+          `コードをロールバックしました。新しい開発依頼でリトライできます。`
+        ).catch(() => {});
+        break;
+      }
+      case 'escalate_to_user':
+      default: {
+        // ロールバックせず、stuckモードでユーザーに判断を委ねる
+        const triedActions = [
+          `${phaseName}の自動修正を${maxRetries}回試行`,
+          `チーム診断会議で原因分析を実施`,
+        ];
+        this.stuckContextMap.set(conv.id, {
+          branchName,
+          subtasks: [],
+          completedFiles: [],
+          failedSubtaskIndex: 0,
+          errorMessage: diagnosis.rootCause,
+          phase,
+          lastFiles,
+          triedActions,
+          teamDiagnosis: `根本原因: ${diagnosis.rootCause}\n対処案: ${diagnosis.actionPlan}`,
+          dialogueLog: [],
+        });
+        updateConversationStatus(conv.id, 'stuck');
+        const diagUrl2 = `${config.admin.baseUrl}/admin/dev/${conv.id}`;
+        await sendLineMessage(conv.user_id,
+          `📋 PMからの報告\n\n` +
+          `■ 状況: ${phaseName}フェーズでチームの自動解決が困難な問題が発生\n\n` +
+          `■ 試したこと:\n${triedActions.map(a => `・${a}`).join('\n')}\n\n` +
+          `■ チーム診断結果:\n` +
+          `根本原因: ${diagnosis.rootCause}\n` +
+          `対処案: ${diagnosis.actionPlan}${analysisReport}\n\n` +
+          `■ PM推奨: ${diagnosis.actionPlan}\n\n` +
+          `この方針でよろしいですか？質問や別の方針があれば教えてください。\n\n` +
+          `詳細: ${diagUrl2}`
+        ).catch(() => {});
+        break;
+      }
+    }
+  }
+
+  // ── ビルドエラー自動修正 ──
+
+  private async autoFixBuildError(
+    conv: DevConversation,
+    lastFiles: FileToWrite[],
+    retryCount: number,
+    branchName: string,
+    buildOutput: string,
+    diagnosisHint?: string,
+    diagnosisRound = 0,
+    transientWaitCount = 0,
+  ): Promise<void> {
+    dbLog('warn', 'dev-agent', `[エンジニア] ビルドエラー → 自動修正 (${retryCount + 1}/${MAX_BUILD_RETRIES})`, {
+      convId: conv.id,
+      buildOutput: buildOutput.slice(0, 300),
+    });
+    emitDevEvent({ type: 'agent_activity', convId: conv.id, agent: 'engineer', data: { status: 'fixing', message: `ビルドエラー修正中... (${retryCount + 1}/${MAX_BUILD_RETRIES})` } });
+    await sendLineMessage(conv.user_id,
+      `🔧 ビルドエラー自動修正中... (${retryCount + 1}/${MAX_BUILD_RETRIES})`
+    );
+
+    try {
+      const { extractErrorFiles } = await import('./deployer');
+      const errorFiles = extractErrorFiles(buildOutput);
+      let existingContext = '';
+      for (const ef of errorFiles) {
+        if (!lastFiles.find(f => f.path === ef)) {
+          const content = await readProjectFile(ef);
+          if (content) {
+            existingContext += `### ${ef}（既存ファイル）\n\`\`\`typescript\n${content}\n\`\`\`\n\n`;
+          }
+        }
+      }
+
+      const diagnosisSection = diagnosisHint
+        ? `## チーム診断からの追加指示\n${diagnosisHint}\n\n`
+        : '';
+
+      const { text } = await callClaude({
+        system: DEV_SYSTEM_PROMPT + '\n\n' + ENGINEER_PROMPT,
+        messages: [{
+          role: 'user',
+          content: `以下のコードにビルドエラーがあります。修正してください。\n\n` +
+            `## ビルドエラー\n${buildOutput}\n\n` +
+            diagnosisSection +
+            `## 今回変更したコード\n${lastFiles.map(f => `### ${f.path}\n\`\`\`typescript\n${f.content}\n\`\`\``).join('\n\n')}\n\n` +
+            (existingContext ? `## 関連する既存ファイル\n${existingContext}\n\n` : '') +
+            `## 重要\n- 既存ファイルのimportパスや型定義に合わせてください\n- 存在しないモジュールをimportしないでください\n\n` +
+            `全ファイルをまとめて修正してください。出力形式:\n{"files": [{"path": "...", "content": "...", "action": "..."}]}`,
+        }],
+        model: 'opus',
+        maxTokens: 16384,
+      });
+
+      const parsed = safeParseJson(text);
+      let fixedFiles: FileToWrite[];
+      if (parsed?.files && Array.isArray(parsed.files)) {
+        fixedFiles = parsed.files;
+      } else if (parsed?.file) {
+        fixedFiles = [parsed.file];
+      } else {
+        throw new Error('修正コードのパースに失敗');
+      }
+
+      await writeFiles(fixedFiles);
+      const fixDesc = fixedFiles.map(f => `${f.path}(${f.action})`).join(', ');
+      recordBuildLearning('engineer', buildOutput.slice(0, 200), `修正ファイル: ${fixDesc}`, fixedFiles.map(f => f.path));
+      recordDeployerLearning('build', buildOutput.slice(0, 150), 'fixed');
+      await this.runBuildAndDeploy(conv, fixedFiles, retryCount + 1, branchName, diagnosisRound);
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      dbLog('error', 'dev-agent', `[エンジニア] ビルド自動修正失敗: ${errMsg.slice(0, 200)}`, { convId: conv.id });
+
+      // 自動修正自体が失敗した場合もエラーを分類
+      const classified = classifyError(errMsg);
+      if (classified.category === 'transient') {
+        if (transientWaitCount >= MAX_TRANSIENT_WAITS) {
+          dbLog('error', 'dev-agent', `[エンジニア] 一時的エラー待機${MAX_TRANSIENT_WAITS}回到達 → エスカレーション`, { convId: conv.id });
+          updateConversationStatus(conv.id, 'stuck');
+          this.stuckContextMap.set(conv.id, {
+            branchName, subtasks: [], completedFiles: [],
+            failedSubtaskIndex: 0, errorMessage: errMsg,
+            phase: 'build', lastFiles,
+            triedActions: [`ビルドエラー自動修正中にAPI制限が${MAX_TRANSIENT_WAITS}回連続で発生`],
+            dialogueLog: [],
+          });
+          await sendLineMessage(conv.user_id,
+            `⏳ API制限が${MAX_TRANSIENT_WAITS}回連続で発生しました。\n\n` +
+            `選択肢:\n・「リトライ」→ 再試行\n・「中止」→ 開発を中止`
+          ).catch(() => {});
+          return;
+        }
+        const waitMs = classified.waitMs || 60_000;
+        dbLog('info', 'dev-agent', `[エンジニア] 自動修正中の一時的エラー → ${waitMs / 1000}秒待機 (${transientWaitCount + 1}/${MAX_TRANSIENT_WAITS})`, { convId: conv.id });
+        await sendLineMessage(conv.user_id, `⏳ API制限。${waitMs / 1000}秒待機後にリトライ... (${transientWaitCount + 1}/${MAX_TRANSIENT_WAITS})`);
+        await sleep(waitMs);
+        await this.autoFixBuildError(conv, lastFiles, retryCount, branchName, buildOutput, diagnosisHint, diagnosisRound, transientWaitCount + 1);
+        return;
+      }
+
+      // それ以外 → ロールバック
+      await rollbackGit(branchName).catch(() => {});
+      updateConversationStatus(conv.id, 'failed');
+      this.stuckContextMap.delete(conv.id);
+      await sendLineMessage(conv.user_id,
+        `ビルドエラーの自動修正に失敗しました:\n${errMsg.slice(0, 300)}\n\nコードをロールバックしました。`
+      ).catch(() => {});
+    }
+  }
+
+  // ── テスト失敗自動修正 ──
+
+  private async autoFixTestError(
+    conv: DevConversation,
+    lastFiles: FileToWrite[],
+    retryCount: number,
+    branchName: string,
+    testResults: TestResult[],
+    diagnosisHint?: string,
+    diagnosisRound = 0,
+    transientWaitCount = 0,
+  ): Promise<void> {
+    dbLog('warn', 'dev-agent', `[エンジニア] テスト失敗 → 自動修正 (${retryCount + 1}/${MAX_TEST_FIX_RETRIES})`, { convId: conv.id });
+    emitDevEvent({ type: 'agent_activity', convId: conv.id, agent: 'engineer', data: { status: 'fixing', message: `テスト失敗修正中... (${retryCount + 1}/${MAX_TEST_FIX_RETRIES})` } });
+    await sendLineMessage(conv.user_id,
+      `🔧 テスト失敗の自動修正中... (${retryCount + 1}/${MAX_TEST_FIX_RETRIES})`
+    );
+
+    try {
+      // 関連する既存ファイルも読み込む
+      let existingContext = '';
+      const relevantFiles = ['src/index.ts', 'src/line/sender.ts', 'src/config.ts'];
+      for (const ef of relevantFiles) {
+        if (!lastFiles.find(f => f.path === ef)) {
+          const content = await readProjectFile(ef);
+          if (content) {
+            existingContext += `### ${ef}（既存ファイル）\n\`\`\`typescript\n${content}\n\`\`\`\n\n`;
+          }
+        }
+      }
+
+      const testReport = formatTestResults(testResults);
+      const diagnosisSection = diagnosisHint
+        ? `## チーム診断からの追加指示\n${diagnosisHint}\n\n`
+        : '';
+
+      const { text } = await callClaude({
+        system: DEV_SYSTEM_PROMPT + '\n\n' + ENGINEER_PROMPT,
+        messages: [{
+          role: 'user',
+          content: `以下のコードはビルドは通りましたが、ランタイムテストで失敗しました。修正してください。\n\n` +
+            `## テスト結果\n${testReport}\n\n` +
+            diagnosisSection +
+            `## テストの説明\n` +
+            `- 起動テスト: PORT=3999 NODE_ENV=test で別プロセス起動 → /health で200確認\n` +
+            `- 機能テスト: /test/task, /webhook, /telegram のルート存在確認\n\n` +
+            `## 今回変更したコード\n${lastFiles.map(f => `### ${f.path}\n\`\`\`typescript\n${f.content}\n\`\`\``).join('\n\n')}\n\n` +
+            (existingContext ? `## 関連する既存ファイル\n${existingContext}\n\n` : '') +
+            `## 重要\n- ランタイムエラー（起動時に落ちる原因）を特定して修正してください\n- importの不整合、未定義変数、型ミスマッチ等を確認\n- NODE_ENV=test時はLINE/Telegram送信がスキップされます\n\n` +
+            `全ファイルをまとめて修正してください。出力形式:\n{"files": [{"path": "...", "content": "...", "action": "..."}]}`,
+        }],
+        model: 'opus',
+        maxTokens: 16384,
+      });
+
+      const parsed = safeParseJson(text);
+      let fixedFiles: FileToWrite[];
+      if (parsed?.files && Array.isArray(parsed.files)) {
+        fixedFiles = parsed.files;
+      } else if (parsed?.file) {
+        fixedFiles = [parsed.file];
+      } else {
+        throw new Error('修正コードのパースに失敗');
+      }
+
+      await writeFiles(fixedFiles);
+      const failedResult = testResults.find(r => !r.passed);
+      if (failedResult) {
+        const fixDesc = fixedFiles.map(f => `${f.path}(${f.action})`).join(', ');
+        recordTestLearning('engineer', failedResult.stage, failedResult.message.slice(0, 200), `修正ファイル: ${fixDesc}`);
+        recordDeployerLearning(failedResult.stage, failedResult.message.slice(0, 150), 'fixed');
+      }
+      await this.runBuildAndDeploy(conv, fixedFiles, retryCount + 1, branchName, diagnosisRound);
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      dbLog('error', 'dev-agent', `[エンジニア] テスト自動修正失敗: ${errMsg.slice(0, 200)}`, { convId: conv.id });
+
+      // 自動修正自体が失敗した場合もエラーを分類
+      const classified = classifyError(errMsg);
+      if (classified.category === 'transient') {
+        if (transientWaitCount >= MAX_TRANSIENT_WAITS) {
+          dbLog('error', 'dev-agent', `[エンジニア] 一時的エラー待機${MAX_TRANSIENT_WAITS}回到達 → エスカレーション`, { convId: conv.id });
+          updateConversationStatus(conv.id, 'stuck');
+          this.stuckContextMap.set(conv.id, {
+            branchName, subtasks: [], completedFiles: [],
+            failedSubtaskIndex: 0, errorMessage: errMsg,
+            phase: 'test', lastFiles,
+            triedActions: [`テスト失敗自動修正中にAPI制限が${MAX_TRANSIENT_WAITS}回連続で発生`],
+            dialogueLog: [],
+          });
+          await sendLineMessage(conv.user_id,
+            `⏳ API制限が${MAX_TRANSIENT_WAITS}回連続で発生しました。\n\n` +
+            `選択肢:\n・「リトライ」→ 再試行\n・「中止」→ 開発を中止`
+          ).catch(() => {});
+          return;
+        }
+        const waitMs = classified.waitMs || 60_000;
+        dbLog('info', 'dev-agent', `[エンジニア] 自動修正中の一時的エラー → ${waitMs / 1000}秒待機 (${transientWaitCount + 1}/${MAX_TRANSIENT_WAITS})`, { convId: conv.id });
+        await sendLineMessage(conv.user_id, `⏳ API制限。${waitMs / 1000}秒待機後にリトライ... (${transientWaitCount + 1}/${MAX_TRANSIENT_WAITS})`);
+        await sleep(waitMs);
+        await this.autoFixTestError(conv, lastFiles, retryCount, branchName, testResults, diagnosisHint, diagnosisRound, transientWaitCount + 1);
+        return;
+      }
+
+      await rollbackGit(branchName).catch(() => {});
+      updateConversationStatus(conv.id, 'failed');
+      this.stuckContextMap.delete(conv.id);
+      await sendLineMessage(conv.user_id,
+        `テスト失敗の自動修正に失敗しました:\n${errMsg.slice(0, 300)}\n\nコードをロールバックしました。`
+      ).catch(() => {});
     }
   }
 }
 
 function safeParseJson(text: string): any {
   let jsonStr = text.trim();
-  const jsonMatch = jsonStr.match(/```(?:json)?\s*\n?([\s\S]*?)```/);
-  if (jsonMatch) {
-    jsonStr = jsonMatch[1].trim();
+
+  // 1. マークダウンコードブロック除去
+  const codeBlockMatch = jsonStr.match(/```(?:json)?\s*\n?([\s\S]*?)```/);
+  if (codeBlockMatch) {
+    jsonStr = codeBlockMatch[1].trim();
   }
-  try {
-    return JSON.parse(jsonStr);
-  } catch {
-    return null;
+
+  // 2. そのまま試す
+  try { return JSON.parse(jsonStr); } catch { /* continue */ }
+
+  // 3. 最初の { ... } または [ ... ] ブロックを抽出
+  const objMatch = jsonStr.match(/(\{[\s\S]*\})/);
+  if (objMatch) {
+    try { return JSON.parse(objMatch[1]); } catch { /* continue */ }
   }
+  const arrMatch = jsonStr.match(/(\[[\s\S]*\])/);
+  if (arrMatch) {
+    try { return JSON.parse(arrMatch[1]); } catch { /* continue */ }
+  }
+
+  // 4. 末尾のカンマ除去して再試行
+  if (objMatch) {
+    const cleaned = objMatch[1].replace(/,\s*([\]}])/g, '$1');
+    try { return JSON.parse(cleaned); } catch { /* continue */ }
+  }
+
+  return null;
 }

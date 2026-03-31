@@ -1,37 +1,27 @@
 import { callClaude } from '../claude/client';
 import { getStatusReport } from '../queue/taskQueue';
 import { getBudgetReport } from '../claude/budgetTracker';
+import { getRecentHistory } from './messageHistory';
+import { buildSmartContext } from '../memory/store';
+import { buildBunshinPrompt } from './bunshinPrompt';
+import { buildSelfAwarenessContext } from '../github/client';
 import { config } from '../config';
 import { logger } from '../utils/logger';
 
-const RESPONDER_PROMPT = `あなたは「母艦」という名前のAIアシスタントです。
-LINEを通じてユーザーと会話しています。
-
-## 性格・トーン
-- 簡潔で的確。余計な前置きや敬語の過剰使用はしない
-- 親しみやすいが、ビジネスパートナーとしての距離感
-- ユーザーは忙しいので、要点を先に伝える
-- 絵文字は控えめに、要所で使う
-
-## あなたの機能
-- SEOサイト（soico.jp/no1/）の最適化・分析（soicoエージェント）
-- 母艦システム自体の開発・拡張（devエージェント）
-- タスクの管理・状況確認
-- API予算の管理
-
-## コンテキスト情報
-ユーザーのメッセージに応じて、以下のシステム情報が提供されます。
-この情報を使って自然な会話で回答してください。
-
-## 管理ダッシュボード
-詳細な情報は ${config.admin.baseUrl}/admin で確認できます。
-
-## 回答ルール
-- 長い分析結果がある場合は3行以内に要約し、「詳細はダッシュボードで確認できます」と付ける
-- タスクの実行結果は、ユーザーにとって意味のある部分だけを伝える
-- エラーが発生した場合は、ユーザーが次に何をすべきかを明確に伝える
-- 開発依頼（「開発して」「実装して」「母艦に機能を追加して」等）は、あなたが直接対応せず "DEV_AGENT" とだけ返す
-- 分からない質問には正直に分からないと言う`;
+/** ユーザーがシステム自身について質問しているか判定 */
+function isSelfReferentialQuery(text: string): boolean {
+  const keywords = [
+    '母艦', 'システム', 'ボット', 'bot',
+    'あなた', 'お前', '君',
+    '機能', 'できること', '何ができ',
+    '最新', 'アップデート', '更新', '変更',
+    'バージョン', 'コミット', 'commit',
+    '開発状況', '実装', 'ステータス', 'status',
+    '自分', '自己紹介', 'github', 'GitHub',
+  ];
+  const lower = text.toLowerCase();
+  return keywords.some(kw => lower.includes(kw.toLowerCase()));
+}
 
 export interface ResponderContext {
   systemStatus?: string;
@@ -44,6 +34,7 @@ export interface ResponderContext {
 export async function generateResponse(
   userMessage: string,
   context?: ResponderContext,
+  userId?: string,
 ): Promise<string> {
   try {
     let contextBlock = '';
@@ -55,7 +46,8 @@ export async function generateResponse(
       contextBlock += `\n## 予算状況\n${context.budgetReport}`;
     }
     if (context?.taskResult) {
-      contextBlock += `\n## タスク実行結果\nタスク: ${context.taskResult.description}\n出力:\n${context.taskResult.output.slice(0, 2000)}`;
+      const output = (context.taskResult.output || '').slice(0, 2000);
+      contextBlock += `\n## タスク実行結果\nタスク: ${context.taskResult.description}\n出力:\n${output}`;
       if (context.taskResult.execResult) {
         contextBlock += `\n実行結果:\n${context.taskResult.execResult.slice(0, 500)}`;
       }
@@ -70,9 +62,47 @@ export async function generateResponse(
       contextBlock += `\n## 追加情報\n${context.rawContext}`;
     }
 
+    // 会話履歴を構築
+    const messages: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+
+    if (userId) {
+      const history = getRecentHistory(userId);
+      for (const msg of history) {
+        if (msg.role === 'user' || msg.role === 'assistant') {
+          messages.push({ role: msg.role, content: msg.content });
+        }
+      }
+    }
+
+    // 現在のメッセージを追加
+    messages.push({ role: 'user', content: userMessage });
+
+    // 記憶コンテキストを追加（意味検索で関連記憶のみ注入）
+    let memoryContext = '';
+    if (userId) {
+      try {
+        memoryContext = await buildSmartContext(userId, userMessage);
+      } catch (err) {
+        logger.warn('スマートコンテキスト構築失敗', { err: err instanceof Error ? err.message : String(err) });
+      }
+    }
+
+    // 自己参照的な質問にはGitHub情報を注入
+    if (isSelfReferentialQuery(userMessage)) {
+      try {
+        const selfContext = await buildSelfAwarenessContext();
+        contextBlock += `\n${selfContext}`;
+      } catch (err) {
+        logger.warn('GitHub自己認識コンテキスト取得失敗', { err: err instanceof Error ? err.message : String(err) });
+      }
+    }
+
+    // 分身プロンプト構築（ナレッジ + 記憶を注入）
+    const systemPrompt = buildBunshinPrompt(memoryContext) + contextBlock;
+
     const { text } = await callClaude({
-      system: RESPONDER_PROMPT + contextBlock,
-      messages: [{ role: 'user', content: userMessage }],
+      system: systemPrompt,
+      messages,
       model: 'default',
     });
 

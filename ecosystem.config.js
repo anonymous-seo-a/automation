@@ -2,8 +2,12 @@ module.exports = {
   apps: [{
     name: 'mothership',
     script: './dist/index.js',
+    exec_mode: 'fork',
     instances: 1,
     autorestart: true,
+    min_uptime: 10000,
+    max_restarts: 3,
+    kill_timeout: 5000,
     watch: false,
     max_memory_restart: '500M',
     env: {
