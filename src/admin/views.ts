@@ -13,6 +13,7 @@ function layout(title: string, content: string, opts: LayoutOptions = {}): strin
     { href: '/admin/insights', label: '改善', key: 'insights' },
     { href: '/admin/live', label: 'オフィス', key: 'live' },
     { href: '/admin/knowledge', label: 'ナレッジ', key: 'knowledge' },
+    { href: '/admin/mindmap', label: 'マインドマップ', key: 'mindmap' },
   ];
 
   const breadcrumbHtml = breadcrumbs && breadcrumbs.length > 0
@@ -201,6 +202,8 @@ export function renderPage(page: string, data: Record<string, unknown>): string 
       return layout('改善', renderInsights(data), { activePage: 'insights' });
     case 'knowledge':
       return layout('ナレッジ', renderKnowledge(data), { activePage: 'knowledge' });
+    case 'mindmap':
+      return layout('マインドマップ', renderMindmap(data), { activePage: 'mindmap' });
     default:
       return layout('404', '<h1>ページが見つかりません</h1>');
   }
@@ -817,5 +820,196 @@ ${items.map(k => `<tr>
 </tr>
 <tr><td colspan="4"><pre>${escapeHtml((k.content as string).slice(0, 500))}</pre></td></tr>`).join('\n')}
 </table>`;
+}
+
+function renderMindmap(data: Record<string, unknown>): string {
+  const knowledgeItems = (data.knowledgeItems as Array<Record<string, unknown>>) || [];
+  const agents = (data.agents as string[]) || [];
+  const taskCounts = (data.taskCounts as Array<{ status: string; cnt: number }>) || [];
+
+  // Group knowledge by file_name
+  const knowledgeByFile: Record<string, string[]> = {};
+  for (const item of knowledgeItems) {
+    const file = (item.file_name as string) || 'unknown';
+    if (!knowledgeByFile[file]) knowledgeByFile[file] = [];
+    const section = (item.section as string) || '(全体)';
+    if (!knowledgeByFile[file].includes(section)) {
+      knowledgeByFile[file].push(section);
+    }
+  }
+
+  const knowledgeFiles = Object.keys(knowledgeByFile);
+  const totalTasks = taskCounts.reduce((s, r) => s + r.cnt, 0);
+
+  // Build SVG mindmap data
+  // Root node at center, branches: ナレッジ, エージェント, タスク
+  const cx = 600;
+  const cy = 400;
+
+  // Branch colors
+  const colors = {
+    knowledge: '#58a6ff',
+    agents: '#2dd4bf',
+    tasks: '#f0c040',
+  };
+
+  // Status color map for tasks
+  const statusColors: Record<string, string> = {
+    pending: '#f0c040',
+    running: '#58a6ff',
+    completed: '#2dd4bf',
+    failed: '#f85149',
+    deployed: '#2dd4bf',
+    implementing: '#58a6ff',
+    testing: '#58a6ff',
+    stuck: '#ffb347',
+    hearing: '#bc8cff',
+    defining: '#bc8cff',
+    approved: '#7ee8fa',
+  };
+
+  // Positions for branch roots
+  const branches = [
+    { key: 'knowledge', label: 'ナレッジ', color: colors.knowledge, angle: 210 },
+    { key: 'agents',    label: 'エージェント', color: colors.agents,   angle: 330 },
+    { key: 'tasks',     label: 'タスク',   color: colors.tasks,     angle: 90  },
+  ];
+
+  const toRad = (deg: number) => (deg * Math.PI) / 180;
+  const branchR = 160;
+  const leafR = 90;
+
+  let svgLines = '';
+  let svgNodes = '';
+
+  for (const branch of branches) {
+    const bx = cx + branchR * Math.cos(toRad(branch.angle));
+    const by = cy + branchR * Math.sin(toRad(branch.angle));
+
+    // Line from root to branch
+    svgLines += `<line x1="${cx}" y1="${cy}" x2="${bx.toFixed(1)}" y2="${by.toFixed(1)}" stroke="${branch.color}" stroke-width="2" stroke-opacity="0.5"/>`;
+
+    // Branch node
+    svgNodes += `
+      <circle cx="${bx.toFixed(1)}" cy="${by.toFixed(1)}" r="36" fill="#1c2128" stroke="${branch.color}" stroke-width="2"/>
+      <text x="${bx.toFixed(1)}" y="${(by - 6).toFixed(1)}" text-anchor="middle" fill="${branch.color}" font-size="12" font-weight="bold">${escapeHtml(branch.label)}</text>`;
+
+    if (branch.key === 'knowledge') {
+      // Leaf nodes: knowledge files
+      const leaves = knowledgeFiles.slice(0, 8);
+      const spread = leaves.length > 1 ? 70 : 0;
+      const startAngle = branch.angle - (spread * (leaves.length - 1)) / 2;
+      leaves.forEach((file, i) => {
+        const la = startAngle + spread * i;
+        const lx = bx + leafR * Math.cos(toRad(la));
+        const ly = by + leafR * Math.sin(toRad(la));
+        const shortName = file.replace(/\.md$/, '').slice(0, 12);
+        svgLines += `<line x1="${bx.toFixed(1)}" y1="${by.toFixed(1)}" x2="${lx.toFixed(1)}" y2="${ly.toFixed(1)}" stroke="${branch.color}" stroke-width="1" stroke-opacity="0.3"/>`;
+        svgNodes += `
+          <circle cx="${lx.toFixed(1)}" cy="${ly.toFixed(1)}" r="26" fill="#161b22" stroke="${branch.color}" stroke-width="1" stroke-opacity="0.6"/>
+          <text x="${lx.toFixed(1)}" y="${(ly + 4).toFixed(1)}" text-anchor="middle" fill="#c9d1d9" font-size="10">${escapeHtml(shortName)}</text>`;
+      });
+      if (knowledgeFiles.length > 8) {
+        const la = startAngle + spread * 8;
+        const lx = bx + leafR * Math.cos(toRad(la));
+        const ly = by + leafR * Math.sin(toRad(la));
+        svgNodes += `<text x="${lx.toFixed(1)}" y="${(ly + 4).toFixed(1)}" text-anchor="middle" fill="#484f58" font-size="10">+${knowledgeFiles.length - 8}件</text>`;
+      }
+      // Count label
+      svgNodes += `<text x="${bx.toFixed(1)}" y="${(by + 8).toFixed(1)}" text-anchor="middle" fill="#8b949e" font-size="10">${knowledgeFiles.length}ファイル</text>`;
+    } else if (branch.key === 'agents') {
+      // Leaf nodes: agents
+      const spread = agents.length > 1 ? 50 : 0;
+      const startAngle = branch.angle - (spread * (agents.length - 1)) / 2;
+      agents.forEach((agent, i) => {
+        const la = startAngle + spread * i;
+        const lx = bx + leafR * Math.cos(toRad(la));
+        const ly = by + leafR * Math.sin(toRad(la));
+        svgLines += `<line x1="${bx.toFixed(1)}" y1="${by.toFixed(1)}" x2="${lx.toFixed(1)}" y2="${ly.toFixed(1)}" stroke="${branch.color}" stroke-width="1" stroke-opacity="0.3"/>`;
+        svgNodes += `
+          <circle cx="${lx.toFixed(1)}" cy="${ly.toFixed(1)}" r="26" fill="#161b22" stroke="${branch.color}" stroke-width="1" stroke-opacity="0.6"/>
+          <text x="${lx.toFixed(1)}" y="${(ly + 4).toFixed(1)}" text-anchor="middle" fill="#c9d1d9" font-size="10">${escapeHtml(agent.slice(0, 12))}</text>`;
+      });
+      svgNodes += `<text x="${bx.toFixed(1)}" y="${(by + 8).toFixed(1)}" text-anchor="middle" fill="#8b949e" font-size="10">${agents.length}体</text>`;
+    } else if (branch.key === 'tasks') {
+      // Leaf nodes: task statuses
+      const activeStatuses = taskCounts.filter(r => r.cnt > 0);
+      const spread = activeStatuses.length > 1 ? 45 : 0;
+      const startAngle = branch.angle - (spread * (activeStatuses.length - 1)) / 2;
+      activeStatuses.forEach((s, i) => {
+        const la = startAngle + spread * i;
+        const lx = bx + leafR * Math.cos(toRad(la));
+        const ly = by + leafR * Math.sin(toRad(la));
+        const nodeColor = statusColors[s.status] || '#8b949e';
+        svgLines += `<line x1="${bx.toFixed(1)}" y1="${by.toFixed(1)}" x2="${lx.toFixed(1)}" y2="${ly.toFixed(1)}" stroke="${nodeColor}" stroke-width="1" stroke-opacity="0.3"/>`;
+        svgNodes += `
+          <circle cx="${lx.toFixed(1)}" cy="${ly.toFixed(1)}" r="26" fill="#161b22" stroke="${nodeColor}" stroke-width="1" stroke-opacity="0.7"/>
+          <text x="${lx.toFixed(1)}" y="${(ly - 4).toFixed(1)}" text-anchor="middle" fill="${nodeColor}" font-size="10">${escapeHtml(s.status)}</text>
+          <text x="${lx.toFixed(1)}" y="${(ly + 8).toFixed(1)}" text-anchor="middle" fill="#f0f6fc" font-size="12" font-weight="bold">${s.cnt}</text>`;
+      });
+      svgNodes += `<text x="${bx.toFixed(1)}" y="${(by + 8).toFixed(1)}" text-anchor="middle" fill="#8b949e" font-size="10">計${totalTasks}件</text>`;
+    }
+  }
+
+  return `
+<h1>マインドマップ</h1>
+<p style="font-size:13px;color:#8b949e;margin-bottom:20px">母艦システムの構成要素を視覚的に表示します。</p>
+
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-bottom:24px">
+  <div class="card">
+    <div class="label">ナレッジファイル</div>
+    <div class="value">${knowledgeFiles.length}</div>
+    <div class="sub">${knowledgeItems.length}セクション</div>
+  </div>
+  <div class="card">
+    <div class="label">エージェント</div>
+    <div class="value">${agents.length}</div>
+    <div class="sub">${agents.join(', ') || '-'}</div>
+  </div>
+  <div class="card">
+    <div class="label">タスク合計</div>
+    <div class="value">${totalTasks}</div>
+    <div class="sub">${taskCounts.map(r => `${r.status}:${r.cnt}`).join(' / ')}</div>
+  </div>
+</div>
+
+<div class="section-card" style="overflow-x:auto">
+  <svg viewBox="0 0 1200 800" style="width:100%;max-height:600px;display:block" xmlns="http://www.w3.org/2000/svg">
+    <rect width="1200" height="800" fill="#0f1117" rx="8"/>
+    ${svgLines}
+    <!-- Root node -->
+    <circle cx="${cx}" cy="${cy}" r="48" fill="#1c2128" stroke="#30363d" stroke-width="2"/>
+    <text x="${cx}" y="${cy - 8}" text-anchor="middle" fill="#f0f6fc" font-size="14" font-weight="bold">母艦</text>
+    <text x="${cx}" y="${cy + 10}" text-anchor="middle" fill="#8b949e" font-size="11">システム</text>
+    ${svgNodes}
+  </svg>
+</div>
+
+<div style="margin-top:24px">
+  <h2>ナレッジ詳細</h2>
+  ${knowledgeFiles.length === 0 ? '<p style="color:#8b949e;font-size:13px">ナレッジが登録されていません。</p>' : `
+  <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px">
+    ${knowledgeFiles.map(file => `
+      <div class="section-card">
+        <h3 style="color:#58a6ff;font-size:13px;margin-bottom:8px">${escapeHtml(file)}</h3>
+        <ul style="list-style:none;padding:0">
+          ${knowledgeByFile[file].map(s => `<li style="font-size:12px;color:#8b949e;padding:2px 0;border-bottom:1px solid #21262d">${escapeHtml(s)}</li>`).join('')}
+        </ul>
+      </div>
+    `).join('')}
+  </div>`}
+
+  <h2>エージェント一覧</h2>
+  ${agents.length === 0 ? '<p style="color:#8b949e;font-size:13px">エージェントが登録されていません。</p>' : `
+  <div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:16px">
+    ${agents.map(a => `<div class="card" style="min-width:120px;text-align:center"><div class="value" style="font-size:16px">${escapeHtml(a)}</div></div>`).join('')}
+  </div>`}
+
+  <h2>タスク状態分布</h2>
+  ${taskCounts.length === 0 ? '<p style="color:#8b949e;font-size:13px">タスクがありません。</p>' : `
+  <div style="display:flex;flex-wrap:wrap;gap:10px">
+    ${taskCounts.map(r => `<div class="card" style="min-width:120px;text-align:center"><div class="label">${escapeHtml(r.status)}</div><div class="value">${r.cnt}</div></div>`).join('')}
+  </div>`}
+</div>`;
 }
 
