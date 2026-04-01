@@ -12,9 +12,6 @@ export const adminRouter = Router();
 
 adminRouter.use(express.json());
 
-// ライブオフィスビュー
-setupLiveRoutes(adminRouter);
-
 // ダッシュボードトップ
 adminRouter.get('/', (_req: Request, res: Response) => {
   try {
@@ -299,3 +296,6 @@ adminRouter.get('/knowledge', (_req: Request, res: Response) => {
   `).all() as Array<Record<string, unknown>>;
   res.send(renderPage('knowledge', { items }));
 });
+
+// ライブオフィスビュー（明示的ルートの後に登録して競合を防ぐ）
+setupLiveRoutes(adminRouter);
