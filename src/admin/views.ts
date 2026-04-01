@@ -201,6 +201,8 @@ export function renderPage(page: string, data: Record<string, unknown>): string 
       return layout('改善', renderInsights(data), { activePage: 'insights' });
     case 'knowledge':
       return layout('ナレッジ', renderKnowledge(data), { activePage: 'knowledge' });
+    case 'mindmap':
+      return layout('マインドマップ', renderMindmap(data), { activePage: 'mindmap' });
     default:
       return layout('404', '<h1>ページが見つかりません</h1>');
   }
@@ -801,6 +803,74 @@ ${routingCorrections.length > 0 ? `
     </tr>`).join('')}
   </table></div>
 </div>` : ''}`;
+}
+
+function renderMindmap(data: Record<string, unknown>): string {
+  const knowledgeItems = (data.knowledgeItems as Array<Record<string, unknown>>) || [];
+  const agents = (data.agents as string[]) || [];
+  const taskCounts = (data.taskCounts as Array<{ status: string; cnt: number }>) || [];
+
+  // ナレッジファイルをfile_name別にグループ化
+  const knowledgeByFile: Record<string, string[]> = {};
+  for (const item of knowledgeItems) {
+    const file = (item.file_name as string) || '不明';
+    const section = (item.section as string) || '(全体)';
+    if (!knowledgeByFile[file]) knowledgeByFile[file] = [];
+    knowledgeByFile[file].push(section);
+  }
+
+  const knowledgeNodes = Object.entries(knowledgeByFile).map(([file, sections]) => {
+    const sectionList = sections.map(s => `<li class="mm-leaf">${escapeHtml(s)}</li>`).join('');
+    return `<li class="mm-node mm-knowledge">
+      <span class="mm-label mm-file">${escapeHtml(file)}</span>
+      <ul>${sectionList}</ul>
+    </li>`;
+  }).join('');
+
+  const agentNodes = agents.map(a => `<li class="mm-node mm-agent">
+    <span class="mm-label">${escapeHtml(a)}</span>
+  </li>`).join('');
+
+  const statusColors: Record<string, string> = {
+    completed: '#2dd4bf', running: '#58a6ff', pending: '#f0c040',
+    failed: '#f85149', stuck: '#ffb347', deployed: '#2dd4bf',
+  };
+  const taskNodes = taskCounts.map(t => {
+    const color = statusColors[t.status] || '#8b949e';
+    return `<li class="mm-node mm-task">
+      <span class="mm-label" style="color:${color}">${escapeHtml(t.status)} <strong>${t.cnt}</strong></span>
+    </li>`;
+  }).join('');
+
+  return `
+<h1>マインドマップ</h1>
+<style>
+  .mm-root { list-style: none; padding: 0; margin: 0; }
+  .mm-root > li { margin-bottom: 24px; background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 16px 20px; }
+  .mm-root > li > .mm-category { font-size: 15px; font-weight: 700; color: #f0f6fc; margin-bottom: 10px; display: block; }
+  .mm-root ul { list-style: none; padding: 0 0 0 20px; margin: 6px 0 0; border-left: 2px solid #30363d; }
+  .mm-node { margin: 6px 0; }
+  .mm-label { font-size: 13px; display: inline-block; padding: 2px 10px; border-radius: 12px; background: #21262d; color: #c9d1d9; }
+  .mm-file { background: #0c2d48; color: #58a6ff; font-weight: 600; }
+  .mm-knowledge > ul > .mm-leaf { margin: 4px 0; list-style: none; }
+  .mm-knowledge > ul > .mm-leaf { font-size: 12px; color: #8b949e; padding: 2px 8px; }
+  .mm-agent .mm-label { background: #2d1b4e; color: #bc8cff; }
+  .mm-task .mm-label { background: #1c2128; }
+</style>
+<ul class="mm-root">
+  <li>
+    <span class="mm-category">ナレッジファイル構造</span>
+    <ul>${knowledgeNodes || '<li style="color:#8b949e;font-size:13px">データなし</li>'}</ul>
+  </li>
+  <li>
+    <span class="mm-category">エージェント</span>
+    <ul>${agentNodes || '<li style="color:#8b949e;font-size:13px">データなし</li>'}</ul>
+  </li>
+  <li>
+    <span class="mm-category">タスク状態</span>
+    <ul>${taskNodes || '<li style="color:#8b949e;font-size:13px">データなし</li>'}</ul>
+  </li>
+</ul>`;
 }
 
 function renderKnowledge(data: Record<string, unknown>): string {
