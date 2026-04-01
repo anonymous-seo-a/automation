@@ -74,6 +74,28 @@ adminRouter.get('/', (_req: Request, res: Response) => {
   }
 });
 
+// マインドマップ
+adminRouter.get('/mindmap', (_req: Request, res: Response) => {
+  try {
+    const db = getDB();
+
+    const knowledgeItems = db.prepare(`
+      SELECT file_name, section FROM knowledge ORDER BY file_name, rowid
+    `).all() as Array<Record<string, unknown>>;
+
+    const agents = listAgents();
+
+    const taskCounts = db.prepare(`
+      SELECT status, COUNT(*) as cnt FROM tasks GROUP BY status
+    `).all() as Array<{ status: string; cnt: number }>;
+
+    res.send(renderPage('mindmap', { knowledgeItems, agents, taskCounts }));
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    res.status(500).send(`<h1>エラー</h1><pre>${errMsg}</pre>`);
+  }
+});
+
 // タスク詳細
 adminRouter.get('/tasks/:id', (req: Request, res: Response) => {
   const db = getDB();
