@@ -588,6 +588,7 @@ ${rawRequirements}
         model: 'default',
         enableThinking: true,
         thinkingBudget: 3000,
+        timeoutMs: 120_000,
       });
       if (!selfReviewResult.includes('LGTM')) {
         text = selfReviewResult;
