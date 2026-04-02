@@ -422,10 +422,10 @@ export async function completePendingDeploy(): Promise<void> {
     }
 
     // ステータス更新
-    recordMetric(pending.convId, 'deployer', 'deploy_success');
-    updateConversationStatus(pending.convId, 'deployed');
+    await recordMetric(pending.convId, 'deployer', 'deploy_success');
+    await updateConversationStatus(pending.convId, 'deployed');
 
-    const updatedConv = getConversation(pending.convId);
+    const updatedConv = await getConversation(pending.convId);
     const generatedFiles: string[] = [];
     try {
       const parsed = JSON.parse(updatedConv?.generated_files || '[]');
@@ -460,7 +460,7 @@ export async function completePendingDeploy(): Promise<void> {
 
     // ロールバック
     await rollbackGit(pending.branchName);
-    updateConversationStatus(pending.convId, 'failed');
+    await updateConversationStatus(pending.convId, 'failed');
 
     const failUrl = `${config.admin.baseUrl}/admin/dev/${pending.convId}`;
     await sendLineMessage(pending.userId,
@@ -468,7 +468,7 @@ export async function completePendingDeploy(): Promise<void> {
     ).catch(err => logger.warn('デプロイ失敗通知失敗', { err: err instanceof Error ? err.message : String(err) }));
 
     // 失敗時もレトロスペクティブを実行（学習のため）
-    const failedConv = getConversation(pending.convId);
+    const failedConv = await getConversation(pending.convId);
     if (failedConv) {
       import('./retrospective').then(({ runRetrospective }) =>
         runRetrospective(failedConv).catch(err =>

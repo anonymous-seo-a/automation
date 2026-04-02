@@ -8,7 +8,7 @@ import { logger, dbLog } from '../utils/logger';
  * 毎日深夜に1回実行する想定。
  */
 export async function consolidateMemories(userId: string): Promise<void> {
-  const allMemories = getAllMemories(userId);
+  const allMemories = await getAllMemories(userId);
   if (allMemories.length < 3) {
     logger.info('記憶が少なすぎるため統合スキップ', { userId, count: allMemories.length });
     return;
@@ -90,7 +90,7 @@ export async function consolidateMemories(userId: string): Promise<void> {
       const db = getDB();
       let cleaned = 0;
       for (const item of result.cleanup) {
-        const r = db.prepare(
+        const r = await db.prepare(
           'DELETE FROM memories WHERE user_id = ? AND type = ? AND key = ?'
         ).run(userId, item.type, item.key);
         if (r.changes > 0) cleaned++;
@@ -111,7 +111,7 @@ export async function consolidateMemories(userId: string): Promise<void> {
  */
 export async function runDailyConsolidation(): Promise<void> {
   const db = getDB();
-  const users = db.prepare(
+  const users = await db.prepare(
     'SELECT DISTINCT user_id FROM memories'
   ).all() as Array<{ user_id: string }>;
 

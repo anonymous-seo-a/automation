@@ -34,7 +34,7 @@ export async function handleConsult(
     model: 'default',
   });
 
-  saveTeamConversation('consult', [fromAgent, 'pm'], [
+  await saveTeamConversation('consult', [fromAgent, 'pm'], [
     { role: fromAgent, message: question, timestamp: now() },
     { role: 'pm', message: pmAnswer, timestamp: now() },
   ]);
@@ -46,7 +46,7 @@ export async function handleConsult(
 }
 
 /** 直接差し戻し（レビュアー/デプロイヤー -> エンジニア、PM経由しない） */
-export function recordReject(
+export async function recordReject(
   fromAgent: AgentRole,
   toAgent: AgentRole,
   reason: string,
@@ -54,13 +54,13 @@ export function recordReject(
   severity: 'critical' | 'major' | 'minor',
   notifyPm: boolean,
   taskId?: string,
-): void {
-  saveTeamConversation('reject', [fromAgent, toAgent], [
+): Promise<void> {
+  await saveTeamConversation('reject', [fromAgent, toAgent], [
     { role: fromAgent, message: `差し戻し [${severity}]: ${reason}\n修正案: ${fixSuggestion}`, timestamp: now() },
   ], taskId);
 
   if (notifyPm) {
-    saveTeamConversation('consult', [fromAgent, 'pm'], [
+    await saveTeamConversation('consult', [fromAgent, 'pm'], [
       { role: fromAgent, message: `エンジニアに差し戻しましたが、設計レベルの問題かもしれません:\n${reason}`, timestamp: now() },
     ], taskId);
   }
@@ -107,36 +107,36 @@ export async function runConsensus(
   });
   log.push({ role: 'pm', message: decision, timestamp: now() });
 
-  saveTeamConversation('consensus', ['pm', 'engineer', 'reviewer', 'deployer'], log, taskId, decision);
+  await saveTeamConversation('consensus', ['pm', 'engineer', 'reviewer', 'deployer'], log, taskId, decision);
 
   logger.info('合議完了', { topic, decision: decision.slice(0, 100) });
   return { decision, log };
 }
 
 /** 会話ログを保存 */
-export function saveTeamConversation(
+export async function saveTeamConversation(
   type: string,
   participants: string[],
   log: ConversationEntry[],
   taskId?: string,
   decision?: string,
-): void {
+): Promise<void> {
   const db = getDB();
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO team_conversations (task_id, conversation_type, participants, log, decision)
     VALUES (?, ?, ?, ?, ?)
   `).run(taskId || null, type, JSON.stringify(participants), JSON.stringify(log), decision || null);
 }
 
 /** 会話ログを取得（管理画面用） */
-export function getTeamConversations(taskId?: string, limit: number = 20): any[] {
+export async function getTeamConversations(taskId?: string, limit: number = 20): Promise<any[]> {
   const db = getDB();
   if (taskId) {
-    return db.prepare(
+    return await db.prepare(
       'SELECT * FROM team_conversations WHERE task_id = ? ORDER BY created_at DESC LIMIT ?'
     ).all(taskId, limit);
   }
-  return db.prepare(
+  return await db.prepare(
     'SELECT * FROM team_conversations ORDER BY created_at DESC LIMIT ?'
   ).all(limit);
 }

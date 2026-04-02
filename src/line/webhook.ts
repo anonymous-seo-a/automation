@@ -223,7 +223,7 @@ export async function handleMessage(userId: string, text: string): Promise<void>
   if (/^会話ログ$/.test(text)) {
     saveMessage(dbId, 'user', text);
     try {
-      const logs = getTeamConversations(undefined, 5);
+      const logs = await getTeamConversations(undefined, 5);
       if (logs.length === 0) {
         await sendLineMessage(userId, 'チーム会話ログはまだありません。');
       } else {
@@ -243,11 +243,11 @@ export async function handleMessage(userId: string, text: string): Promise<void>
   }
 
   // dev会話はプラットフォーム固有ID（tg:xxx等）で管理される（devAgentが作成時にuserIdを使うため）
-  const activeDevConv = getActiveConversation(userId);
+  const activeDevConv = await getActiveConversation(userId);
 
   // ★ 脱出チェック（最優先）
   if (activeDevConv && wantsToExit(text)) {
-    cancelConversation(activeDevConv.id);
+    await cancelConversation(activeDevConv.id);
     dbLog('info', 'webhook', `開発脱出: "${text}" → conv ${activeDevConv.id} をキャンセル`);
     await sendLineMessage(userId, '開発を中止しました。何でも聞いてください。');
     return;
@@ -351,7 +351,7 @@ export async function handleMessage(userId: string, text: string): Promise<void>
       }
 
       for (const task of interpreted.tasks) {
-        enqueueTask(task);
+        await enqueueTask(task);
       }
 
       const taskNames = interpreted.tasks.map(t => t.description).join('\n');
@@ -371,7 +371,7 @@ export async function handleMessage(userId: string, text: string): Promise<void>
     // 進行中の開発情報をコンテキストに含める + DEV_AGENTトリガー指示
     let devContext = '';
     if (activeDevConv) {
-      devContext = buildDevRoutingContext(activeDevConv, userId);
+      devContext = await buildDevRoutingContext(activeDevConv, userId);
     } else {
       // 開発会話がない時も、新規開発依頼を検出する
       devContext = '\n\n## 開発エージェント\nこのシステムには開発チーム（PM→エンジニア→レビュアー）が組み込まれています。' +
@@ -412,7 +412,7 @@ export async function handleMessage(userId: string, text: string): Promise<void>
     extractAndSaveMemories(dbId, text, response).catch(err => logger.warn('自動記憶抽出失敗', { err }));
 
     // バックグラウンドで評価抽出（直近のdeployedタスクのtopicを渡す）
-    const lastDeployed = getDB().prepare(
+    const lastDeployed = await getDB().prepare(
       `SELECT topic FROM dev_conversations WHERE user_id = ? AND status = 'deployed' ORDER BY updated_at DESC LIMIT 1`
     ).get(userId) as { topic: string } | undefined;
     extractDaikiEvaluation(text, lastDeployed?.topic).catch(err =>
@@ -489,17 +489,19 @@ function recordRoutingCorrection(
     db.prepare(`
       INSERT INTO routing_corrections (user_id, message, dev_phase, auto_target, corrected_target)
       VALUES (?, ?, ?, ?, ?)
-    `).run(userId, message.slice(0, 300), devPhase, autoTarget, correctedTarget);
+    `).run(userId, message.slice(0, 300), devPhase, autoTarget, correctedTarget).catch((err: unknown) =>
+      logger.warn('ルーティング修正記録失敗', { err: err instanceof Error ? err.message : String(err) })
+    );
   } catch (err) {
     logger.warn('ルーティング修正記録失敗', { err: err instanceof Error ? err.message : String(err) });
   }
 }
 
 /** 直近のルーティング修正履歴を取得（プロンプト注入用） */
-function getRecentRoutingCorrections(userId: string, limit = 10): Array<{ message: string; dev_phase: string; corrected_target: string }> {
+async function getRecentRoutingCorrections(userId: string, limit = 10): Promise<Array<{ message: string; dev_phase: string; corrected_target: string }>> {
   try {
     const db = getDB();
-    return db.prepare(`
+    return await db.prepare(`
       SELECT message, dev_phase, corrected_target
       FROM routing_corrections
       WHERE user_id = ?
@@ -512,7 +514,7 @@ function getRecentRoutingCorrections(userId: string, limit = 10): Array<{ messag
 }
 
 /** 開発会話の状態に応じたルーティングコンテキストを構築 */
-function buildDevRoutingContext(conv: { id: string; topic: string; status: string; hearing_log: string }, userId: string): string {
+async function buildDevRoutingContext(conv: { id: string; topic: string; status: string; hearing_log: string }, userId: string): Promise<string> {
   let ctx = `\n## 進行中の開発\nトピック: ${conv.topic}\n状態: ${conv.status}`;
 
   // フェーズ別のコンテキスト追加
@@ -532,7 +534,7 @@ function buildDevRoutingContext(conv: { id: string; topic: string; status: strin
   }
 
   // 過去のルーティング修正を学習例として注入
-  const corrections = getRecentRoutingCorrections(userId);
+  const corrections = await getRecentRoutingCorrections(userId);
   if (corrections.length > 0) {
     const bunshinExamples = corrections.filter(c => c.corrected_target === 'bunshin');
     const pmExamples = corrections.filter(c => c.corrected_target === 'pm');
@@ -573,7 +575,7 @@ async function handleMemoryCommand(sendToId: string, dbUserId: string, text: str
 
   // 「何覚えてる？」「覚えてる？」「記憶一覧」→ 記憶の一覧表示
   if (/^(何.{0,2}覚えてる|覚えてる[？?]?$|記憶一覧|メモ一覧|覚えてること)/.test(text)) {
-    const memories = getAllMemories(dbUserId);
+    const memories = await getAllMemories(dbUserId);
     if (memories.length === 0) {
       await sendLineMessage(sendToId, 'まだ何も覚えていません。\n「覚えて 〇〇」で記憶を追加できます。');
     } else {
@@ -650,7 +652,7 @@ async function handleMemoryCommand(sendToId: string, dbUserId: string, text: str
     try {
       const found = await searchByMeaning(dbUserId, query, 1);
       if (found.length > 0) {
-        deleteMemory(dbUserId, found[0].memory.type as MemoryType, found[0].memory.key);
+        await deleteMemory(dbUserId, found[0].memory.type as MemoryType, found[0].memory.key);
         await sendLineMessage(sendToId, `「${found[0].memory.key}」の記憶を削除しました。`);
       } else {
         await sendLineMessage(sendToId, `「${query}」に関する記憶は見つかりませんでした。`);

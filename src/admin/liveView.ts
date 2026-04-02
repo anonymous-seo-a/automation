@@ -50,21 +50,21 @@ export function setupLiveRoutes(router: Router): void {
   });
 
   // 現在の状態を返すAPI
-  router.get('/live/api/state', (_req: Request, res: Response) => {
+  router.get('/live/api/state', async (_req: Request, res: Response) => {
     try {
       const db = getDB();
-      const conversations = db.prepare(
+      const conversations = await db.prepare(
         `SELECT id, user_id, status, topic, hearing_log, requirements, generated_files, created_at, updated_at
          FROM dev_conversations ORDER BY updated_at DESC LIMIT 5`
       ).all();
-      const recentLogs = db.prepare(
+      const recentLogs = await db.prepare(
         `SELECT level, source, message, metadata, created_at
          FROM logs WHERE source = 'dev-agent' ORDER BY created_at DESC LIMIT 60`
       ).all();
 
       let teamConvs: unknown[] = [];
       try {
-        teamConvs = db.prepare(
+        teamConvs = await db.prepare(
           `SELECT conversation_type, participants, log, decision, created_at
            FROM team_conversations ORDER BY created_at DESC LIMIT 20`
         ).all();
@@ -72,9 +72,9 @@ export function setupLiveRoutes(router: Router): void {
 
       let apiUsage: unknown = { cost: 0, calls: 0 };
       try {
-        apiUsage = db.prepare(
+        apiUsage = await db.prepare(
           `SELECT COALESCE(SUM(cost_usd),0) as cost, COUNT(*) as calls
-           FROM api_usage WHERE created_at >= date('now','start of day')`
+           FROM api_usage WHERE created_at >= date_trunc('day', NOW())`
         ).get();
       } catch { /* table may not exist yet */ }
 

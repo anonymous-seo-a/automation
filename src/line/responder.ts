@@ -86,7 +86,7 @@ export async function generateResponse(
     const messages: ClaudeMessage[] = [];
 
     if (userId) {
-      const history = getRecentHistory(userId);
+      const history = await getRecentHistory(userId);
       for (const msg of history) {
         if (msg.role === 'user' || msg.role === 'assistant') {
           messages.push({ role: msg.role, content: msg.content });
@@ -129,7 +129,7 @@ export async function generateResponse(
 
     // 開発に関する質問には過去開発履歴を注入
     if (isDevRelatedQuery(userMessage)) {
-      const devHistory = buildDevHistorySummary(10);
+      const devHistory = await buildDevHistorySummary(10);
       if (devHistory) {
         contextBlock += `\n${devHistory}`;
       }
@@ -141,8 +141,8 @@ export async function generateResponse(
       try {
         const { estimateEmotion, saveEmotionalState, getLatestEmotionalState, getEmotionalGuidance, detectEmotionalSurprise } = await import('./emotionalState');
         const emotion = await estimateEmotion(userMessage);
-        const prevEmotion = getLatestEmotionalState(userId);
-        saveEmotionalState(userId, emotion, userMessage);
+        const prevEmotion = await getLatestEmotionalState(userId);
+        await saveEmotionalState(userId, emotion, userMessage);
         emotionalGuidance = getEmotionalGuidance(emotion);
 
         // D-MEM: 感情急変を重要イベントとして記録
@@ -178,7 +178,7 @@ export async function generateResponse(
 }
 
 export async function gatherSystemContext(): Promise<string> {
-  const status = getStatusReport();
+  const status = await getStatusReport();
   const budget = await getBudgetReport();
   return `${status}\n\n${budget}`;
 }

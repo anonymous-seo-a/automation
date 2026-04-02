@@ -19,9 +19,9 @@ export interface TaskRow {
   completed_at: string | null;
 }
 
-export function enqueueTask(task: ParsedTask): void {
+export async function enqueueTask(task: ParsedTask): Promise<void> {
   const db = getDB();
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO tasks (id, agent, description, priority, requires_opus, input_data)
     VALUES (?, ?, ?, ?, ?, ?)
   `).run(
@@ -34,9 +34,9 @@ export function enqueueTask(task: ParsedTask): void {
   );
 }
 
-export function getNextTask(): TaskRow | null {
+export async function getNextTask(): Promise<TaskRow | null> {
   const db = getDB();
-  const row = db.prepare(`
+  const row = await db.prepare(`
     SELECT * FROM tasks
     WHERE status = 'pending'
     ORDER BY priority DESC, created_at ASC
@@ -45,46 +45,46 @@ export function getNextTask(): TaskRow | null {
   return row || null;
 }
 
-export function updateTaskStatus(
+export async function updateTaskStatus(
   taskId: string,
   status: string,
   data?: { output?: string; error?: string }
-): void {
+): Promise<void> {
   const db = getDB();
 
   if (data?.error) {
     // エラー追加 + リトライカウント増加
-    db.prepare(`
+    await db.prepare(`
       UPDATE tasks
       SET status = ?,
-          error_log = json_insert(COALESCE(error_log, '[]'), '$[#]', ?),
+          error_log = (COALESCE(error_log::jsonb, '[]'::jsonb) || to_jsonb(?::text))::text,
           retry_count = retry_count + 1,
-          updated_at = datetime('now')
+          updated_at = NOW()
       WHERE id = ?
     `).run(status, data.error, taskId);
   } else if (data?.output) {
-    db.prepare(`
+    await db.prepare(`
       UPDATE tasks
       SET status = ?,
           output_data = ?,
-          updated_at = datetime('now'),
-          completed_at = CASE WHEN ? IN ('success', 'failed') THEN datetime('now') ELSE completed_at END
+          updated_at = NOW(),
+          completed_at = CASE WHEN ? IN ('success', 'failed') THEN NOW() ELSE completed_at END
       WHERE id = ?
     `).run(status, data.output, status, taskId);
   } else {
-    db.prepare(`
+    await db.prepare(`
       UPDATE tasks
       SET status = ?,
-          updated_at = datetime('now'),
-          completed_at = CASE WHEN ? IN ('success', 'failed') THEN datetime('now') ELSE completed_at END
+          updated_at = NOW(),
+          completed_at = CASE WHEN ? IN ('success', 'failed') THEN NOW() ELSE completed_at END
       WHERE id = ?
     `).run(status, status, taskId);
   }
 }
 
-export function getStatusReport(): string {
+export async function getStatusReport(): Promise<string> {
   const db = getDB();
-  const counts = db.prepare(`
+  const counts = await db.prepare(`
     SELECT status, COUNT(*) as cnt FROM tasks
     GROUP BY status
   `).all() as Array<{ status: string; cnt: number }>;

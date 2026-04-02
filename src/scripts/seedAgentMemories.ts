@@ -259,7 +259,7 @@ async function main() {
     const { saveAgentMemory } = await import('../agents/dev/teamMemory');
     for (const s of seeds) {
       try {
-        saveAgentMemory(s.agent, s.type, s.key, s.content, s.source);
+        await saveAgentMemory(s.agent, s.type, s.key, s.content, s.source);
       } catch (e) {
         console.error(`  ❌ ${s.agent}/${s.key}:`, e instanceof Error ? e.message : String(e));
       }
@@ -270,7 +270,7 @@ async function main() {
   // 結果確認
   const { getDB } = await import('../db/database');
   const db = getDB();
-  const stats = db.prepare(`
+  const stats = await db.prepare(`
     SELECT agent, type, COUNT(*) as cnt,
            SUM(CASE WHEN embedding IS NOT NULL THEN 1 ELSE 0 END) as with_embedding
     FROM agent_memories GROUP BY agent, type ORDER BY agent, type
@@ -281,8 +281,8 @@ async function main() {
     console.log(`  ${row.agent}/${row.type}: ${row.cnt}件 (embedding: ${row.with_embedding}件)`);
   }
 
-  const total = db.prepare('SELECT COUNT(*) as cnt FROM agent_memories').get() as { cnt: number };
-  const withEmb = db.prepare('SELECT COUNT(*) as cnt FROM agent_memories WHERE embedding IS NOT NULL').get() as { cnt: number };
+  const total = await db.prepare('SELECT COUNT(*) as cnt FROM agent_memories').get() as { cnt: number };
+  const withEmb = await db.prepare('SELECT COUNT(*) as cnt FROM agent_memories WHERE embedding IS NOT NULL').get() as { cnt: number };
   console.log(`\n合計: ${total.cnt}件 (embedding付き: ${withEmb.cnt}件)`);
 }
 

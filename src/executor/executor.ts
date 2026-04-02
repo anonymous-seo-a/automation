@@ -27,7 +27,7 @@ async function poll(): Promise<void> {
   while (isRunning) {
     try {
       if (!isProcessing) {
-        const task = getNextTask();
+        const task = await getNextTask();
         if (task) {
           isProcessing = true;
           try {
@@ -46,7 +46,7 @@ async function poll(): Promise<void> {
 }
 
 async function executeTask(task: TaskRow): Promise<void> {
-  updateTaskStatus(task.id, 'running');
+  await updateTaskStatus(task.id, 'running');
   dbLog('info', 'executor', `タスク開始: ${task.description}`, { taskId: task.id });
 
   try {
@@ -82,7 +82,7 @@ async function executeTask(task: TaskRow): Promise<void> {
       const execResult = await runInSandbox(result.code, result.language);
 
       if (execResult.success) {
-        updateTaskStatus(task.id, 'success', {
+        await updateTaskStatus(task.id, 'success', {
           output: JSON.stringify({
             aiResponse: result.output.slice(0, 3000),
             execResult: execResult.stdout,
@@ -94,7 +94,7 @@ async function executeTask(task: TaskRow): Promise<void> {
       }
     } else {
       // コード不要のタスク（分析・レポート等）
-      updateTaskStatus(task.id, 'success', { output: result.output });
+      await updateTaskStatus(task.id, 'success', { output: result.output });
       await notifySuccess(task, result.output);
     }
   } catch (err) {
@@ -102,7 +102,7 @@ async function executeTask(task: TaskRow): Promise<void> {
 
     // 予算超過は即通知（リトライしない）
     if (errMsg.includes('BUDGET_EXCEEDED')) {
-      updateTaskStatus(task.id, 'failed', { error: errMsg });
+      await updateTaskStatus(task.id, 'failed', { error: errMsg });
       const msg = await generateResponse(
         `予算上限に達しました: ${errMsg}`,
         { rawContext: '予算超過でタスクが停止したことをユーザーに伝え、ダッシュボードで予算を確認するよう促してください。' }
@@ -119,7 +119,7 @@ async function handleFailure(task: TaskRow, errorMsg: string): Promise<void> {
   const currentRetry = task.retry_count + 1;
 
   if (currentRetry >= task.max_retries) {
-    updateTaskStatus(task.id, 'failed', { error: errorMsg });
+    await updateTaskStatus(task.id, 'failed', { error: errorMsg });
 
     const msg = await generateResponse(
       `タスクが最終的に失敗しました`,
@@ -141,7 +141,7 @@ async function handleFailure(task: TaskRow, errorMsg: string): Promise<void> {
     });
   } else {
     // pendingに戻してリトライ
-    updateTaskStatus(task.id, 'pending', { error: errorMsg });
+    await updateTaskStatus(task.id, 'pending', { error: errorMsg });
     dbLog('warn', 'executor', `リトライ予定 ${currentRetry}/${task.max_retries}`, {
       taskId: task.id,
     });

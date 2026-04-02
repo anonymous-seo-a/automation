@@ -26,15 +26,15 @@ if (config.server.env !== 'production') {
   }));
 }
 
-export function dbLog(
+export async function dbLog(
   level: string,
   source: string,
   message: string,
   metadata?: Record<string, unknown>
-): void {
+): Promise<void> {
   try {
     const db = getDB();
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO logs (level, source, message, metadata)
       VALUES (?, ?, ?, ?)
     `).run(level, source, message, metadata ? JSON.stringify(metadata) : null);

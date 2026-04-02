@@ -14,7 +14,7 @@ export async function extractAndSaveMemories(
 ): Promise<void> {
   try {
     // 既存記憶のキー一覧を取得（重複防止用）
-    const existingKeys = getDB().prepare(
+    const existingKeys = await getDB().prepare(
       "SELECT type, key FROM memories WHERE user_id = ? ORDER BY updated_at DESC LIMIT 50"
     ).all(userId) as Array<{ type: string; key: string }>;
 

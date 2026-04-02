@@ -21,11 +21,11 @@ async function main(): Promise<void> {
   logger.info('母艦システム起動中...');
 
   // DB初期化
-  runMigrations();
+  await runMigrations();
   logger.info('DBマイグレーション完了');
 
   // Embeddingキャッシュ初期化（DBから全embeddingをメモリにロード）
-  initEmbeddingCache();
+  await initEmbeddingCache();
 
   // ナレッジファイルロード（DB + 分身プロンプトキャッシュ）
   const knowledgeDir = path.join(__dirname, '..', 'knowledge');
@@ -77,7 +77,7 @@ async function main(): Promise<void> {
         }
 
         for (const task of interpreted.tasks) {
-          enqueueTask(task);
+          await enqueueTask(task);
         }
 
         res.json({

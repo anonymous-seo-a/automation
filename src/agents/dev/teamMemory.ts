@@ -1,6 +1,6 @@
 import { getDB } from '../../db/database';
 import { logger } from '../../utils/logger';
-import { embed, embedBatch, embedQuery, cosineSimilarity, embeddingToBuffer, bufferToEmbedding } from '../../memory/embedding';
+import { embed, embedBatch, embedQuery, cosineSimilarity, embeddingToSql, parseEmbedding } from '../../memory/embedding';
 import { getAgentCache, addToAgentCache, removeFromAgentCache, isCacheInitialized } from '../../memory/embeddingCache';
 import { callClaude } from '../../claude/client';
 import * as crypto from 'crypto';
@@ -16,7 +16,7 @@ export interface AgentMemory {
   content: string;
   source: string | null;
   importance: number;
-  embedding: Buffer | null;
+  embedding: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -50,19 +50,19 @@ function getDefaultAgentImportance(type: MemoryType, source?: string): number {
 // 保存
 // ============================================================
 
-/** 記憶を保存（同期版、embedding無し — 高頻度記録用） */
-export function saveAgentMemory(
+/** 記憶を保存（embedding無し — 高頻度記録用） */
+export async function saveAgentMemory(
   agent: AgentRole, type: MemoryType, key: string, content: string,
   source?: string, importance?: number,
-): void {
+): Promise<void> {
   const db = getDB();
   const imp = importance ?? getDefaultAgentImportance(type, source);
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO agent_memories (agent, type, key, content, source, importance)
     VALUES (?, ?, ?, ?, ?, ?)
     ON CONFLICT(agent, type, key) DO UPDATE SET
       content = excluded.content, source = excluded.source,
-      importance = excluded.importance, updated_at = datetime('now')
+      importance = excluded.importance, updated_at = NOW()
   `).run(agent, type, key, content, source || null, imp);
 }
 
@@ -73,31 +73,31 @@ export async function saveAgentMemoryWithEmbedding(
 ): Promise<void> {
   const db = getDB();
   const imp = importance ?? getDefaultAgentImportance(type, source);
-  let embeddingBuf: Buffer | null = null;
+  let embeddingSql: string | null = null;
   let vec: number[] | null = null;
 
   try {
     // contentのみをembedする（keyにタイムスタンプやハッシュが含まれるとノイズになる）
     vec = await embed(content);
-    embeddingBuf = embeddingToBuffer(vec);
+    embeddingSql = embeddingToSql(vec);
   } catch (err) {
     logger.warn('Agent embedding取得失敗（テキストのみ保存）', {
       agent, key, err: err instanceof Error ? err.message : String(err),
     });
   }
 
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO agent_memories (agent, type, key, content, source, importance, embedding)
     VALUES (?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(agent, type, key) DO UPDATE SET
       content = excluded.content, source = excluded.source,
       importance = excluded.importance, embedding = excluded.embedding,
-      updated_at = datetime('now')
-  `).run(agent, type, key, content, source || null, imp, embeddingBuf);
+      updated_at = NOW()
+  `).run(agent, type, key, content, source || null, imp, embeddingSql);
 
   // キャッシュ更新
   if (vec && isCacheInitialized()) {
-    const saved = db.prepare(
+    const saved = await db.prepare(
       'SELECT id FROM agent_memories WHERE agent = ? AND type = ? AND key = ?'
     ).get(agent, type, key) as { id: number } | undefined;
     if (saved) {
@@ -124,25 +124,24 @@ export async function saveAgentMemoriesBatch(
   }
 
   const db = getDB();
-  const stmt = db.prepare(`
+  const sql = `
     INSERT INTO agent_memories (agent, type, key, content, source, importance, embedding)
     VALUES (?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(agent, type, key) DO UPDATE SET
       content = excluded.content, source = excluded.source,
       importance = excluded.importance, embedding = excluded.embedding,
-      updated_at = datetime('now')
-  `);
+      updated_at = NOW()
+  `;
 
-  const insertMany = db.transaction((items: typeof entries) => {
-    for (let i = 0; i < items.length; i++) {
-      const e = items[i];
+  await db.withTransaction(async (tx) => {
+    for (let i = 0; i < entries.length; i++) {
+      const e = entries[i];
       const imp = e.importance ?? getDefaultAgentImportance(e.type, e.source);
-      const embBuf = embeddings[i] ? embeddingToBuffer(embeddings[i]) : null;
-      stmt.run(e.agent, e.type, e.key, e.content, e.source || null, imp, embBuf);
+      const embStr = embeddings[i] ? embeddingToSql(embeddings[i]) : null;
+      await tx.prepare(sql).run(e.agent, e.type, e.key, e.content, e.source || null, imp, embStr);
     }
   });
 
-  insertMany(entries);
   logger.info('エージェント記憶バッチ保存', { count: entries.length, withEmbedding: embeddings.length > 0 });
 }
 
@@ -151,23 +150,23 @@ export async function saveAgentMemoriesBatch(
 // ============================================================
 
 /** 指定メンバーの全記憶を取得 */
-export function getAgentMemories(agent: AgentRole, type?: MemoryType): AgentMemory[] {
+export async function getAgentMemories(agent: AgentRole, type?: MemoryType): Promise<AgentMemory[]> {
   const db = getDB();
   if (type) {
-    return db.prepare(
+    return await db.prepare(
       'SELECT * FROM agent_memories WHERE agent = ? AND type = ? ORDER BY importance DESC, updated_at DESC'
     ).all(agent, type) as AgentMemory[];
   }
-  return db.prepare(
+  return await db.prepare(
     'SELECT * FROM agent_memories WHERE agent = ? ORDER BY type, importance DESC, updated_at DESC'
   ).all(agent) as AgentMemory[];
 }
 
 /** 直近N日の記憶のみ取得 */
-export function getRecentAgentMemories(agent: AgentRole, days: number = 30): AgentMemory[] {
+export async function getRecentAgentMemories(agent: AgentRole, days: number = 30): Promise<AgentMemory[]> {
   const db = getDB();
-  return db.prepare(
-    `SELECT * FROM agent_memories WHERE agent = ? AND updated_at >= datetime('now', '-' || ? || ' days') ORDER BY importance DESC, updated_at DESC`
+  return await db.prepare(
+    `SELECT * FROM agent_memories WHERE agent = ? AND updated_at >= NOW() - INTERVAL '1 day' * ? ORDER BY importance DESC, updated_at DESC`
   ).all(agent, days) as AgentMemory[];
 }
 
@@ -196,22 +195,26 @@ export async function searchAgentMemories(
       const topIds = scored.slice(0, topK);
 
       const db = getDB();
-      return topIds.map(r => {
-        const full = db.prepare('SELECT * FROM agent_memories WHERE id = ?').get(r.id) as AgentMemory;
-        return { memory: full, score: r.score };
-      }).filter(r => r.memory);
+      const results: AgentMemorySearchResult[] = [];
+      for (const r of topIds) {
+        const full = await db.prepare('SELECT * FROM agent_memories WHERE id = ?').get(r.id) as AgentMemory;
+        if (full) {
+          results.push({ memory: full, score: r.score });
+        }
+      }
+      return results;
     }
 
     // キャッシュ未初期化時はDB直接
     const db = getDB();
-    const rows = db.prepare(
+    const rows = await db.prepare(
       'SELECT * FROM agent_memories WHERE agent = ? AND embedding IS NOT NULL'
     ).all(agent) as AgentMemory[];
 
     const scored: AgentMemorySearchResult[] = [];
     for (const row of rows) {
       if (!row.embedding) continue;
-      const memVec = bufferToEmbedding(row.embedding as Buffer);
+      const memVec = parseEmbedding(row.embedding);
       const similarity = cosineSimilarity(queryVec, memVec);
       const daysSince = (Date.now() - new Date(row.updated_at).getTime()) / (1000 * 60 * 60 * 24);
       const timeDecay = Math.exp(-daysSince / 30);
@@ -227,51 +230,52 @@ export async function searchAgentMemories(
       agent, err: err instanceof Error ? err.message : String(err),
     });
     // フォールバック: importance順 + 新しい順
-    return getDB().prepare(
-      "SELECT * FROM agent_memories WHERE agent = ? AND updated_at >= datetime('now', '-30 days') ORDER BY importance DESC, updated_at DESC LIMIT ?"
-    ).all(agent, topK).map((m: any) => ({ memory: m as AgentMemory, score: 0.5 }));
+    const fallbackRows = await getDB().prepare(
+      "SELECT * FROM agent_memories WHERE agent = ? AND updated_at >= NOW() - INTERVAL '30 days' ORDER BY importance DESC, updated_at DESC LIMIT ?"
+    ).all(agent, topK);
+    return fallbackRows.map((m: any) => ({ memory: m as AgentMemory, score: 0.5 }));
   }
 }
 
 /** キーワードフォールバック検索 */
-function keywordFallback(agent: AgentRole, query: string, limit: number): AgentMemorySearchResult[] {
+async function keywordFallback(agent: AgentRole, query: string, limit: number): Promise<AgentMemorySearchResult[]> {
   const db = getDB();
-  const rows = db.prepare(
+  const rows = await db.prepare(
     'SELECT * FROM agent_memories WHERE agent = ? AND (key LIKE ? OR content LIKE ?) ORDER BY importance DESC, updated_at DESC LIMIT ?'
   ).all(agent, `%${query}%`, `%${query}%`, limit) as AgentMemory[];
   return rows.map(m => ({ memory: m, score: 0.5 }));
 }
 
 // ============================================================
-// 学習記録（同期版 — ホットパスで使用、embeddingはバックグラウンドで後追い）
+// 学習記録（embedding はバックグラウンドで後追い）
 // ============================================================
 
 /** ビルドエラー解決時の学習記録 */
-export function recordBuildLearning(
+export async function recordBuildLearning(
   agent: AgentRole, error: string, fixDescription: string, fixedFilePaths?: string[]
-): void {
+): Promise<void> {
   const key = `build_fix_${errorKey(error)}`;
   const filesInfo = fixedFilePaths?.length ? `\n修正ファイル: ${fixedFilePaths.join(', ')}` : '';
   const content = `エラー: ${error.slice(0, 200)}\n解決: ${fixDescription.slice(0, 300)}${filesInfo}`;
-  saveAgentMemory(agent, 'learning', key, content, 'build_error');
+  await saveAgentMemory(agent, 'learning', key, content, 'build_error');
   embedAndUpdateAsync(agent, 'learning', key, content);
   checkAndRecordPattern(agent, extractErrorType(error), error.slice(0, 100));
 }
 
 /** テスト失敗解決時の学習記録 */
-export function recordTestLearning(
+export async function recordTestLearning(
   agent: AgentRole, testStage: string, error: string, fixDescription: string
-): void {
+): Promise<void> {
   const key = `test_fix_${testStage}_${errorKey(error)}`;
   const content = `テスト(${testStage})エラー: ${error.slice(0, 200)}\n解決: ${fixDescription.slice(0, 300)}`;
-  saveAgentMemory(agent, 'learning', key, content, 'test_error');
+  await saveAgentMemory(agent, 'learning', key, content, 'test_error');
   embedAndUpdateAsync(agent, 'learning', key, content);
   checkAndRecordPattern(agent, `test_${testStage}_fail`, error.slice(0, 100));
 }
 
 /** 差し戻し修正時の学習記録（ERL式ヒューリスティック形式）
  *  ナラティブ形式で「いつ・何が起きて・どうすべきだったか」を記録 */
-export function recordRejectLearning(agent: AgentRole, issue: string, fix: string, filePath?: string): void {
+export async function recordRejectLearning(agent: AgentRole, issue: string, fix: string, filePath?: string): Promise<void> {
   const key = `reject_fix_${errorKey(issue)}`;
   // ERL式: トリガー条件 + 失敗パターン + 推奨アクションの構造化ヒューリスティック
   const fileHint = filePath ? `\nファイル: ${filePath}` : '';
@@ -282,56 +286,56 @@ export function recordRejectLearning(agent: AgentRole, issue: string, fix: strin
     `教訓: ${fix.slice(0, 300)}`,
     `→ 同様のファイルを実装する際は、この指摘を事前に確認してから実装を開始すること`,
   ].join('\n');
-  saveAgentMemory(agent, 'learning', key, content, 'review_reject');
+  await saveAgentMemory(agent, 'learning', key, content, 'review_reject');
   embedAndUpdateAsync(agent, 'learning', key, content);
   checkAndRecordPattern(agent, 'review_reject', issue.slice(0, 100));
 }
 
 /** レビュアーが指摘パターンを記憶する */
-export function recordReviewerLearning(
+export async function recordReviewerLearning(
   reviewerFinding: string, severity: string, filePath: string
-): void {
+): Promise<void> {
   const key = `review_pattern_${errorKey(reviewerFinding)}`;
   const content = `[${severity}] ${reviewerFinding.slice(0, 300)}\nファイル: ${filePath}`;
-  saveAgentMemory('reviewer', 'learning', key, content, 'review_finding');
+  await saveAgentMemory('reviewer', 'learning', key, content, 'review_finding');
   embedAndUpdateAsync('reviewer', 'learning', key, content);
   checkAndRecordPattern('reviewer', `review_${severity}`, reviewerFinding.slice(0, 100));
 }
 
 /** デプロイヤーがテスト失敗パターンを記憶する */
-export function recordDeployerLearning(
+export async function recordDeployerLearning(
   stage: string, error: string, outcome: 'fixed' | 'escalated'
-): void {
+): Promise<void> {
   const key = `deploy_${stage}_${errorKey(error)}`;
   const content = `${stage}失敗: ${error.slice(0, 200)}\n結果: ${outcome === 'fixed' ? '自動修正で解決' : 'エスカレーション'}`;
-  saveAgentMemory('deployer', 'learning', key, content, 'deploy_failure');
+  await saveAgentMemory('deployer', 'learning', key, content, 'deploy_failure');
   embedAndUpdateAsync('deployer', 'learning', key, content);
   checkAndRecordPattern('deployer', `deploy_${stage}_fail`, error.slice(0, 100));
 }
 
 /** PMの判断記録 */
-export function recordPmLearning(
+export async function recordPmLearning(
   key: string, content: string, source: string = 'pm_decision'
-): void {
+): Promise<void> {
   const sliced = content.slice(0, 400);
-  saveAgentMemory('pm', 'learning', `pm_${key}`, sliced, source);
+  await saveAgentMemory('pm', 'learning', `pm_${key}`, sliced, source);
   embedAndUpdateAsync('pm', 'learning', `pm_${key}`, sliced);
 }
 
-/** 同期保存後にバックグラウンドでembeddingを付与（+ キャッシュ更新） */
+/** 保存後にバックグラウンドでembeddingを付与（+ キャッシュ更新） */
 function embedAndUpdateAsync(agent: AgentRole, type: MemoryType, key: string, content: string): void {
   // contentのみをembed
   embed(content)
-    .then(vec => {
-      const buf = embeddingToBuffer(vec);
+    .then(async vec => {
+      const embStr = embeddingToSql(vec);
       const db = getDB();
-      db.prepare(
+      await db.prepare(
         'UPDATE agent_memories SET embedding = ? WHERE agent = ? AND type = ? AND key = ?'
-      ).run(buf, agent, type, key);
+      ).run(embStr, agent, type, key);
 
       // キャッシュ更新
       if (isCacheInitialized()) {
-        const saved = db.prepare(
+        const saved = await db.prepare(
           'SELECT id, importance FROM agent_memories WHERE agent = ? AND type = ? AND key = ?'
         ).get(agent, type, key) as { id: number; importance: number } | undefined;
         if (saved) {
@@ -386,7 +390,7 @@ async function checkAndRecordPatternAsync(agent: AgentRole, errorType: string, d
 
     if (similar.length >= MIN_OCCURRENCES) {
       // 既にパターンとして記録済みか確認
-      const existingPattern = getDB().prepare(
+      const existingPattern = await getDB().prepare(
         "SELECT id FROM agent_memories WHERE agent = ? AND type = 'pattern' AND key = ?"
       ).get(agent, `recurring_${errorType}`) as { id: number } | undefined;
 
@@ -394,22 +398,22 @@ async function checkAndRecordPatternAsync(agent: AgentRole, errorType: string, d
 
       if (existingPattern) {
         // 既存パターンを更新（最新情報で上書き）
-        getDB().prepare(
+        await getDB().prepare(
           'UPDATE agent_memories SET content = ?, importance = 5, updated_at = CURRENT_TIMESTAMP WHERE id = ?'
         ).run(content, existingPattern.id);
       } else {
-        saveAgentMemory(agent, 'pattern', `recurring_${errorType}`, content, 'auto_detect', 5);
+        await saveAgentMemory(agent, 'pattern', `recurring_${errorType}`, content, 'auto_detect', 5);
       }
       logger.info('パターン検出', { agent, errorType, similarCount: similar.length });
     }
   } catch {
     // embedding未対応時はキーワードフォールバック（従来動作）
-    const existing = getDB().prepare(
+    const existing = await getDB().prepare(
       `SELECT COUNT(*) as cnt FROM agent_memories WHERE agent = ? AND type = 'learning' AND key LIKE ?`
     ).get(agent, `%${errorType}%`) as { cnt: number };
 
     if (existing.cnt >= MIN_OCCURRENCES) {
-      saveAgentMemory(agent, 'pattern', `recurring_${errorType}`,
+      await saveAgentMemory(agent, 'pattern', `recurring_${errorType}`,
         `繰り返し発生(${existing.cnt}回): ${errorType}\n直近: ${details}\n→ 実装前に事前確認すること`,
         'auto_detect', 5);
     }
@@ -424,7 +428,7 @@ async function checkAndRecordPatternAsync(agent: AgentRole, errorType: string, d
 export async function buildAgentMemoryContext(agent: AgentRole, taskContext?: string): Promise<string> {
   try {
     // patternタイプは常に全件含める（致命的警告は見逃してはいけない）
-    const patterns = getAgentMemories(agent, 'pattern');
+    const patterns = await getAgentMemories(agent, 'pattern');
 
     // それ以外はタスク文脈で意味検索
     let relevant: AgentMemory[] = [];
@@ -435,8 +439,8 @@ export async function buildAgentMemoryContext(agent: AgentRole, taskContext?: st
       relevant = results.filter(r => !patternIds.has(r.memory.id)).map(r => r.memory);
     } else {
       // タスク文脈がない場合はimportance順で上位10件
-      relevant = getDB().prepare(
-        "SELECT * FROM agent_memories WHERE agent = ? AND type != 'pattern' AND updated_at >= datetime('now', '-30 days') ORDER BY importance DESC, updated_at DESC LIMIT 10"
+      relevant = await getDB().prepare(
+        "SELECT * FROM agent_memories WHERE agent = ? AND type != 'pattern' AND updated_at >= NOW() - INTERVAL '30 days' ORDER BY importance DESC, updated_at DESC LIMIT 10"
       ).all(agent) as AgentMemory[];
     }
 
@@ -469,9 +473,9 @@ export async function buildAgentMemoryContext(agent: AgentRole, taskContext?: st
 }
 
 /** 後方互換: 同期版（キャッシュやtaskContextなし、フォールバック用） */
-export function buildAgentMemoryContextSync(agent: AgentRole): string {
+export async function buildAgentMemoryContextSync(agent: AgentRole): Promise<string> {
   try {
-    const memories = getRecentAgentMemories(agent);
+    const memories = await getRecentAgentMemories(agent);
     if (memories.length === 0) return '';
 
     const sections: Record<MemoryType, string[]> = {
@@ -502,7 +506,7 @@ export function buildAgentMemoryContextSync(agent: AgentRole): string {
 /** 繰り返しlearning記憶をクラスタリングし、共通パターンをルール化して昇格 */
 export async function promoteRecurringLearnings(agent: AgentRole): Promise<number> {
   try {
-    const learnings = getAgentMemories(agent, 'learning');
+    const learnings = await getAgentMemories(agent, 'learning');
     if (learnings.length < 5) return 0; // 学習記憶が少なすぎる
 
     // embedding付きの学習記憶を取得
@@ -569,7 +573,7 @@ export async function promoteRecurringLearnings(agent: AgentRole): Promise<numbe
 // ============================================================
 
 export async function consolidateAgentMemories(agent: AgentRole): Promise<void> {
-  const allMemories = getAgentMemories(agent);
+  const allMemories = await getAgentMemories(agent);
   if (allMemories.length < 30) return;
 
   const learnings = allMemories.filter(m => m.type === 'learning');
@@ -624,11 +628,11 @@ export async function consolidateAgentMemories(agent: AgentRole): Promise<void> 
     if (result.delete_keys?.length > 0) {
       for (const key of result.delete_keys) {
         // DELETE前にIDを取得（DELETE後ではレコードが消えておりIDが取れない）
-        const row = db.prepare(
+        const row = await db.prepare(
           'SELECT id FROM agent_memories WHERE agent = ? AND key = ?'
         ).get(agent, key) as { id: number } | undefined;
 
-        const deleted = db.prepare(
+        const deleted = await db.prepare(
           "DELETE FROM agent_memories WHERE agent = ? AND type = 'learning' AND key = ?"
         ).run(agent, key);
 

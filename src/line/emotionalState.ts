@@ -34,11 +34,11 @@ export async function estimateEmotion(message: string): Promise<EmotionalState> 
 }
 
 /** 感情状態をDBに保存 */
-export function saveEmotionalState(userId: string, state: EmotionalState, triggerMessage: string): void {
+export async function saveEmotionalState(userId: string, state: EmotionalState, triggerMessage: string): Promise<void> {
   try {
     const db = getDB();
     // emotional_statesテーブルがなければスキップ（PostgreSQL移行前はテーブルが存在しない）
-    db.prepare(
+    await db.prepare(
       'INSERT INTO emotional_states (user_id, valence, arousal, dominant_emotion, trigger_message) VALUES (?, ?, ?, ?, ?)'
     ).run(userId, state.valence, state.arousal, state.dominantEmotion, triggerMessage.slice(0, 200));
   } catch {
@@ -47,10 +47,10 @@ export function saveEmotionalState(userId: string, state: EmotionalState, trigge
 }
 
 /** 直近の感情状態を取得 */
-export function getLatestEmotionalState(userId: string): EmotionalState | null {
+export async function getLatestEmotionalState(userId: string): Promise<EmotionalState | null> {
   try {
     const db = getDB();
-    const row = db.prepare(
+    const row = await db.prepare(
       'SELECT valence, arousal, dominant_emotion FROM emotional_states WHERE user_id = ? ORDER BY updated_at DESC LIMIT 1'
     ).get(userId) as { valence: number; arousal: number; dominant_emotion: string } | undefined;
     if (!row) return null;

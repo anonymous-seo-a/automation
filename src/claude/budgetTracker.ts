@@ -25,7 +25,7 @@ export async function trackUsage(
   try {
     const cost = calcCost(model, inputTokens, outputTokens);
     const db = getDB();
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO api_usage (model, input_tokens, output_tokens, cost_usd, task_id)
       VALUES (?, ?, ?, ?, ?)
     `).run(model, inputTokens, outputTokens, cost, taskId || null);
@@ -36,20 +36,20 @@ export async function trackUsage(
 
 export async function getDailySpend(): Promise<number> {
   const db = getDB();
-  const row = db.prepare(`
+  const row = await db.prepare(`
     SELECT COALESCE(SUM(cost_usd), 0) as total
     FROM api_usage
-    WHERE date(created_at) = date('now')
+    WHERE created_at::date = CURRENT_DATE
   `).get() as { total: number };
   return row.total;
 }
 
 export async function getMonthlySpend(): Promise<number> {
   const db = getDB();
-  const row = db.prepare(`
+  const row = await db.prepare(`
     SELECT COALESCE(SUM(cost_usd), 0) as total
     FROM api_usage
-    WHERE strftime('%Y-%m', created_at) = strftime('%Y-%m', 'now')
+    WHERE date_trunc('month', created_at) = date_trunc('month', NOW())
   `).get() as { total: number };
   return row.total;
 }
@@ -82,10 +82,10 @@ export async function getBudgetReport(): Promise<string> {
 /** 週間使用量 */
 export async function getWeeklySpend(): Promise<number> {
   const db = getDB();
-  const row = db.prepare(`
+  const row = await db.prepare(`
     SELECT COALESCE(SUM(cost_usd), 0) as total
     FROM api_usage
-    WHERE created_at >= datetime('now', '-7 days')
+    WHERE created_at >= NOW() - INTERVAL '7 days'
   `).get() as { total: number };
   return row.total;
 }
@@ -93,12 +93,12 @@ export async function getWeeklySpend(): Promise<number> {
 /** 今月のモデル別内訳 */
 export async function getMonthlyBreakdown(): Promise<string> {
   const db = getDB();
-  const byModel = db.prepare(`
+  const byModel = await db.prepare(`
     SELECT model,
            COALESCE(SUM(cost_usd), 0) as total,
            COUNT(*) as calls
     FROM api_usage
-    WHERE strftime('%Y-%m', created_at) = strftime('%Y-%m', 'now')
+    WHERE date_trunc('month', created_at) = date_trunc('month', NOW())
     GROUP BY model
     ORDER BY total DESC
   `).all() as Array<{ model: string; total: number; calls: number }>;

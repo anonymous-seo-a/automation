@@ -22,7 +22,7 @@ export async function loadKnowledgeFiles(dir: string): Promise<void> {
     ON CONFLICT(id) DO UPDATE SET
       content = excluded.content,
       version = version + 1,
-      updated_at = datetime('now')
+      updated_at = NOW()
   `);
 
   for (const file of mdFiles) {
@@ -31,7 +31,7 @@ export async function loadKnowledgeFiles(dir: string): Promise<void> {
 
     for (const section of sections) {
       const id = `${file}::${section.heading || 'root'}`;
-      upsert.run(id, file, section.heading, section.content);
+      await upsert.run(id, file, section.heading, section.content);
     }
     logger.info(`ナレッジロード完了: ${file} (${sections.length}セクション)`);
   }

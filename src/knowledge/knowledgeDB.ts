@@ -1,6 +1,6 @@
 import { getDB } from '../db/database';
 
-export function searchKnowledge(query: string): string[] {
+export async function searchKnowledge(query: string): Promise<string[]> {
   const db = getDB();
   const terms = query.split(/\s+/).filter(Boolean);
   if (terms.length === 0) return [];
@@ -8,7 +8,7 @@ export function searchKnowledge(query: string): string[] {
   const where = terms.map(() => `content LIKE ?`).join(' AND ');
   const params = terms.map(t => `%${t}%`);
 
-  const rows = db.prepare(`
+  const rows = await db.prepare(`
     SELECT content FROM knowledge
     WHERE ${where}
     ORDER BY updated_at DESC
@@ -18,38 +18,38 @@ export function searchKnowledge(query: string): string[] {
   return rows.map(r => r.content);
 }
 
-export function getKnowledgeByFile(fileName: string): string {
+export async function getKnowledgeByFile(fileName: string): Promise<string> {
   const db = getDB();
-  const rows = db.prepare(`
+  const rows = await db.prepare(`
     SELECT content FROM knowledge
     WHERE file_name = ?
-    ORDER BY rowid ASC
+    ORDER BY id ASC
   `).all(fileName) as Array<{ content: string }>;
 
   return rows.map(r => r.content).join('\n\n');
 }
 
-export function updateKnowledge(
+export async function updateKnowledge(
   id: string,
   newContent: string,
   changedBy: string = 'line'
-): void {
+): Promise<void> {
   const db = getDB();
-  const current = db.prepare(
+  const current = await db.prepare(
     `SELECT content FROM knowledge WHERE id = ?`
   ).get(id) as { content: string } | undefined;
 
   if (current) {
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO knowledge_history
         (knowledge_id, content_before, content_after, changed_by)
       VALUES (?, ?, ?, ?)
     `).run(id, current.content, newContent, changedBy);
   }
 
-  db.prepare(`
+  await db.prepare(`
     UPDATE knowledge
-    SET content = ?, version = version + 1, updated_at = datetime('now')
+    SET content = ?, version = version + 1, updated_at = NOW()
     WHERE id = ?
   `).run(newContent, id);
 }

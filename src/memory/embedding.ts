@@ -141,14 +141,25 @@ export function cosineSimilarity(a: number[], b: number[]): number {
   return denom === 0 ? 0 : dot / denom;
 }
 
-/** embeddingをBuffer（Float32Array）に変換して保存用に */
-export function embeddingToBuffer(embedding: number[]): Buffer {
-  const float32 = new Float32Array(embedding);
-  return Buffer.from(float32.buffer);
+/** embeddingをpgvector文字列に変換して保存用に */
+export function embeddingToSql(embedding: number[]): string {
+  return '[' + embedding.join(',') + ']';
 }
 
-/** BufferからFloat32Arrayを復元 */
-export function bufferToEmbedding(buf: Buffer): number[] {
-  const float32 = new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4);
-  return Array.from(float32);
+/** 後方互換エイリアス */
+export const embeddingToBuffer = embeddingToSql as (embedding: number[]) => any;
+
+/** pgvector文字列からnumber[]を復元（レガシーBuffer形式にも対応） */
+export function parseEmbedding(input: string | Buffer): number[] {
+  // レガシーBuffer形式の場合
+  if (Buffer.isBuffer(input)) {
+    const float32 = new Float32Array(input.buffer, input.byteOffset, input.byteLength / 4);
+    return Array.from(float32);
+  }
+  // pgvector文字列形式: '[0.1,0.2,...]'
+  const trimmed = input.replace(/^\[|\]$/g, '');
+  return trimmed.split(',').map(Number);
 }
+
+/** 後方互換エイリアス */
+export const bufferToEmbedding = parseEmbedding as (input: any) => number[];

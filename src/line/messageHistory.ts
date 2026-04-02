@@ -7,10 +7,10 @@ interface HistoryMessage {
 }
 
 /** ユーザーまたはアシスタントのメッセージを保存 */
-export function saveMessage(userId: string, role: 'user' | 'assistant', content: string): void {
+export async function saveMessage(userId: string, role: 'user' | 'assistant', content: string): Promise<void> {
   try {
     const db = getDB();
-    db.prepare(
+    await db.prepare(
       'INSERT INTO message_history (user_id, role, content) VALUES (?, ?, ?)'
     ).run(userId, role, content);
   } catch (err) {
@@ -19,9 +19,9 @@ export function saveMessage(userId: string, role: 'user' | 'assistant', content:
 }
 
 /** 直近N件の会話履歴を取得（Claude messages形式で返す） */
-export function getRecentHistory(userId: string, limit = 20): HistoryMessage[] {
+export async function getRecentHistory(userId: string, limit = 20): Promise<HistoryMessage[]> {
   const db = getDB();
-  const rows = db.prepare(
+  const rows = await db.prepare(
     'SELECT role, content FROM message_history WHERE user_id = ? ORDER BY created_at DESC LIMIT ?'
   ).all(userId, limit) as HistoryMessage[];
 
@@ -30,9 +30,9 @@ export function getRecentHistory(userId: string, limit = 20): HistoryMessage[] {
 }
 
 /** 古い履歴を削除（7日より前） */
-export function cleanOldHistory(): void {
+export async function cleanOldHistory(): Promise<void> {
   const db = getDB();
-  db.prepare(
-    "DELETE FROM message_history WHERE created_at < datetime('now', '-7 days')"
+  await db.prepare(
+    "DELETE FROM message_history WHERE created_at < NOW() - INTERVAL '7 days'"
   ).run();
 }

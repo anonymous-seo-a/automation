@@ -1,6 +1,6 @@
 import { getDB } from '../db/database';
 import { logger } from '../utils/logger';
-import { embed, embedQuery, cosineSimilarity, embeddingToBuffer, bufferToEmbedding } from './embedding';
+import { embed, embedQuery, cosineSimilarity, embeddingToSql, parseEmbedding } from './embedding';
 import { getMemoriesCache, addToMemoriesCache, isCacheInitialized } from './embeddingCache';
 
 export type MemoryType = 'profile' | 'project' | 'memo' | 'session_summary' | 'consolidated';
@@ -12,7 +12,7 @@ export interface Memory {
   key: string;
   content: string;
   importance: number;
-  embedding: Buffer | null;
+  embedding: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -45,30 +45,30 @@ export async function saveMemoryWithEmbedding(
   try {
     const db = getDB();
     const imp = importance ?? getDefaultImportance(type);
-    let embeddingBuf: Buffer | null = null;
+    let embeddingSql: string | null = null;
     let vec: number[] | null = null;
 
     try {
       // contentのみをembedする（keyにタイムスタンプ等が含まれるとノイズになる）
       vec = await embed(content);
-      embeddingBuf = embeddingToBuffer(vec);
+      embeddingSql = embeddingToSql(vec);
     } catch (err) {
       logger.warn('Embedding取得失敗（テキストのみ保存）', { err: err instanceof Error ? err.message : String(err) });
     }
 
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO memories (user_id, type, key, content, importance, embedding)
       VALUES (?, ?, ?, ?, ?, ?)
       ON CONFLICT(user_id, type, key) DO UPDATE SET
         content = excluded.content,
         importance = excluded.importance,
         embedding = excluded.embedding,
-        updated_at = datetime('now')
-    `).run(userId, type, key, content, imp, embeddingBuf);
+        updated_at = NOW()
+    `).run(userId, type, key, content, imp, embeddingSql);
 
     // キャッシュ更新
     if (vec && isCacheInitialized()) {
-      const saved = db.prepare(
+      const saved = await db.prepare(
         'SELECT id FROM memories WHERE user_id = ? AND type = ? AND key = ?'
       ).get(userId, type, key) as { id: number } | undefined;
       if (saved) {
@@ -82,29 +82,32 @@ export async function saveMemoryWithEmbedding(
   }
 }
 
-/** 同期版（embedding無し、互換性のため） */
-export function saveMemorySync(
+/** 記憶保存（embedding無し） */
+export async function saveMemory(
   userId: string,
   type: MemoryType,
   key: string,
   content: string,
   importance?: number,
-): void {
+): Promise<void> {
   try {
     const db = getDB();
     const imp = importance ?? getDefaultImportance(type);
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO memories (user_id, type, key, content, importance)
       VALUES (?, ?, ?, ?, ?)
       ON CONFLICT(user_id, type, key) DO UPDATE SET
         content = excluded.content,
         importance = excluded.importance,
-        updated_at = datetime('now')
+        updated_at = NOW()
     `).run(userId, type, key, content, imp);
   } catch (err) {
     logger.error('記憶保存失敗', { userId, type, key, err });
   }
 }
+
+/** 後方互換エイリアス */
+export const saveMemorySync = saveMemory;
 
 /** 意味検索: クエリに関連する記憶をTop-K取得（時間減衰+重要度考慮） */
 export async function searchByMeaning(
@@ -134,22 +137,24 @@ export async function searchByMeaning(
 
       // top結果のidでDBから完全なMemoryを取得
       const db = getDB();
-      return topIds.map(r => {
-        const full = db.prepare('SELECT * FROM memories WHERE id = ?').get(r.id) as Memory;
-        return { memory: full, score: r.score };
-      }).filter(r => r.memory);
+      const results: MemorySearchResult[] = [];
+      for (const r of topIds) {
+        const full = await db.prepare('SELECT * FROM memories WHERE id = ?').get(r.id) as Memory;
+        if (full) results.push({ memory: full, score: r.score });
+      }
+      return results;
     }
 
     // キャッシュ未初期化時はDB直接
     const db = getDB();
-    const rows = db.prepare(
+    const rows = await db.prepare(
       'SELECT * FROM memories WHERE user_id = ? AND embedding IS NOT NULL'
     ).all(userId) as Memory[];
 
     const scored: MemorySearchResult[] = [];
     for (const row of rows) {
       if (!row.embedding) continue;
-      const memVec = bufferToEmbedding(row.embedding as Buffer);
+      const memVec = parseEmbedding(row.embedding as string);
       const similarity = cosineSimilarity(queryVec, memVec);
       const daysSince = (Date.now() - new Date(row.updated_at).getTime()) / (1000 * 60 * 60 * 24);
       const timeDecay = Math.exp(-daysSince / 60);
@@ -167,13 +172,13 @@ export async function searchByMeaning(
 }
 
 /** キーワード検索（フォールバック用） */
-function keywordSearchFallback(
+async function keywordSearchFallback(
   userId: string,
   query: string,
   limit: number,
-): MemorySearchResult[] {
+): Promise<MemorySearchResult[]> {
   const db = getDB();
-  const rows = db.prepare(
+  const rows = await db.prepare(
     'SELECT * FROM memories WHERE user_id = ? AND (key LIKE ? OR content LIKE ?) ORDER BY importance DESC, updated_at DESC LIMIT ?'
   ).all(userId, `%${query}%`, `%${query}%`, limit) as Memory[];
 
@@ -181,31 +186,31 @@ function keywordSearchFallback(
 }
 
 /** 全記憶を取得 */
-export function getAllMemories(userId: string, type?: MemoryType): Memory[] {
+export async function getAllMemories(userId: string, type?: MemoryType): Promise<Memory[]> {
   const db = getDB();
   if (type) {
-    return db.prepare(
+    return await db.prepare(
       'SELECT * FROM memories WHERE user_id = ? AND type = ? ORDER BY importance DESC, updated_at DESC'
     ).all(userId, type) as Memory[];
   }
-  return db.prepare(
+  return await db.prepare(
     'SELECT * FROM memories WHERE user_id = ? ORDER BY type, importance DESC, updated_at DESC'
   ).all(userId) as Memory[];
 }
 
 /** 記憶を削除 */
-export function deleteMemory(userId: string, type: MemoryType, key: string): boolean {
+export async function deleteMemory(userId: string, type: MemoryType, key: string): Promise<boolean> {
   const db = getDB();
-  const result = db.prepare(
+  const result = await db.prepare(
     'DELETE FROM memories WHERE user_id = ? AND type = ? AND key = ?'
   ).run(userId, type, key);
   return result.changes > 0;
 }
 
 /** 記憶の件数 */
-export function getMemoryCount(userId: string): number {
+export async function getMemoryCount(userId: string): Promise<number> {
   const db = getDB();
-  const row = db.prepare(
+  const row = await db.prepare(
     'SELECT COUNT(*) as cnt FROM memories WHERE user_id = ?'
   ).get(userId) as { cnt: number };
   return row.cnt;
@@ -213,7 +218,7 @@ export function getMemoryCount(userId: string): number {
 
 /** スマートコンテキスト構築: 現在のメッセージに関連する記憶だけ注入 */
 export async function buildSmartContext(userId: string, currentMessage: string): Promise<string> {
-  const allMemories = getAllMemories(userId);
+  const allMemories = await getAllMemories(userId);
   if (allMemories.length === 0) return '';
 
   // consolidated（統合プロフィール）は常に含める

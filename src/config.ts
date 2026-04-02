@@ -25,7 +25,11 @@ export const config = {
     env: process.env.NODE_ENV || 'development',
   },
   db: {
-    path: process.env.DB_PATH || './data/mothership.db',
+    host: process.env.DB_HOST || 'localhost',
+    port: parseInt(process.env.DB_PORT || '5432', 10),
+    name: process.env.DB_NAME || 'mothership_db',
+    user: process.env.DB_USER || 'mothership',
+    password: process.env.DB_PASSWORD || '',
   },
   log: {
     dir: process.env.LOG_DIR || './logs',

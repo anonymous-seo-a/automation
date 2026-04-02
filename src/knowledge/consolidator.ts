@@ -24,7 +24,7 @@ export async function consolidateKnowledge(userId: string): Promise<Consolidatio
   // 直近30日の記憶を取得
   const db = getDB();
   const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
-  const recentMemories = db.prepare(
+  const recentMemories = await db.prepare(
     "SELECT * FROM memories WHERE user_id = ? AND updated_at >= ? ORDER BY updated_at DESC"
   ).all(userId, thirtyDaysAgo) as Array<{ type: string; key: string; content: string; updated_at: string }>;
 
@@ -97,7 +97,7 @@ export async function consolidateKnowledge(userId: string): Promise<Consolidatio
   // pending_updates に保存
   if (pendingContents.length > 0) {
     const updateId = randomUUID();
-    db.prepare(
+    await db.prepare(
       "INSERT INTO pending_updates (id, user_id, update_type, content, status) VALUES (?, ?, ?, ?, 'pending')"
     ).run(updateId, userId, 'knowledge_consolidation', JSON.stringify(pendingContents));
     logger.info('ナレッジ統合結果をpending_updatesに保存', { updateId, fileCount: pendingContents.length });
@@ -140,7 +140,7 @@ function generateDiffSummary(oldContent: string, newContent: string, fileName: s
  */
 export async function applyPendingUpdate(userId: string): Promise<string> {
   const db = getDB();
-  const pending = db.prepare(
+  const pending = await db.prepare(
     "SELECT * FROM pending_updates WHERE user_id = ? AND status = 'pending' AND update_type = 'knowledge_consolidation' ORDER BY created_at DESC LIMIT 1"
   ).get(userId) as { id: string; content: string } | undefined;
 
@@ -162,7 +162,7 @@ export async function applyPendingUpdate(userId: string): Promise<string> {
   }
 
   // ステータス更新
-  db.prepare(
+  await db.prepare(
     "UPDATE pending_updates SET status = 'applied' WHERE id = ?"
   ).run(pending.id);
 

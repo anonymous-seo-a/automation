@@ -1,5 +1,5 @@
 import { getDB } from '../db/database';
-import { bufferToEmbedding } from './embedding';
+import { parseEmbedding } from './embedding';
 import { logger } from '../utils/logger';
 
 interface CachedEmbedding {
@@ -18,13 +18,13 @@ const agentMemoriesCache = new Map<string, CachedEmbedding[]>(); // key: agent r
 let initialized = false;
 
 /** 起動時にDBから全embeddingをメモリにロード */
-export function initEmbeddingCache(): void {
+export async function initEmbeddingCache(): Promise<void> {
   const db = getDB();
 
   // memories テーブル
-  const memories = db.prepare(
+  const memories = await db.prepare(
     'SELECT id, user_id, type, key, embedding, importance, updated_at FROM memories WHERE embedding IS NOT NULL'
-  ).all() as Array<{ id: number; user_id: string; type: string; key: string; embedding: Buffer; importance: number; updated_at: string }>;
+  ).all() as Array<{ id: number; user_id: string; type: string; key: string; embedding: string; importance: number; updated_at: string }>;
 
   for (const row of memories) {
     const userId = row.user_id;
@@ -34,7 +34,7 @@ export function initEmbeddingCache(): void {
         id: row.id,
         type: row.type,
         key: row.key,
-        embedding: bufferToEmbedding(row.embedding),
+        embedding: parseEmbedding(row.embedding),
         importance: row.importance || 3,
         updated_at: row.updated_at,
       });
@@ -44,9 +44,9 @@ export function initEmbeddingCache(): void {
   }
 
   // agent_memories テーブル
-  const agentMems = db.prepare(
+  const agentMems = await db.prepare(
     'SELECT id, agent, type, key, embedding, importance, updated_at FROM agent_memories WHERE embedding IS NOT NULL'
-  ).all() as Array<{ id: number; agent: string; type: string; key: string; embedding: Buffer; importance: number; updated_at: string }>;
+  ).all() as Array<{ id: number; agent: string; type: string; key: string; embedding: string; importance: number; updated_at: string }>;
 
   for (const row of agentMems) {
     const agent = row.agent;
@@ -56,7 +56,7 @@ export function initEmbeddingCache(): void {
         id: row.id,
         type: row.type,
         key: row.key,
-        embedding: bufferToEmbedding(row.embedding),
+        embedding: parseEmbedding(row.embedding),
         importance: row.importance || 3,
         updated_at: row.updated_at,
       });

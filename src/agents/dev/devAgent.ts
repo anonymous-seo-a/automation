@@ -191,10 +191,10 @@ export class DevAgent implements Agent {
   async handleMessage(userId: string, text: string): Promise<void> {
     try {
       if (/開発(キャンセル|中止|やめ)|やめて|やめる|キャンセル|別の話/.test(text.trim())) {
-        const conv = getActiveConversation(userId);
+        const conv = await getActiveConversation(userId);
         if (conv) {
           this.cleanupConversation(conv.id, conv.user_id);
-          cancelConversation(conv.id);
+          await cancelConversation(conv.id);
           dbLog('info', 'dev-agent', `開発キャンセル: ${conv.topic}`, { convId: conv.id });
           await sendLineMessage(userId, '開発を中止しました。');
         } else {
@@ -203,7 +203,7 @@ export class DevAgent implements Agent {
         return;
       }
 
-      let conv = getActiveConversation(userId);
+      let conv = await getActiveConversation(userId);
 
       if (!conv) {
         // 予算ゲート: 月次上限到達時は新規開発を拒否
@@ -213,7 +213,7 @@ export class DevAgent implements Agent {
           return;
         }
 
-        conv = createConversation(userId, text);
+        conv = await createConversation(userId, text);
         dbLog('info', 'dev-agent', `新規開発会話: ${text.slice(0, 60)}`, { convId: conv.id });
         await sendLineMessage(userId,
           `🛠 開発モード開始\n「${text.slice(0, 40)}」について、いくつか確認させてください。\n\n` +
@@ -243,7 +243,7 @@ export class DevAgent implements Agent {
           break;
         default:
           dbLog('warn', 'dev-agent', `想定外ステータス: ${conv.status}`, { convId: conv.id });
-          updateConversationStatus(conv.id, 'failed');
+          await updateConversationStatus(conv.id, 'failed');
           await sendLineMessage(userId, `開発が不整合な状態になっています（ステータス: ${conv.status}）。新しい開発依頼を送ってください。`);
           break;
       }
@@ -278,7 +278,7 @@ export class DevAgent implements Agent {
 
       // hearing/defining フェーズはstuckに移行せず、即座にfailed + 通知
       if (phaseName === 'hearing' || phaseName === 'defining') {
-        updateConversationStatus(conv.id, 'failed');
+        await updateConversationStatus(conv.id, 'failed');
         emitDevEvent({ type: 'phase_change', convId: conv.id, agent: 'system', data: { phase: 'failed', reason: errMsg.slice(0, 100) } });
         // 529/500エラーは人間向けメッセージに変換
         const isOverloaded = /529|overloaded|500.*Internal server/i.test(errMsg);
@@ -291,7 +291,7 @@ export class DevAgent implements Agent {
 
       // implementing/stuck フェーズは途中作業を保全してstuckに移行
       if (conv.status !== 'stuck') {
-        updateConversationStatus(conv.id, 'stuck');
+        await updateConversationStatus(conv.id, 'stuck');
         emitDevEvent({ type: 'phase_change', convId: conv.id, agent: 'system', data: { phase: 'stuck', reason: errMsg.slice(0, 100) } });
       }
 
@@ -395,7 +395,7 @@ export class DevAgent implements Agent {
 
     // 1. 直近LINE会話（10件）— PMが会話の流れを把握
     try {
-      const recentMessages = getRecentHistory(userId, 10);
+      const recentMessages = await getRecentHistory(userId, 10);
       if (recentMessages.length > 0) {
         ctx += '## 直前のLINE会話（文脈把握用）\n';
         for (const msg of recentMessages) {
@@ -409,7 +409,7 @@ export class DevAgent implements Agent {
     }
 
     // 2. 過去開発実績 — 既存機能の把握
-    const devHistory = buildDevHistorySummary(5);
+    const devHistory = await buildDevHistorySummary(5);
     if (devHistory) {
       ctx += devHistory + '\n\n';
     }
@@ -428,15 +428,15 @@ export class DevAgent implements Agent {
   }
 
   private async runHearing(conv: DevConversation, initialMessage: string): Promise<void> {
-    appendHearingLog(conv.id, 'user', initialMessage);
+    await appendHearingLog(conv.id, 'user', initialMessage);
     dbLog('info', 'dev-agent', `[PM] ヒアリング開始: round 1/${MAX_HEARING_ROUNDS}`, { convId: conv.id });
     emitDevEvent({ type: 'phase_change', convId: conv.id, agent: 'system', data: { phase: 'hearing', topic: initialMessage.slice(0, 60) } });
     emitDevEvent({ type: 'agent_activity', convId: conv.id, agent: 'pm', data: { status: 'thinking', message: 'ヒアリング分析中...' } });
 
-    const updatedConv = getConversation(conv.id);
+    const updatedConv = await getConversation(conv.id);
     if (!updatedConv) {
       dbLog('error', 'dev-agent', `[PM] 会話データ消失: ${conv.id}`, { convId: conv.id });
-      updateConversationStatus(conv.id, 'failed');
+      await updateConversationStatus(conv.id, 'failed');
       await sendLineMessage(conv.user_id, '会話データの読み込みに失敗しました。もう一度開発依頼を送ってください。').catch(() => {});
       return;
     }
@@ -462,15 +462,15 @@ export class DevAgent implements Agent {
   }
 
   private async handleHearing(conv: DevConversation, userReply: string): Promise<void> {
-    appendHearingLog(conv.id, 'user', userReply);
+    await appendHearingLog(conv.id, 'user', userReply);
 
-    const round = getHearingRound(conv.id);
-    dbLog('info', 'dev-agent', `[PM] ヒアリング回答��信: round ${round}/${MAX_HEARING_ROUNDS}`, { convId: conv.id });
+    const round = await getHearingRound(conv.id);
+    dbLog('info', 'dev-agent', `[PM] ヒアリング回答受信: round ${round}/${MAX_HEARING_ROUNDS}`, { convId: conv.id });
 
-    const updatedConv = getConversation(conv.id);
+    const updatedConv = await getConversation(conv.id);
     if (!updatedConv) {
       dbLog('error', 'dev-agent', `[PM] 会話データ消失: ${conv.id}`, { convId: conv.id });
-      updateConversationStatus(conv.id, 'failed');
+      await updateConversationStatus(conv.id, 'failed');
       await sendLineMessage(conv.user_id, '会話データの読み込みに失敗しました。もう一���開発依頼を送ってください。').catch(() => {});
       return;
     }
@@ -478,7 +478,7 @@ export class DevAgent implements Agent {
 
     if (round >= MAX_HEARING_ROUNDS) {
       dbLog('info', 'dev-agent', '[PM] ヒアリング最大回数到達 → 要件定義へ', { convId: conv.id });
-      appendHearingLog(conv.id, 'agent', 'ヒアリング最大回数到達。要件定義に進みます。');
+      await appendHearingLog(conv.id, 'agent', 'ヒアリング最大回数到達。要件定義に進みます。');
       await this.transitionToDefining(conv);
       return;
     }
@@ -504,7 +504,7 @@ export class DevAgent implements Agent {
 
   private async processHearingResponse(conv: DevConversation, text: string): Promise<void> {
     // キャンセル済みの会話はスキップ（Opusリトライ中にユーザーがキャンセルした場合）
-    const freshConv = getConversation(conv.id);
+    const freshConv = await getConversation(conv.id);
     if (!freshConv || freshConv.status === 'failed' || freshConv.status === 'deployed') {
       dbLog('info', 'dev-agent', `[PM] 会話終了済み(${freshConv?.status || 'deleted'}) → ヒアリング応答スキップ`, { convId: conv.id });
       return;
@@ -514,20 +514,20 @@ export class DevAgent implements Agent {
 
     if (parsed && parsed.hearing_complete) {
       dbLog('info', 'dev-agent', '[PM] ヒアリング完了 → 要件定義へ', { convId: conv.id });
-      appendHearingLog(conv.id, 'agent', parsed.summary || 'ヒアリング完了');
-      saveTeamConversation('pm_hearing', ['pm', 'user'], [
+      await appendHearingLog(conv.id, 'agent', parsed.summary || 'ヒアリング完了');
+      await saveTeamConversation('pm_hearing', ['pm', 'user'], [
         { role: 'pm', message: parsed.summary || 'ヒアリング完了', timestamp: new Date().toISOString() },
       ], conv.id, parsed.summary);
       await this.transitionToDefining(conv);
     } else if (parsed && parsed.questions && Array.isArray(parsed.questions) && parsed.questions.length > 0) {
       const questions = (parsed.questions as string[]).slice(0, 3);
       const msg = questions.map((q: string, i: number) => `${i + 1}. ${q}`).join('\n') + '\n\n（「やめる」で中止できます）';
-      appendHearingLog(conv.id, 'agent', msg);
+      await appendHearingLog(conv.id, 'agent', msg);
       emitDevEvent({ type: 'agent_message', convId: conv.id, agent: 'pm', data: { message: questions[0]?.slice(0, 80) || 'ヒアリング質問' } });
       await sendLineMessage(conv.user_id, msg);
     } else {
       dbLog('warn', 'dev-agent', `[PM] ヒアリング応答がJSON外: ${text.slice(0, 80)}`, { convId: conv.id });
-      appendHearingLog(conv.id, 'agent', text);
+      await appendHearingLog(conv.id, 'agent', text);
       await sendLineMessage(conv.user_id, text);
     }
   }
@@ -537,15 +537,15 @@ export class DevAgent implements Agent {
   // ========================================
 
   private async transitionToDefining(conv: DevConversation): Promise<void> {
-    updateConversationStatus(conv.id, 'defining');
+    await updateConversationStatus(conv.id, 'defining');
     dbLog('info', 'dev-agent', '[PM] 要件定義書作成開始', { convId: conv.id });
     emitDevEvent({ type: 'phase_change', convId: conv.id, agent: 'system', data: { phase: 'defining' } });
     emitDevEvent({ type: 'agent_activity', convId: conv.id, agent: 'pm', data: { status: 'thinking', message: '要件定義書作成中...' } });
 
-    const updatedConv = getConversation(conv.id);
+    const updatedConv = await getConversation(conv.id);
     if (!updatedConv) {
       dbLog('error', 'dev-agent', `[PM] 会話データ消失: ${conv.id}`, { convId: conv.id });
-      updateConversationStatus(conv.id, 'failed');
+      await updateConversationStatus(conv.id, 'failed');
       await sendLineMessage(conv.user_id, '会話データの読み込みに失敗しました。もう一度開発依頼を送ってください。').catch(() => {});
       return;
     }
@@ -600,9 +600,9 @@ ${rawRequirements}
       await sendLineMessage(conv.user_id, '※ 要件の品質チェック（Self-Refine）をスキップしました。内容を特に注意して確認してください。').catch(() => {});
     }
 
-    setRequirements(conv.id, text);
+    await setRequirements(conv.id, text);
     dbLog('info', 'dev-agent', `[PM] 要件定義書作成完了 (${text.length}文字)`, { convId: conv.id });
-    saveTeamConversation('pm_requirements', ['pm'], [
+    await saveTeamConversation('pm_requirements', ['pm'], [
       { role: 'pm', message: text, timestamp: new Date().toISOString() },
     ], conv.id, `要件定義書作成完了 (${text.length}文字)`);
     await sendLineMessage(conv.user_id, text);
@@ -613,7 +613,7 @@ ${rawRequirements}
     dbLog('info', 'dev-agent', `[PM] 要件定義フェーズ応答: ${userReply.slice(0, 40)}`, { convId: conv.id });
 
     // 要件が未生成の場合は何もしない（webhookで弾くが二重安全）
-    const freshConv = getConversation(conv.id);
+    const freshConv = await getConversation(conv.id);
     if (!freshConv?.requirements) {
       dbLog('warn', 'dev-agent', '[PM] 要件未生成のまま handleDefining に到達', { convId: conv.id });
       await sendLineMessage(conv.user_id, '要件定義書を作成中です。完了までお待ちください。');
@@ -621,16 +621,16 @@ ${rawRequirements}
     }
 
     if (/^(ok|おk|はい|いいよ|お願い|問題ない|大丈夫|進めて|実装して|それで|それでいい|いいと思う|よさそう|良さそう)$/i.test(userReply.trim())) {
-      updateConversationStatus(freshConv.id, 'approved');
+      await updateConversationStatus(freshConv.id, 'approved');
       dbLog('info', 'dev-agent', '[PM] 要件承認 → 実装開始', { convId: conv.id });
       emitDevEvent({ type: 'phase_change', convId: conv.id, agent: 'system', data: { phase: 'approved' } });
       await sendLineMessage(conv.user_id, '実装を開始します。チーム体制で進めます。\n（PM → エンジニア → レビュアー の順で各ファイルを処理）');
       // 実装は非同期で実行（safeExecutePhaseの5分タイムアウトを回避）
       // runImplementation は独自のtry/catch/finallyで全てのエラーを処理する
-      this.runImplementation(conv).catch(err => {
+      this.runImplementation(conv).catch(async (err) => {
         const errMsg = err instanceof Error ? err.message : String(err);
         dbLog('error', 'dev-agent', `[チーム] 実装未捕捉エラー: ${errMsg}`, { convId: conv.id });
-        updateConversationStatus(conv.id, 'failed');
+        await updateConversationStatus(conv.id, 'failed');
         sendLineMessage(conv.user_id, `実装中に予期しないエラー:\n${errMsg.slice(0, 300)}\n\n新しい開発依頼でリトライできます。`).catch(() => {});
       });
     } else {
@@ -647,9 +647,9 @@ ${rawRequirements}
         model: 'opus',
       });
 
-      setRequirements(conv.id, text);
+      await setRequirements(conv.id, text);
       dbLog('info', 'dev-agent', `[PM] 要件修正完了 (${text.length}文字)`, { convId: conv.id });
-      saveTeamConversation('pm_requirements_revision', ['pm', 'user'], [
+      await saveTeamConversation('pm_requirements_revision', ['pm', 'user'], [
         { role: 'user', message: userReply, timestamp: new Date().toISOString() },
         { role: 'pm', message: text, timestamp: new Date().toISOString() },
       ], conv.id, `要件修正完了 (${text.length}文字)`);
@@ -663,14 +663,14 @@ ${rawRequirements}
   // ========================================
 
   private async runImplementation(conv: DevConversation, resumeFrom?: { branchName: string; subtasks: Subtask[]; completedFiles: Array<{ path: string; content: string }>; startIndex: number }): Promise<void> {
-    updateConversationStatus(conv.id, 'implementing');
+    await updateConversationStatus(conv.id, 'implementing');
     dbLog('info', 'dev-agent', '[チーム] 実装フェーズ開始', { convId: conv.id });
     emitDevEvent({ type: 'phase_change', convId: conv.id, agent: 'system', data: { phase: 'implementing', topic: conv.topic } });
 
-    const updatedConv = getConversation(conv.id);
+    const updatedConv = await getConversation(conv.id);
     if (!updatedConv) {
       dbLog('error', 'dev-agent', `[チーム] 会話データ消失: ${conv.id}`, { convId: conv.id });
-      updateConversationStatus(conv.id, 'failed');
+      await updateConversationStatus(conv.id, 'failed');
       await sendLineMessage(conv.user_id, '会話データが見つかりません。新しい開発依頼を送ってください。').catch(() => {});
       return;
     }
@@ -717,7 +717,7 @@ ${rawRequirements}
         subtasks = await this.pmDecompose(updatedConv);
         dbLog('info', 'dev-agent', `[PM] サブタスク分解完了: ${subtasks.length}件`, { convId: conv.id });
         emitDevEvent({ type: 'agent_message', convId: conv.id, agent: 'pm', data: { message: `${subtasks.length}個のサブタスクに分解` } });
-        saveTeamConversation('pm_decompose', ['pm'], [
+        await saveTeamConversation('pm_decompose', ['pm'], [
           { role: 'pm', message: `サブタスク分解:\n${subtasks.map(s => `${s.index}. [${s.action}] ${s.path}: ${s.description}`).join('\n')}`, timestamp: new Date().toISOString() },
         ], conv.id, `${subtasks.length}個のサブタスクに分解`);
         await sendLineMessage(conv.user_id, `${subtasks.length}個のサブタスクに分解しました:\n${subtasks.map(s => `${s.index}. ${s.path}`).join('\n')}`);
@@ -749,7 +749,7 @@ ${rawRequirements}
 
       // バッチごとに実行
       for (const batch of batches) {
-        touchConversation(conv.id);
+        await touchConversation(conv.id);
 
         if (batch.subtasks.length === 1) {
           // === 単一サブタスク → 従来通り直列実行 ===
@@ -779,7 +779,7 @@ ${rawRequirements}
               }
             }
 
-            touchConversation(conv.id);
+            await touchConversation(conv.id);
             const modelIcon = result.model === 'opus' ? '🧠' : '⚡';
             await sendLineMessage(conv.user_id, `${subtask.index}/${subtasks.length} 完了: ${subtask.path} (${result.model} ${modelIcon})`);
           } catch (subtaskErr) {
@@ -797,12 +797,12 @@ ${rawRequirements}
               failedSubtaskIndex: failIdx >= 0 ? failIdx : 0,
               errorMessage: errMsg, phase: 'implementing', triedActions, dialogueLog: [],
             });
-            updateConversationStatus(conv.id, 'stuck');
+            await updateConversationStatus(conv.id, 'stuck');
             if (gitLockAcquired) { releaseGitLock(conv.id); gitLockAcquired = false; }
 
             const stuckUrl1 = `${config.admin.baseUrl}/admin/dev/${conv.id}`;
             if (isEscalation) {
-              saveTeamConversation('pm_escalation', ['pm', 'user'], [
+              await saveTeamConversation('pm_escalation', ['pm', 'user'], [
                 { role: 'pm', message: errMsg, timestamp: new Date().toISOString() },
               ], conv.id, 'ユーザーへエスカレーション');
               await sendLineMessage(conv.user_id,
@@ -863,7 +863,7 @@ ${rawRequirements}
             }
           }
 
-          touchConversation(conv.id);
+          await touchConversation(conv.id);
           emitDevEvent({ type: 'batch_complete', convId: conv.id, agent: 'engineer', data: { batchIndex: batch.batchIndex, succeeded: succeeded.length, failed: failed.length } });
           await sendLineMessage(conv.user_id,
             `バッチ${batch.batchIndex} 完了: ✅${succeeded.length} ${failed.length > 0 ? `❌${failed.length}` : ''}\n全体進捗: ${completedFiles.length}/${subtasks.length}`
@@ -882,7 +882,7 @@ ${rawRequirements}
               triedActions: [`バッチ${batch.batchIndex}の並列実行で${failed.length}件失敗`],
               dialogueLog: [],
             });
-            updateConversationStatus(conv.id, 'stuck');
+            await updateConversationStatus(conv.id, 'stuck');
             emitDevEvent({ type: 'phase_change', convId: conv.id, agent: 'system', data: { phase: 'stuck', reason: `バッチ${batch.batchIndex}で${failed.length}件失敗` } });
             if (gitLockAcquired) { releaseGitLock(conv.id); gitLockAcquired = false; }
 
@@ -899,10 +899,10 @@ ${rawRequirements}
         }
       }
 
-      setGeneratedFiles(conv.id, [...new Set(completedFiles.map(f => f.path))]);
+      await setGeneratedFiles(conv.id, [...new Set(completedFiles.map(f => f.path))]);
 
       // ビルド → デプロイ
-      updateConversationStatus(conv.id, 'testing');
+      await updateConversationStatus(conv.id, 'testing');
       dbLog('info', 'dev-agent', '[チーム] 全サブタスク完了 → ビルド開始', { convId: conv.id });
       emitDevEvent({ type: 'phase_change', convId: conv.id, agent: 'system', data: { phase: 'testing' } });
       await sendLineMessage(conv.user_id, `全${subtasks.length}ファイル完了。ビルド開始...`);
@@ -926,7 +926,7 @@ ${rawRequirements}
           triedActions: [`${completedFiles.length}ファイルまで実装完了後にエラー発生`],
           dialogueLog: [],
         });
-        updateConversationStatus(conv.id, 'stuck');
+        await updateConversationStatus(conv.id, 'stuck');
 
         const stuckUrl2 = `${config.admin.baseUrl}/admin/dev/${conv.id}`;
         const { category: errCat2, explanation: errExp2 } = classifyStuckError(errMsg, 'implementing');
@@ -944,14 +944,14 @@ ${rawRequirements}
         if (branchName) {
           await rollbackGit(branchName).catch(() => {});
         }
-        updateConversationStatus(conv.id, 'failed');
+        await updateConversationStatus(conv.id, 'failed');
         await sendLineMessage(conv.user_id,
           `実装中にエラーが発生しました:\n${errMsg.slice(0, 400)}\n\n` +
           `コードをロールバックしました。新しい依頼を送ってリトライできます。`
         ).catch(() => {});
 
         // C: 失敗時もレトロスペクティブを実行（学習蓄積のため）
-        const failedConv = getConversation(conv.id);
+        const failedConv = await getConversation(conv.id);
         if (failedConv) {
           import('./retrospective').then(({ runRetrospective }) =>
             runRetrospective(failedConv).catch(() => {})
@@ -973,7 +973,7 @@ ${rawRequirements}
     const ctx = this.stuckContextMap.get(conv.id);
     if (!ctx) {
       await sendLineMessage(conv.user_id, 'スタック情報が失われました。新しい開発依頼を送ってください。');
-      updateConversationStatus(conv.id, 'failed');
+      await updateConversationStatus(conv.id, 'failed');
       return;
     }
 
@@ -987,7 +987,7 @@ ${rawRequirements}
     if (/^(中止|キャンセル|やめ)/.test(normalizedReply)) {
       dbLog('info', 'dev-agent', '[stuck] ユーザーが中止を選択', { convId: conv.id });
       this.stuckContextMap.delete(conv.id);
-      updateConversationStatus(conv.id, 'failed');
+      await updateConversationStatus(conv.id, 'failed');
       const branchMsg = ctx.branchName ? `\n完了済みファイルはブランチ ${ctx.branchName} に残っています。` : '';
       await sendLineMessage(conv.user_id, `承知しました。開発を中止します。${branchMsg}`);
       return;
@@ -1069,7 +1069,7 @@ ${rawRequirements}
 
     const pmMessage = parsed.message || pmResponse;
     ctx.dialogueLog!.push({ role: 'pm', message: pmMessage });
-    saveTeamConversation('pm_stuck_dialogue', ['pm', 'user'], [
+    await saveTeamConversation('pm_stuck_dialogue', ['pm', 'user'], [
       { role: 'user', message: userReply, timestamp: new Date().toISOString() },
       { role: 'pm', message: pmMessage, timestamp: new Date().toISOString() },
     ], conv.id, `stuck対話: ${parsed.action}`);
@@ -1144,7 +1144,7 @@ ${rawRequirements}
       }
 
       dbLog('info', 'dev-agent', `[PM介入] レビュー分析完了: ${pmAdvice.slice(0, 100)}`, { convId: conv.id });
-      saveTeamConversation('pm_review_intervention', ['pm', 'reviewer', 'engineer'], [
+      await saveTeamConversation('pm_review_intervention', ['pm', 'reviewer', 'engineer'], [
         { role: 'reviewer', message: `差し戻しが繰り返されている: ${reviewFeedback.slice(0, 200)}`, timestamp: new Date().toISOString() },
         { role: 'pm', message: pmAdvice, timestamp: new Date().toISOString() },
       ], conv.id, `PM介入: ${subtask.path}`);
@@ -1166,7 +1166,7 @@ ${rawRequirements}
 
     if (action === 'cancel') {
       this.stuckContextMap.delete(conv.id);
-      updateConversationStatus(conv.id, 'failed');
+      await updateConversationStatus(conv.id, 'failed');
       const branchMsg = ctx.branchName ? `\n完了済みファイルはブランチ ${ctx.branchName} に残っています。` : '';
       await sendLineMessage(conv.user_id, `承知しました。開発を中止します。${branchMsg}`);
       return;
@@ -1182,10 +1182,10 @@ ${rawRequirements}
       this.resumingSet.add(conv.id);
       // ヒントがある場合はエラーメッセージに追記してautoFixに渡す
       if (hint) ctx.errorMessage += `\n\nDaikiからの追加情報: ${hint}`;
-      this.resumeBuildTest(conv, ctx).catch(err => {
+      this.resumeBuildTest(conv, ctx).catch(async (err) => {
         const errMsg = err instanceof Error ? err.message : String(err);
         dbLog('error', 'dev-agent', `[チーム] ${ctx.phase}再試行失敗: ${errMsg}`, { convId: conv.id });
-        updateConversationStatus(conv.id, 'failed');
+        await updateConversationStatus(conv.id, 'failed');
         sendLineMessage(conv.user_id, `再試行中にエラーが発生しました:\n${errMsg.slice(0, 300)}`).catch(() => {});
       }).finally(() => this.resumingSet.delete(conv.id));
       return;
@@ -1201,10 +1201,10 @@ ${rawRequirements}
         subtasks: ctx.subtasks,
         completedFiles: ctx.completedFiles,
         startIndex: ctx.failedSubtaskIndex + 1,
-      }).catch(err => {
+      }).catch(async (err) => {
         const errMsg = err instanceof Error ? err.message : String(err);
         dbLog('error', 'dev-agent', `[チーム] 再開エラー: ${errMsg}`, { convId: conv.id });
-        updateConversationStatus(conv.id, 'failed');
+        await updateConversationStatus(conv.id, 'failed');
         sendLineMessage(conv.user_id, `再開中にエラー:\n${errMsg.slice(0, 300)}`).catch(() => {});
       }).finally(() => this.resumingSet.delete(conv.id));
       return;
@@ -1223,10 +1223,10 @@ ${rawRequirements}
       subtasks: ctx.subtasks,
       completedFiles: ctx.completedFiles,
       startIndex: ctx.failedSubtaskIndex,
-    }).catch(err => {
+    }).catch(async (err) => {
       const errMsg = err instanceof Error ? err.message : String(err);
       dbLog('error', 'dev-agent', `[チーム] リトライエラー: ${errMsg}`, { convId: conv.id });
-      updateConversationStatus(conv.id, 'failed');
+      await updateConversationStatus(conv.id, 'failed');
       sendLineMessage(conv.user_id, `リトライ中にエラー:\n${errMsg.slice(0, 300)}`).catch(() => {});
     }).finally(() => this.resumingSet.delete(conv.id));
   }
@@ -1237,7 +1237,7 @@ ${rawRequirements}
     try {
       gitLockAcquired = await acquireGitLock(conv.id, 60_000);
       if (!gitLockAcquired) throw new Error('Gitロック取得失敗');
-      updateConversationStatus(conv.id, 'testing');
+      await updateConversationStatus(conv.id, 'testing');
       const phaseName = ctx.phase === 'build' ? 'ビルド' : 'テスト';
       await sendLineMessage(conv.user_id, `🔄 ${phaseName}から再試行中...`);
       await this.runBuildAndDeploy(conv, ctx.lastFiles || [], 0, ctx.branchName);
@@ -1338,7 +1338,7 @@ ${rawRequirements}
 
     while (reviewRetry <= MAX_REVIEW_RETRIES) {
       // --- エンジニア（Claude CLI） ---
-      const cliPrompt = this.buildCLIPrompt(conv, subtask, allSubtasks, completedFiles, reviewFeedback, skipBuild, engineerMemoryCtx);
+      const cliPrompt = await this.buildCLIPrompt(conv, subtask, allSubtasks, completedFiles, reviewFeedback, skipBuild, engineerMemoryCtx);
 
       dbLog('info', 'dev-agent', `[エンジニア/CLI] コード生成開始 (レビュー試行 ${reviewRetry + 1}) [${model}]`, { convId: conv.id, path: subtask.path });
       emitDevEvent({ type: 'agent_activity', convId: conv.id, agent: 'engineer', data: { status: 'coding', message: `コーディング中: ${subtask.path} [${model}]`, file: subtask.path } });
@@ -1407,7 +1407,7 @@ ${engineerMemoryCtx || '（過去の記録なし）'}
       emitDevEvent({ type: 'agent_activity', convId: conv.id, agent: 'reviewer', data: { status: 'reviewing', message: `レビュー中: ${subtask.path}`, file: subtask.path } });
 
       // A: システム基盤ファイルを含むレビューコンテキストを構築
-      const reviewContext = this.buildReviewContext(subtask, fileToWrite, completedFiles, systemFiles, allSubtasks);
+      const reviewContext = await this.buildReviewContext(subtask, fileToWrite, completedFiles, systemFiles, allSubtasks);
 
       const { text: reviewOutput } = await callClaude({
         system: await buildAgentPersonality('reviewer') + '\n\n' + REVIEWER_PROMPT,
@@ -1440,7 +1440,7 @@ ${engineerMemoryCtx || '（過去の記録なし）'}
       if (reviewParsed && reviewParsed.approved) {
         dbLog('info', 'dev-agent', `[レビュアー] 承認: ${subtask.path} - ${reviewParsed.summary} [${model}]`, { convId: conv.id });
         emitDevEvent({ type: 'agent_message', convId: conv.id, agent: 'reviewer', data: { message: `承認: ${subtask.path}`, verdict: 'approved' } });
-        saveTeamConversation('review_approve', ['reviewer', 'engineer'], [
+        await saveTeamConversation('review_approve', ['reviewer', 'engineer'], [
           { role: 'engineer', message: `実装完了: ${subtask.path} (${model})`, timestamp: new Date().toISOString() },
           { role: 'reviewer', message: `承認: ${reviewParsed.summary || 'OK'}`, timestamp: new Date().toISOString() },
         ], conv.id, `承認: ${subtask.path}`);
@@ -1455,20 +1455,20 @@ ${engineerMemoryCtx || '（過去の記録なし）'}
         dbLog('warn', 'dev-agent', `[レビュアー] レビュー結果パース失敗 → 差し戻し扱い (${reviewRetry}/${MAX_REVIEW_RETRIES})`, { convId: conv.id });
         currentRejectReason = reviewOutput.slice(0, 500);
         reviewFeedback = `レビュアーの応答（JSON解析不可）:\n${currentRejectReason}`;
-        recordMetric(conv.id, 'reviewer', 'review_reject');
-        recordReject('reviewer', 'engineer', 'レビュー結果パース失敗',
+        await recordMetric(conv.id, 'reviewer', 'review_reject');
+        await recordReject('reviewer', 'engineer', 'レビュー結果パース失敗',
           reviewFeedback.slice(0, 300), 'major', false, conv.id);
       } else {
-        recordMetric(conv.id, 'reviewer', 'review_reject');
+        await recordMetric(conv.id, 'reviewer', 'review_reject');
         const issues = (reviewParsed.issues || []) as Array<{ severity: string; message: string; fix: string }>;
         currentRejectReason = (reviewParsed.summary || '') + ' ' + issues.map(i => i.message).join(' ');
         reviewFeedback = issues.map(i => `[${i.severity}] ${i.message}\n修正: ${i.fix}`).join('\n\n');
-        recordReject('reviewer', 'engineer', reviewParsed.summary || 'レビューNG',
+        await recordReject('reviewer', 'engineer', reviewParsed.summary || 'レビューNG',
           reviewFeedback.slice(0, 300), 'major',
           reviewRetry >= 2, conv.id);
-        recordRejectLearning('engineer', reviewParsed.summary || 'レビューNG', reviewFeedback.slice(0, 200), subtask.path);
+        await recordRejectLearning('engineer', reviewParsed.summary || 'レビューNG', reviewFeedback.slice(0, 200), subtask.path);
         for (const issue of issues.filter(i => i.severity === 'error')) {
-          recordReviewerLearning(issue.message, issue.severity, subtask.path);
+          await recordReviewerLearning(issue.message, issue.severity, subtask.path);
         }
         dbLog('warn', 'dev-agent', `[レビュアー] NG → エンジニアに差し戻し (${reviewRetry}/${MAX_REVIEW_RETRIES}): ${reviewParsed.summary}`, { convId: conv.id });
         emitDevEvent({ type: 'agent_message', convId: conv.id, agent: 'reviewer', data: { message: `差し戻し: ${(reviewParsed.summary || '').slice(0, 60)}`, verdict: 'rejected', file: subtask.path } });
@@ -1561,7 +1561,7 @@ ${currentRejectReason.slice(0, 500)}
     throw new Error(`レビューループ異常終了: ${subtask.path}`);
   }
 
-  private buildCLIPrompt(
+  private async buildCLIPrompt(
     conv: DevConversation,
     subtask: Subtask,
     _allSubtasks: Subtask[],
@@ -1569,7 +1569,7 @@ ${currentRejectReason.slice(0, 500)}
     reviewFeedback: string,
     skipBuild: boolean = false,
     engineerMemory: string = '',
-  ): string {
+  ): Promise<string> {
     const acSection = this.currentAC.length > 0
       ? `\n## 受け入れ条件（AC）— 全サブタスクの最終ゴール\n${this.currentAC.map((ac, i) => `${i + 1}. ${ac}`).join('\n')}\nあなたのサブタスクがこのACの達成に必要な部分を確実に実装してください。\n`
       : '';
@@ -1591,7 +1591,7 @@ ${conv.requirements}
 `;
 
     // 過去開発で同じファイルを触った実績があれば参照情報として注入
-    const relatedDev = buildRelatedDevContext(subtask.path);
+    const relatedDev = await buildRelatedDevContext(subtask.path);
     if (relatedDev) {
       prompt += `\n${relatedDev}\n`;
     }
@@ -1635,13 +1635,13 @@ ${conv.requirements}
     return prompt;
   }
 
-  private buildReviewContext(
+  private async buildReviewContext(
     subtask: Subtask,
     file: FileToWrite,
     completedFiles: Array<{ path: string; content: string }>,
     systemFiles: Array<{ path: string; content: string }> = [],
     allSubtasks: Subtask[] = [],
-  ): string {
+  ): Promise<string> {
     let ctx = `## レビュー対象\npath: ${file.path}\naction: ${file.action}\n\n`;
     ctx += `## コード\n\`\`\`typescript\n${file.content}\n\`\`\`\n\n`;
     ctx += `## サブタスクの説明\n${subtask.description}\n\n`;
@@ -1680,7 +1680,7 @@ ${conv.requirements}
     }
 
     // 過去開発で同じファイルを触った実績があれば情報提供
-    const relatedDev = buildRelatedDevContext(file.path);
+    const relatedDev = await buildRelatedDevContext(file.path);
     if (relatedDev) {
       ctx += `\n${relatedDev}\n`;
     }
@@ -1705,11 +1705,11 @@ ${conv.requirements}
     const buildResult = await runBuild();
 
     if (!buildResult.success) {
-      recordMetric(conv.id, 'engineer', 'build_fail');
+      await recordMetric(conv.id, 'engineer', 'build_fail');
       const classified = classifyError(buildResult.buildOutput || '');
       dbLog('info', 'dev-agent', `[チーム] ビルド失敗: ${categoryLabel(classified.category)}/${classified.subcategory}`, { convId: conv.id });
       emitDevEvent({ type: 'build', convId: conv.id, agent: 'deployer', data: { status: 'failed', error: (buildResult.buildOutput || '').slice(0, 200) } });
-      saveTeamConversation('deployer_build', ['deployer', 'engineer'], [
+      await saveTeamConversation('deployer_build', ['deployer', 'engineer'], [
         { role: 'deployer', message: `ビルド失敗 (試行 ${retryCount + 1}): ${categoryLabel(classified.category)}/${classified.subcategory}\n${(buildResult.buildOutput || '').slice(0, 300)}`, timestamp: new Date().toISOString() },
       ], conv.id, `ビルド失敗: ${classified.subcategory}`);
 
@@ -1742,7 +1742,7 @@ ${conv.requirements}
     await sendLineMessage(conv.user_id, '🔨 ビルド: OK');
     dbLog('info', 'dev-agent', '[チーム] ビルド成功 → テスト開始', { convId: conv.id });
     emitDevEvent({ type: 'build', convId: conv.id, agent: 'deployer', data: { status: 'success' } });
-    saveTeamConversation('deployer_build', ['deployer'], [
+    await saveTeamConversation('deployer_build', ['deployer'], [
       { role: 'deployer', message: `ビルド成功 (試行 ${retryCount + 1})`, timestamp: new Date().toISOString() },
     ], conv.id, 'ビルド成功');
 
@@ -1754,7 +1754,7 @@ ${conv.requirements}
 
     if (allPassed) {
       emitDevEvent({ type: 'test', convId: conv.id, agent: 'deployer', data: { status: 'passed' } });
-      saveTeamConversation('deployer_test', ['deployer'], [
+      await saveTeamConversation('deployer_test', ['deployer'], [
         { role: 'deployer', message: `全テスト通過: ${testResults.map(r => `${r.stage}=OK`).join(', ')}`, timestamp: new Date().toISOString() },
       ], conv.id, '全テスト通過');
       for (const r of testResults) {
@@ -1770,12 +1770,12 @@ ${conv.requirements}
 
       dbLog('warn', 'dev-agent', `[デプロイヤー] ${failedName}失敗: ${categoryLabel(classified.category)}/${classified.subcategory}`, { convId: conv.id });
       emitDevEvent({ type: 'test', convId: conv.id, agent: 'deployer', data: { status: 'failed', message: failedResult.message.slice(0, 100) } });
-      saveTeamConversation('deployer_test', ['deployer', 'engineer'], [
+      await saveTeamConversation('deployer_test', ['deployer', 'engineer'], [
         { role: 'deployer', message: `${failedName}失敗: ${failedResult.message.slice(0, 200)}`, timestamp: new Date().toISOString() },
       ], conv.id, `${failedName}失敗`);
-      recordMetric(conv.id, 'deployer', 'test_fail');
-      recordDeployerLearning(failedResult.stage, failedResult.message.slice(0, 150), retryCount >= MAX_TEST_FIX_RETRIES ? 'escalated' : 'fixed');
-      recordReject('deployer', 'engineer', failedResult.message,
+      await recordMetric(conv.id, 'deployer', 'test_fail');
+      await recordDeployerLearning(failedResult.stage, failedResult.message.slice(0, 150), retryCount >= MAX_TEST_FIX_RETRIES ? 'escalated' : 'fixed');
+      await recordReject('deployer', 'engineer', failedResult.message,
         failedResult.details || '修正してください', 'major', false, conv.id);
 
       if (retryCount < MAX_TEST_FIX_RETRIES) {
@@ -1836,7 +1836,7 @@ ${conv.requirements}
     releaseGitLock(conv.id);
 
     emitDevEvent({ type: 'deploy', convId: conv.id, agent: 'deployer', data: { status: 'deploying' } });
-    saveTeamConversation('deployer_deploy', ['deployer'], [
+    await saveTeamConversation('deployer_deploy', ['deployer'], [
       { role: 'deployer', message: `デプロイ開始: ブランチ ${branchName}`, timestamp: new Date().toISOString() },
     ], conv.id, `デプロイ実行: ${branchName}`);
     await sendLineMessage(conv.user_id, '🚀 全テスト通過。デプロイ中（再起動します）...');
@@ -1883,7 +1883,7 @@ ${conv.requirements}
         errorCategory: errCatDiag,
         errorExplanation: errExpDiag,
       });
-      updateConversationStatus(conv.id, 'stuck');
+      await updateConversationStatus(conv.id, 'stuck');
       emitDevEvent({ type: 'phase_change', convId: conv.id, agent: 'system', data: { phase: 'stuck', reason: `${phaseName}エラーが${MAX_DIAGNOSIS_ROUNDS}ラウンド診断でも未解決` } });
       const diagUrl = `${config.admin.baseUrl}/admin/dev/${conv.id}`;
       await sendLineMessage(conv.user_id,
@@ -1917,7 +1917,7 @@ ${conv.requirements}
     dbLog('info', 'dev-agent', `[チーム診断] 結果: ${diagnosis.recommendation} - ${diagnosis.rootCause.slice(0, 100)}`, { convId: conv.id });
     emitDevEvent({ type: 'diagnosis', convId: conv.id, agent: 'system', data: { recommendation: diagnosis.recommendation, rootCause: diagnosis.rootCause.slice(0, 100) } });
     // PMが診断結果を学びとして記憶
-    recordPmLearning(`diagnosis_${phase}_${conv.id.slice(0, 8)}`,
+    await recordPmLearning(`diagnosis_${phase}_${conv.id.slice(0, 8)}`,
       `${phaseName}障害(${conv.topic.slice(0, 30)}): ${diagnosis.rootCause.slice(0, 200)}\n判断: ${diagnosis.recommendation}\n対処: ${diagnosis.actionPlan.slice(0, 150)}`,
       'team_diagnosis');
 
@@ -1950,7 +1950,7 @@ ${conv.requirements}
       }
       case 'rollback': {
         await rollbackGit(branchName).catch(() => {});
-        updateConversationStatus(conv.id, 'failed');
+        await updateConversationStatus(conv.id, 'failed');
         this.stuckContextMap.delete(conv.id);
         await sendLineMessage(conv.user_id,
           `🏥 チーム診断結果: ロールバック\n` +
@@ -1979,7 +1979,7 @@ ${conv.requirements}
           teamDiagnosis: `根本原因: ${diagnosis.rootCause}\n対処案: ${diagnosis.actionPlan}`,
           dialogueLog: [],
         });
-        updateConversationStatus(conv.id, 'stuck');
+        await updateConversationStatus(conv.id, 'stuck');
         emitDevEvent({ type: 'phase_change', convId: conv.id, agent: 'system', data: { phase: 'stuck', reason: 'チーム診断: ユーザーへエスカレーション' } });
         emitDevEvent({ type: 'escalation', convId: conv.id, agent: 'pm', data: { reason: 'team_diagnosis', phase } });
         const diagUrl2 = `${config.admin.baseUrl}/admin/dev/${conv.id}`;
@@ -2065,8 +2065,8 @@ ${conv.requirements}
 
       await writeFiles(fixedFiles);
       const fixDesc = fixedFiles.map(f => `${f.path}(${f.action})`).join(', ');
-      recordBuildLearning('engineer', buildOutput.slice(0, 200), `修正ファイル: ${fixDesc}`, fixedFiles.map(f => f.path));
-      recordDeployerLearning('build', buildOutput.slice(0, 150), 'fixed');
+      await recordBuildLearning('engineer', buildOutput.slice(0, 200), `修正ファイル: ${fixDesc}`, fixedFiles.map(f => f.path));
+      await recordDeployerLearning('build', buildOutput.slice(0, 150), 'fixed');
       await this.runBuildAndDeploy(conv, fixedFiles, retryCount + 1, branchName, diagnosisRound);
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
@@ -2077,7 +2077,7 @@ ${conv.requirements}
       if (classified.category === 'transient') {
         if (transientWaitCount >= MAX_TRANSIENT_WAITS) {
           dbLog('error', 'dev-agent', `[エンジニア] 一時的エラー待機${MAX_TRANSIENT_WAITS}回到達 → エスカレーション`, { convId: conv.id });
-          updateConversationStatus(conv.id, 'stuck');
+          await updateConversationStatus(conv.id, 'stuck');
           this.stuckContextMap.set(conv.id, {
             branchName, subtasks: [], completedFiles: [],
             failedSubtaskIndex: 0, errorMessage: errMsg,
@@ -2101,7 +2101,7 @@ ${conv.requirements}
 
       // それ以外 → ロールバック
       await rollbackGit(branchName).catch(() => {});
-      updateConversationStatus(conv.id, 'failed');
+      await updateConversationStatus(conv.id, 'failed');
       this.stuckContextMap.delete(conv.id);
       await sendLineMessage(conv.user_id,
         `ビルドエラーの自動修正に失敗しました:\n${errMsg.slice(0, 300)}\n\nコードをロールバックしました。`
@@ -2178,8 +2178,8 @@ ${conv.requirements}
       const failedResult = testResults.find(r => !r.passed);
       if (failedResult) {
         const fixDesc = fixedFiles.map(f => `${f.path}(${f.action})`).join(', ');
-        recordTestLearning('engineer', failedResult.stage, failedResult.message.slice(0, 200), `修正ファイル: ${fixDesc}`);
-        recordDeployerLearning(failedResult.stage, failedResult.message.slice(0, 150), 'fixed');
+        await recordTestLearning('engineer', failedResult.stage, failedResult.message.slice(0, 200), `修正ファイル: ${fixDesc}`);
+        await recordDeployerLearning(failedResult.stage, failedResult.message.slice(0, 150), 'fixed');
       }
       await this.runBuildAndDeploy(conv, fixedFiles, retryCount + 1, branchName, diagnosisRound);
     } catch (err) {
@@ -2191,7 +2191,7 @@ ${conv.requirements}
       if (classified.category === 'transient') {
         if (transientWaitCount >= MAX_TRANSIENT_WAITS) {
           dbLog('error', 'dev-agent', `[エンジニア] 一時的エラー待機${MAX_TRANSIENT_WAITS}回到達 → エスカレーション`, { convId: conv.id });
-          updateConversationStatus(conv.id, 'stuck');
+          await updateConversationStatus(conv.id, 'stuck');
           this.stuckContextMap.set(conv.id, {
             branchName, subtasks: [], completedFiles: [],
             failedSubtaskIndex: 0, errorMessage: errMsg,
@@ -2214,7 +2214,7 @@ ${conv.requirements}
       }
 
       await rollbackGit(branchName).catch(() => {});
-      updateConversationStatus(conv.id, 'failed');
+      await updateConversationStatus(conv.id, 'failed');
       this.stuckContextMap.delete(conv.id);
       await sendLineMessage(conv.user_id,
         `テスト失敗の自動修正に失敗しました:\n${errMsg.slice(0, 300)}\n\nコードをロールバックしました。`

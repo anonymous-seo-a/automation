@@ -11,8 +11,8 @@ export async function runRetrospective(conv: DevConversation): Promise<void> {
   dbLog('info', 'retro', `レトロスペクティブ開始: ${conv.topic}`, { convId: conv.id });
 
   try {
-    const metrics = getTaskMetricsSummary(conv.id);
-    const conversations = getTeamConversations(conv.id);
+    const metrics = await getTaskMetricsSummary(conv.id);
+    const conversations = await getTeamConversations(conv.id);
 
     const context = `タスク: ${conv.topic}
 レビュー差し戻し: ${metrics['review_reject'] || 0}回
@@ -74,7 +74,7 @@ export async function runRetrospective(conv: DevConversation): Promise<void> {
     await extractLearnings('pm', pmSummary, conv.topic);
 
     // 保存
-    saveTeamConversation('retrospective', ['pm', 'engineer', 'reviewer', 'deployer'], log, conv.id, pmSummary);
+    await saveTeamConversation('retrospective', ['pm', 'engineer', 'reviewer', 'deployer'], log, conv.id, pmSummary);
 
     // エピソード→意味記憶の自動昇格チェック
     try {
@@ -121,7 +121,7 @@ async function extractLearnings(agent: AgentRole, reflection: string, topic: str
 
     for (const item of parsed) {
       if (item.key && item.content) {
-        saveAgentMemory(agent, 'learning',
+        await saveAgentMemory(agent, 'learning',
           `retro_${topic.slice(0, 20)}_${item.key}`, item.content, 'retrospective');
       }
     }

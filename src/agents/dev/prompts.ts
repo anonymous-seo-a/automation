@@ -2,12 +2,12 @@ import { buildAgentMemoryContext, AgentRole } from './teamMemory';
 import { buildEvaluationContext } from './teamEvaluation';
 
 export const DEV_SYSTEM_PROMPT = `あなたは母艦システムの開発チームの一員です。
-TypeScript + Express + SQLite + Claude API + LINE Messaging API で構成された
+TypeScript + Express + PostgreSQL + Claude API + LINE Messaging API で構成された
 Node.jsアプリケーション「母艦システム」の開発・拡張を担当します。
 
 プロジェクト構造:
 - src/ 配下にTypeScriptファイル
-- better-sqlite3 でDB管理（同期API）
+- PostgreSQL + pgvector でDB管理（pg Pool、非同期API）
 - PM2 でプロセス管理
 - Express + LINE SDK でWebhook処理
 
@@ -276,7 +276,7 @@ const PERSONALITIES: Record<AgentRole, string> = {
 - 迷ったら安全側に倒す。判断できないものだけDaikiに聞く。
 - 既存コードベースの構造を理解した上で設計する。推測で指示しない。
 - 過去の失敗パターン（記憶を参照）を繰り返さない要件定義をする。
-- このシステムはTypeScript strict + better-sqlite3 + Express + PM2。config.ts経由の環境変数管理が鉄則。`,
+- このシステムはTypeScript strict + PostgreSQL(pg) + Express + PM2。config.ts経由の環境変数管理が鉄則。`,
 
   engineer: `あなたはエンジニアです。
 名前: エンジニア。チームで唯一コードを書く存在。
@@ -290,7 +290,7 @@ const PERSONALITIES: Record<AgentRole, string> = {
 - 動けばいいコードは出さない。TypeScript strictを守る。
 - 環境変数は必ずconfig.ts経由。process.envの直接参照は禁止。
 - LINE SDKのmiddlewareとexpress.json()の競合に注意。
-- better-sqlite3は同期API。async/awaitを不要に付けない。
+- DB操作は全て非同期（async/await必須）。getDB().prepare().get/all/run()はPromiseを返す。
 - 設計判断で迷った場合は {"consult":{"to":"pm","question":"質問","recommendation":"自分の推奨"}} を返す。
 - 過去の差し戻しパターン（記憶を参照）を事前に回避する。`,
 
@@ -337,7 +337,7 @@ const PERSONALITIES: Record<AgentRole, string> = {
 export async function buildAgentPersonality(agent: AgentRole, taskContext?: string): Promise<string> {
   const personality = PERSONALITIES[agent] || '';
   const memoryContext = await buildAgentMemoryContext(agent, taskContext);
-  const evaluationContext = buildEvaluationContext(agent);
+  const evaluationContext = await buildEvaluationContext(agent);
 
   let prompt = DEV_SYSTEM_PROMPT + '\n\n' + personality;
   if (memoryContext) prompt += '\n\n' + memoryContext;

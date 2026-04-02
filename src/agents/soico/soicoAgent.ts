@@ -7,7 +7,7 @@ export class SoicoAgent implements Agent {
   name = 'soico';
 
   async execute(task: Task): Promise<TaskResult> {
-    const relevantKnowledge = searchKnowledge(task.description);
+    const relevantKnowledge = await searchKnowledge(task.description);
     const knowledgeContext = relevantKnowledge.length > 0
       ? `\n\n## 参考ナレッジ\n${relevantKnowledge.join('\n---\n')}`
       : '';
