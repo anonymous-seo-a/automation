@@ -496,6 +496,75 @@ export function buildAgentMemoryContextSync(agent: AgentRole): string {
 }
 
 // ============================================================
+// エピソード→意味記憶の自動昇格（ExpeL/ERL方式）
+// ============================================================
+
+/** 繰り返しlearning記憶をクラスタリングし、共通パターンをルール化して昇格 */
+export async function promoteRecurringLearnings(agent: AgentRole): Promise<number> {
+  try {
+    const learnings = getAgentMemories(agent, 'learning');
+    if (learnings.length < 5) return 0; // 学習記憶が少なすぎる
+
+    // embedding付きの学習記憶を取得
+    const withEmbedding = learnings.filter(l => l.embedding);
+    if (withEmbedding.length < 3) return 0;
+
+    // 簡易クラスタリング: 各learning同士の類似度を計算し、閾値以上のグループを検出
+    const clusters: AgentMemory[][] = [];
+    const used = new Set<number>();
+
+    for (let i = 0; i < withEmbedding.length; i++) {
+      if (used.has(withEmbedding[i].id)) continue;
+      const cluster = [withEmbedding[i]];
+      used.add(withEmbedding[i].id);
+
+      // 意味検索で類似記憶を探す
+      try {
+        const results = await searchAgentMemories(agent, withEmbedding[i].content, 10);
+        for (const r of results) {
+          if (r.memory.type === 'learning' && r.score >= 0.5 && !used.has(r.memory.id)) {
+            cluster.push(r.memory);
+            used.add(r.memory.id);
+          }
+        }
+      } catch {
+        continue;
+      }
+
+      if (cluster.length >= 3) {
+        clusters.push(cluster);
+      }
+    }
+
+    let promoted = 0;
+    for (const cluster of clusters) {
+      try {
+        // Claude APIでクラスタを1ルール文に要約
+        const clusterTexts = cluster.map(m => `- ${m.content}`).join('\n');
+        const { text: rule } = await callClaude({
+          system: '以下の類似した学習記録群を分析し、共通する1つのルール文にまとめてください。\n「〜する際は、必ず〜すること」の形式で簡潔に。',
+          messages: [{ role: 'user', content: clusterTexts }],
+          model: 'default',
+          maxTokens: 300,
+        });
+
+        const ruleKey = `auto_promoted_${agent}_${Date.now()}_${promoted}`;
+        await saveAgentMemoryWithEmbedding(agent, 'pattern', ruleKey, rule.trim(), 'auto_promote', 5);
+        promoted++;
+        logger.info('記憶昇格', { agent, clusterSize: cluster.length, rule: rule.slice(0, 100) });
+      } catch (err) {
+        logger.warn('記憶昇格失敗', { agent, err: err instanceof Error ? err.message : String(err) });
+      }
+    }
+
+    return promoted;
+  } catch (err) {
+    logger.warn('promoteRecurringLearnings失敗', { agent, err: err instanceof Error ? err.message : String(err) });
+    return 0;
+  }
+}
+
+// ============================================================
 // エージェント記憶の統合（記憶が30件を超えたら実行）
 // ============================================================
 

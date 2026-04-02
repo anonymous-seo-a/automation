@@ -76,6 +76,21 @@ export async function runRetrospective(conv: DevConversation): Promise<void> {
     // 保存
     saveTeamConversation('retrospective', ['pm', 'engineer', 'reviewer', 'deployer'], log, conv.id, pmSummary);
 
+    // エピソード→意味記憶の自動昇格チェック
+    try {
+      const { promoteRecurringLearnings } = await import('./teamMemory');
+      let totalPromoted = 0;
+      for (const role of ['pm', 'engineer', 'reviewer', 'deployer'] as const) {
+        const count = await promoteRecurringLearnings(role);
+        totalPromoted += count;
+      }
+      if (totalPromoted > 0) {
+        dbLog('info', 'retro', `記憶昇格: ${totalPromoted}件のパターンルールを自動生成`, { convId: conv.id });
+      }
+    } catch (err) {
+      dbLog('warn', 'retro', `記憶昇格チェック失敗: ${err instanceof Error ? err.message : String(err)}`, { convId: conv.id });
+    }
+
     // Daikiにサマリーを送信
     const summaryLines = pmSummary.split('\n').slice(0, 10).join('\n');
     await sendLineMessage(conv.user_id,

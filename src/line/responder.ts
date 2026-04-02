@@ -135,8 +135,32 @@ export async function generateResponse(
       }
     }
 
-    // 分身プロンプト構築（ナレッジ + 記憶を注入）
-    const systemPrompt = buildBunshinPrompt(memoryContext) + contextBlock;
+    // 感情状態の推定と応答トーン調整（Chain-of-Emotion + D-MEM）
+    let emotionalGuidance = '';
+    if (userId && !image) {
+      try {
+        const { estimateEmotion, saveEmotionalState, getLatestEmotionalState, getEmotionalGuidance, detectEmotionalSurprise } = await import('./emotionalState');
+        const emotion = await estimateEmotion(userMessage);
+        const prevEmotion = getLatestEmotionalState(userId);
+        saveEmotionalState(userId, emotion, userMessage);
+        emotionalGuidance = getEmotionalGuidance(emotion);
+
+        // D-MEM: 感情急変を重要イベントとして記録
+        if (detectEmotionalSurprise(emotion, prevEmotion)) {
+          const { saveMemoryWithEmbedding } = await import('../memory/store');
+          saveMemoryWithEmbedding(userId, 'memo',
+            `emotional_shift_${Date.now()}`,
+            `感情の変化: ${prevEmotion?.dominantEmotion || 'unknown'} → ${emotion.dominantEmotion}。文脈: ${userMessage.slice(0, 200)}`,
+            5,
+          ).catch(() => {});
+        }
+      } catch (err) {
+        logger.debug('感情推定スキップ', { err: err instanceof Error ? err.message : String(err) });
+      }
+    }
+
+    // 分身プロンプト構築（ナレッジ + 記憶 + 感情ガイダンスを注入）
+    const systemPrompt = buildBunshinPrompt(memoryContext) + contextBlock + emotionalGuidance;
 
     const { text } = await callClaude({
       system: systemPrompt,

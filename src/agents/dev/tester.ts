@@ -276,3 +276,50 @@ export function formatTestResults(results: TestResult[]): string {
     return line;
   }).join('\n');
 }
+
+/** AC（受け入れ条件）ベースの自動検証（デプロイ後に実行） */
+export interface ACVerificationResult {
+  ac: string;
+  passed: boolean;
+  detail: string;
+}
+
+export async function runACVerification(
+  acList: string[],
+  port: number = 3000,
+): Promise<{ passed: boolean; results: ACVerificationResult[] }> {
+  const results: ACVerificationResult[] = [];
+
+  for (const ac of acList) {
+    // ACにURLパスが含まれている場合、HTTPリクエストで検証
+    const urlMatch = ac.match(/\/admin\/[\w/-]+|\/api\/[\w/-]+/);
+    if (urlMatch) {
+      const url = `http://localhost:${port}${urlMatch[0]}`;
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 5000);
+        const res = await fetch(url, { signal: controller.signal });
+        clearTimeout(timeoutId);
+        results.push({
+          ac,
+          passed: res.status === 200,
+          detail: `HTTP ${res.status} for ${urlMatch[0]}`,
+        });
+      } catch (err) {
+        results.push({
+          ac,
+          passed: false,
+          detail: `接続失敗: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      }
+    } else {
+      // URL以外のAC → 自動検証不可、infoとして記録
+      results.push({ ac, passed: true, detail: '自動検証対象外（手動確認推奨）' });
+    }
+  }
+
+  return {
+    passed: results.every(r => r.passed),
+    results,
+  };
+}

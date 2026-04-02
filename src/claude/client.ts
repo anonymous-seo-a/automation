@@ -58,7 +58,11 @@ export async function callClaude(params: {
   timeoutMs?: number;
   /** web_searchツールを有効にする */
   enableWebSearch?: boolean;
-}): Promise<{ text: string; usage: { input: number; output: number } }> {
+  /** 拡張思考を有効にする（Quiet-STaR代替: PM/レビュアーの重要判断用） */
+  enableThinking?: boolean;
+  /** 拡張思考のトークン予算（デフォルト: 5000） */
+  thinkingBudget?: number;
+}): Promise<{ text: string; thinking?: string; usage: { input: number; output: number } }> {
 
   if (await isOverBudget()) {
     throw new Error('BUDGET_EXCEEDED: APIの日次または月次予算上限に達しました');
@@ -104,6 +108,10 @@ export async function callClaude(params: {
       };
       if (tools) {
         body.tools = tools;
+      }
+      if (params.enableThinking) {
+        body.thinking = { type: 'enabled', budget_tokens: params.thinkingBudget || 5000 };
+        body.temperature = 1; // 拡張思考使用時はtemperature=1が必須
       }
 
       let response: Response;
@@ -155,9 +163,11 @@ export async function callClaude(params: {
         throw new Error(`Claude API レスポンス形式が不正: content配列がありません`);
       }
 
-      // web_searchツール使用時: stop_reason === 'tool_use' なら自動的にツール結果を返してループ
-      // Claude APIのweb_searchは server-side tool なので、クライアント側でのツール結果送信は不要
-      // レスポンスのcontent配列にtextブロックとweb_search結果が混在する
+      // 拡張思考のthinkingブロックを抽出（存在する場合）
+      const thinkingBlock = data.content.find(c => c.type === 'thinking');
+      const thinking = thinkingBlock && 'thinking' in thinkingBlock
+        ? (thinkingBlock as { type: string; thinking: string }).thinking
+        : undefined;
 
       const text = data.content
         .filter(c => c.type === 'text' && c.text)
@@ -175,7 +185,7 @@ export async function callClaude(params: {
 
       await trackUsage(model, usage.input, usage.output, params.taskId);
 
-      return { text, usage };
+      return { text, thinking, usage };
 
     } catch (err) {
       if (err instanceof Error && err.name === 'AbortError') {

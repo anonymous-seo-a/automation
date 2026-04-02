@@ -555,13 +555,50 @@ export class DevAgent implements Agent {
 
     const codebaseCtx = await this.buildCodebaseContext();
 
-    const { text } = await callClaude({
+    const { text: rawRequirements } = await callClaude({
       system: DEV_SYSTEM_PROMPT + '\n\n' + PM_REQUIREMENTS_PROMPT,
       messages: [
         { role: 'user', content: `${codebaseCtx}\n\n開発依頼: ${conv.topic}\n\nヒアリング内容:\n${JSON.stringify(hearingLog)}` },
       ],
       model: 'opus',
     });
+
+    // PM Self-Refine: 要件定義書の自己批評（AC粒度・登録漏れ・テスト方法の具体性を検証）
+    let text = rawRequirements;
+    try {
+      dbLog('info', 'dev-agent', '[PM] Self-Refine: 要件定義書を自己批評中', { convId: conv.id });
+      const { text: selfReviewResult } = await callClaude({
+        system: DEV_SYSTEM_PROMPT,
+        messages: [{
+          role: 'user',
+          content: `以下の要件定義書を批評し、問題があれば修正版を出力してください。
+
+${rawRequirements}
+
+## チェック項目
+1. 各ACは具体的で検証可能か？「〜できること」が動作として記述されているか？
+2. UIを追加する場合、「既存ナビゲーションからリンクで到達できること」がACに含まれているか？
+3. 新規ファイルを作る場合、「app.ts/dashboard.tsへの登録」がサブタスクに含まれるか？
+4. テスト方法は具体的か？（「動作確認」ではなく「〇〇にアクセスして△△が表示される」等）
+5. 各ACが少なくとも1つのサブタスクでカバーされているか？
+
+問題がなければ「LGTM」とだけ出力。問題があれば修正した完全な要件定義書を出力してください。`,
+        }],
+        model: 'default',
+        enableThinking: true,
+        thinkingBudget: 3000,
+      });
+      if (!selfReviewResult.includes('LGTM')) {
+        text = selfReviewResult;
+        dbLog('info', 'dev-agent', '[PM] Self-Refine: 要件定義書を修正', { convId: conv.id });
+      } else {
+        dbLog('info', 'dev-agent', '[PM] Self-Refine: LGTM（修正不要）', { convId: conv.id });
+      }
+    } catch (err) {
+      dbLog('warn', 'dev-agent', `[PM] Self-Refine失敗（原版を使用）: ${err instanceof Error ? err.message : String(err)}`, { convId: conv.id });
+      // Self-Refineは品質向上の追加ステップ。失敗しても原版で続行するが、ユーザーに通知
+      await sendLineMessage(conv.user_id, '※ 要件の品質チェック（Self-Refine）をスキップしました。内容を特に注意して確認してください。').catch(() => {});
+    }
 
     setRequirements(conv.id, text);
     dbLog('info', 'dev-agent', `[PM] 要件定義書作成完了 (${text.length}文字)`, { convId: conv.id });
@@ -1275,6 +1312,7 @@ export class DevAgent implements Agent {
 
     let model = this.selectModel(subtask);
     let reviewRetry = 0;
+    let redefineAttempts = 0; // PMサブタスク再定義の試行回数（無限ループ防止）
     let reviewFeedback = '';
     let previousRejectReason = ''; // 同一理由差し戻し検出用
 
@@ -1324,7 +1362,35 @@ export class DevAgent implements Agent {
 
       emitDevEvent({ type: 'code_write', convId: conv.id, agent: 'engineer', data: { file: subtask.path, action: subtask.action } });
 
-      // CLIが書いたファイルの内容を読み取り
+      // --- MIRROR Self-Check（Goals/Reasoning/Memory の3次元自己レビュー） ---
+      if (reviewRetry === 0) {
+        // 初回のみ実行（リトライ時はレビュアーFBがあるので不要）
+        dbLog('info', 'dev-agent', `[エンジニア] MIRROR self-check実行中`, { convId: conv.id });
+        emitDevEvent({ type: 'agent_activity', convId: conv.id, agent: 'engineer', data: { status: 'thinking', message: `自己レビュー中: ${subtask.path}` } });
+        const selfCheckPrompt = `あなたは実装を完了したエンジニアとして、提出前の自己レビューを行います。
+
+## Goals（このサブタスクのゴール）
+${subtask.description}
+
+## Memory（過去の失敗パターン — 必ず確認）
+${engineerMemoryCtx || '（過去の記録なし）'}
+
+## チェック項目（1つでも該当すれば修正してください）
+1. 新しいRouterを作成した場合、dashboard.ts/app.tsへのuse()登録は済んでいるか？
+2. 新しいページなら、views.tsのナビゲーションリンクは追加したか？
+3. importパスは実在するファイルを指しているか？
+4. export名が既存のものと衝突していないか？
+5. 過去の失敗パターンに該当していないか？
+
+問題があれば修正してください。問題がなければ「SELF-CHECK PASSED」と出力してください。`;
+        try {
+          await runClaudeCLI(selfCheckPrompt, 'sonnet', 60_000);
+        } catch {
+          dbLog('warn', 'dev-agent', `[エンジニア] self-check失敗（続行）`, { convId: conv.id });
+        }
+      }
+
+      // CLIが書いたファイルの内容を読み取り（self-check後の最新版）
       const content = await readProjectFile(subtask.path);
       if (!content) {
         throw new Error(`CLIがファイルを生成しませんでした: ${subtask.path}`);
@@ -1341,7 +1407,7 @@ export class DevAgent implements Agent {
       emitDevEvent({ type: 'agent_activity', convId: conv.id, agent: 'reviewer', data: { status: 'reviewing', message: `レビュー中: ${subtask.path}`, file: subtask.path } });
 
       // A: システム基盤ファイルを含むレビューコンテキストを構築
-      const reviewContext = this.buildReviewContext(subtask, fileToWrite, completedFiles, systemFiles);
+      const reviewContext = this.buildReviewContext(subtask, fileToWrite, completedFiles, systemFiles, allSubtasks);
 
       const { text: reviewOutput } = await callClaude({
         system: await buildAgentPersonality('reviewer') + '\n\n' + REVIEWER_PROMPT,
@@ -1408,33 +1474,61 @@ export class DevAgent implements Agent {
         emitDevEvent({ type: 'agent_message', convId: conv.id, agent: 'reviewer', data: { message: `差し戻し: ${(reviewParsed.summary || '').slice(0, 60)}`, verdict: 'rejected', file: subtask.path } });
       }
 
-      // B: 同一理由の差し戻し検出 → 合議発動（無限ループ防止）
+      // B: 同一理由の差し戻し検出 → PMサブタスク再定義を試みる（合議より迅速）
       if (previousRejectReason && isSimilarReject(previousRejectReason, currentRejectReason)) {
-        dbLog('info', 'dev-agent', `[チーム] 同一理由の差し戻し検出 → 合議発動`, { convId: conv.id, file: subtask.path });
-        emitDevEvent({ type: 'agent_message', convId: conv.id, agent: 'pm', data: { message: '同一差し戻しパターン検出 → チーム合議を開催' } });
-        try {
-          const { decision } = await runConsensus(
-            `レビュー差し戻しの繰り返し: ${subtask.path}`,
-            `レビュアーが同じ理由で差し戻しを繰り返しています。\n差し戻し理由: ${currentRejectReason.slice(0, 300)}\nサブタスク: ${subtask.description}\n\nこの問題をどう解決すべきか議論してください。レビュー基準を緩和すべきか、実装アプローチを変えるべきか、あるいはレビュアーが見えていない情報があるのかを判断してください。\n\n※ チーム内で解決できない方針判断やユーザー確認が必要な場合は、結論に「ESCALATE:」から始めてその理由を書いてください。`,
-            conv.id,
+        // 再定義は1回まで。2回目以降はエスカレーション
+        if (redefineAttempts >= 1) {
+          dbLog('warn', 'dev-agent', `[PM] 再定義後も差し戻し継続 → エスカレーション`, { convId: conv.id });
+          emitDevEvent({ type: 'escalation', convId: conv.id, agent: 'pm', data: { reason: 'redefine_exhausted', file: subtask.path } });
+          throw new EscalationError(
+            `PMのサブタスク再定義後も同じ理由で差し戻しが続いています（${subtask.path}）。\n` +
+            `差し戻し理由: ${currentRejectReason.slice(0, 300)}\n\n` +
+            `要件の根本的な見直しが必要です。`
           );
+        }
+        redefineAttempts++;
+        dbLog('info', 'dev-agent', `[PM] 同一差し戻し検出 → サブタスク再定義を試みる (${redefineAttempts}回目)`, { convId: conv.id, file: subtask.path });
+        emitDevEvent({ type: 'agent_message', convId: conv.id, agent: 'pm', data: { message: '同一差し戻し検出 → PMがサブタスクを再定義' } });
+        try {
+          // PMに拡張思考付きでサブタスク再定義を依頼
+          const { text: redefineResult } = await callClaude({
+            system: DEV_SYSTEM_PROMPT + '\n\nあなたはPMです。レビュアーの繰り返し差し戻しの根本原因を分析し、サブタスクの説明を修正してください。',
+            messages: [{
+              role: 'user',
+              content: `## 問題
+レビュアーが同じ理由で${reviewRetry}回差し戻しています。
 
-          // F3: 合議結果がエスカレーション要求の場合、ユーザーに相談
-          if (decision.includes('ESCALATE:')) {
-            const escalateReason = decision.replace(/^[\s\S]*?ESCALATE:\s*/, '').slice(0, 500);
-            dbLog('info', 'dev-agent', `[PM] 合議結果: ユーザーへエスカレーション`, { convId: conv.id });
-            emitDevEvent({ type: 'escalation', convId: conv.id, agent: 'pm', data: { reason: 'consensus', file: subtask.path } });
-            throw new EscalationError(
-              `レビュー差し戻しの繰り返し（${subtask.path}）でチーム合議の結果、ユーザー判断が必要と判断\n\n` +
-              `合議内容: ${escalateReason}\n差し戻し理由: ${currentRejectReason.slice(0, 200)}`
-            );
-          }
+## 差し戻し理由
+${currentRejectReason.slice(0, 500)}
 
-          reviewFeedback += `\n\n## チーム合議の結論\n${decision}`;
-          dbLog('info', 'dev-agent', `[チーム] 合議完了: ${decision.slice(0, 100)}`, { convId: conv.id });
-        } catch (consensusErr) {
-          if (consensusErr instanceof EscalationError) throw consensusErr;
-          dbLog('warn', 'dev-agent', `[チーム] 合議実行エラー: ${consensusErr instanceof Error ? consensusErr.message : String(consensusErr)}`, { convId: conv.id });
+## 現在のサブタスク定義
+ファイル: ${subtask.path}
+説明: ${subtask.description}
+アクション: ${subtask.action}
+
+## 指示
+差し戻し理由を解消するために、サブタスクの説明を修正してください。
+特に「どのファイルにどんな変更が必要か」を具体的に明記してください。
+修正後の説明文のみを出力してください（JSON不要、テキストのみ）。`,
+            }],
+            model: 'default',
+            enableThinking: true,
+            thinkingBudget: 3000,
+          });
+
+          // サブタスクの説明を更新
+          subtask.description = redefineResult.trim();
+          reviewFeedback = `## PMによるサブタスク再定義\n差し戻し理由「${currentRejectReason.slice(0, 100)}」を踏まえ、以下に修正:\n${subtask.description}`;
+          dbLog('info', 'dev-agent', `[PM] サブタスク再定義完了: ${subtask.description.slice(0, 100)}`, { convId: conv.id });
+        } catch (redefineErr) {
+          // 再定義失敗 → エスカレーション
+          dbLog('warn', 'dev-agent', `[PM] サブタスク再定義失敗 → エスカレーション`, { convId: conv.id });
+          emitDevEvent({ type: 'escalation', convId: conv.id, agent: 'pm', data: { reason: 'redefine_failed', file: subtask.path } });
+          throw new EscalationError(
+            `レビュー差し戻しの繰り返し（${subtask.path}）でPMのサブタスク再定義も失敗\n\n` +
+            `差し戻し理由: ${currentRejectReason.slice(0, 300)}\n` +
+            `PMの判断: ユーザーに方針を確認する必要があります。`
+          );
         }
       } else if (reviewRetry === 2) {
         // 異なる理由の2回目差し戻し → PM介入（従来動作）
@@ -1513,8 +1607,21 @@ ${conv.requirements}
       prompt += `\n## レビュアーからのフィードバック（必ず反映すること）\n${reviewFeedback}\n`;
     }
 
+    // 全サブタスクの概要を注入（共有コンテキスト — 自分のタスクの位置を把握）
+    const taskOverview = _allSubtasks
+      .map(s => `${s.index}. [${s.action}] ${s.path}: ${s.description.slice(0, 80)}${s.index === subtask.index ? ' ← 今回のタスク' : ''}`)
+      .join('\n');
+    prompt += `\n## 全サブタスクの概要（あなたのタスクは${subtask.index}番）\n${taskOverview}\n`;
+    prompt += `※ 他のサブタスクの内容を把握した上で、必要な連携（import先の確認等）を行ってください。\n`;
+
     prompt += `\n## 指示
-- このサブタスク（1ファイル）だけを作成/変更してください`;
+- 主な変更対象は ${subtask.path} です
+- このファイルが正しく動作するために、他ファイルへの以下の変更のみ許可します:
+  - import追加/修正（新しいimportのみ。既存ファイルの再編成は不可）
+  - use()登録（dashboard.ts/app.tsへの1-2行追加のみ）
+  - ナビゲーションリンク追加（views.tsへの1-2行追加のみ）
+- ${subtask.path}以外のファイルへのロジック変更・リファクタリングは絶対禁止
+- 判断に迷ったら相談してください`;
 
     if (skipBuild) {
       prompt += `\n- ⚠️ npm run build は実行しないでください。ビルドは後で一括で行います。ファイルの作成/変更のみ行ってください`;
@@ -1533,10 +1640,21 @@ ${conv.requirements}
     file: FileToWrite,
     completedFiles: Array<{ path: string; content: string }>,
     systemFiles: Array<{ path: string; content: string }> = [],
+    allSubtasks: Subtask[] = [],
   ): string {
     let ctx = `## レビュー対象\npath: ${file.path}\naction: ${file.action}\n\n`;
     ctx += `## コード\n\`\`\`typescript\n${file.content}\n\`\`\`\n\n`;
     ctx += `## サブタスクの説明\n${subtask.description}\n\n`;
+
+    // 後続サブタスク情報（レビュアーのスコープ判断用）
+    const remaining = allSubtasks
+      .filter(s => s.index > subtask.index)
+      .map(s => `${s.index}. [${s.action}] ${s.path}: ${s.description.slice(0, 80)}`)
+      .join('\n');
+    if (remaining) {
+      ctx += `## 後続サブタスク（このレビュー後に実施予定）\n${remaining}\n`;
+      ctx += `※ 後続サブタスクで実施予定の変更は、このレビューではerrorとしないこと。ただし「到達不可能」問題はerror。\n\n`;
+    }
 
     // ACをレビュアーに提供（サブタスクがACに貢献しているか検証するため）
     if (this.currentAC.length > 0) {
