@@ -14,6 +14,7 @@ import { consolidateAgentMemories, AgentRole } from './agents/dev/teamMemory';
 import { loadKnowledgeCache } from './line/bunshinPrompt';
 import { completePendingDeploy } from './agents/dev/deployer';
 import { initEmbeddingCache } from './memory/embeddingCache';
+import { initializeCoreMemories } from './memory/coreMemory';
 import { logger } from './utils/logger';
 import path from 'path';
 
@@ -26,6 +27,9 @@ async function main(): Promise<void> {
 
   // Embeddingキャッシュ初期化（DBから全embeddingをメモリにロード）
   await initEmbeddingCache();
+
+  // Core Memory初期化（Phase 6.5: MemGPT式コアメモリ + ペルソナアンカリング）
+  await initializeCoreMemories();
 
   // ナレッジファイルロード（DB + 分身プロンプトキャッシュ）
   const knowledgeDir = path.join(__dirname, '..', 'knowledge');

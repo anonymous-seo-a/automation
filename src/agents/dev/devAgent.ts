@@ -1597,6 +1597,13 @@ ${conv.requirements}
       prompt += `\n${proceduralCtx}\n`;
     }
 
+    // ナレッジグラフ: 類似過去開発の経験を注入（Phase 4.5）
+    try {
+      const { findSimilarDeployExperiences } = await import('./knowledgeGraph');
+      const graphCtx = await findSimilarDeployExperiences(subtask.description);
+      if (graphCtx) prompt += `\n${graphCtx}\n`;
+    } catch { /* graph not populated yet */ }
+
     // 過去開発で同じファイルを触った実績があれば参照情報として注入
     const relatedDev = await buildRelatedDevContext(subtask.path);
     if (relatedDev) {

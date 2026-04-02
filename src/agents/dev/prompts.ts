@@ -1,5 +1,6 @@
 import { buildAgentMemoryContext, AgentRole } from './teamMemory';
 import { buildEvaluationContext } from './teamEvaluation';
+import { getCoreMemory } from '../../memory/coreMemory';
 
 export const DEV_SYSTEM_PROMPT = `あなたは母艦システムの開発チームの一員です。
 TypeScript + Express + PostgreSQL + Claude API + LINE Messaging API で構成された
@@ -333,13 +334,15 @@ const PERSONALITIES: Record<AgentRole, string> = {
 - 過去のテスト失敗パターン（記憶を参照）を把握し、同じ失敗を予測する。`,
 };
 
-/** 人格 + 記憶(意味検索) + 評価を統合したプロンプトを構築 */
+/** 人格 + コアメモリ + 記憶(意味検索) + 評価を統合したプロンプトを構築 */
 export async function buildAgentPersonality(agent: AgentRole, taskContext?: string): Promise<string> {
   const personality = PERSONALITIES[agent] || '';
+  const coreMemory = await getCoreMemory(agent);
   const memoryContext = await buildAgentMemoryContext(agent, taskContext);
   const evaluationContext = await buildEvaluationContext(agent);
 
   let prompt = DEV_SYSTEM_PROMPT + '\n\n' + personality;
+  if (coreMemory) prompt += '\n\n## Core Memory（常時参照）\n' + coreMemory;
   if (memoryContext) prompt += '\n\n' + memoryContext;
   if (evaluationContext) prompt += '\n\n' + evaluationContext;
   return prompt;

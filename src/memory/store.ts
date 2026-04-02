@@ -2,6 +2,8 @@ import { getDB } from '../db/database';
 import { logger } from '../utils/logger';
 import { embed, embedQuery, cosineSimilarity, embeddingToSql, parseEmbedding } from './embedding';
 import { getMemoriesCache, addToMemoriesCache, isCacheInitialized } from './embeddingCache';
+import { hybridSearch } from './hybridSearch';
+import { detectContradiction } from './contradictionDetector';
 
 export type MemoryType = 'profile' | 'project' | 'memo' | 'session_summary' | 'consolidated';
 
@@ -54,6 +56,24 @@ export async function saveMemoryWithEmbedding(
       embeddingSql = embeddingToSql(vec);
     } catch (err) {
       logger.warn('Embedding取得失敗（テキストのみ保存）', { err: err instanceof Error ? err.message : String(err) });
+    }
+
+    // Phase 2.5: 矛盾検出（embedding がある場合のみ）
+    if (embeddingSql) {
+      try {
+        const contradiction = await detectContradiction(
+          'memories', content, embeddingSql, 'user_id', userId,
+        );
+        if (contradiction.hasContradiction) {
+          logger.info('矛盾検出・上書き', {
+            userId, type, key,
+            contradictedId: contradiction.contradictedId,
+            explanation: contradiction.explanation,
+          });
+        }
+      } catch (err) {
+        logger.warn('矛盾検出スキップ', { err: err instanceof Error ? err.message : String(err) });
+      }
     }
 
     await db.prepare(`
@@ -145,26 +165,24 @@ export async function searchByMeaning(
       return results;
     }
 
-    // キャッシュ未初期化時はDB直接
-    const db = getDB();
-    const rows = await db.prepare(
-      'SELECT * FROM memories WHERE user_id = ? AND embedding IS NOT NULL'
-    ).all(userId) as Memory[];
-
-    const scored: MemorySearchResult[] = [];
-    for (const row of rows) {
-      if (!row.embedding) continue;
-      const memVec = parseEmbedding(row.embedding as string);
-      const similarity = cosineSimilarity(queryVec, memVec);
-      const daysSince = (Date.now() - new Date(row.updated_at).getTime()) / (1000 * 60 * 60 * 24);
-      const timeDecay = Math.exp(-daysSince / 60);
-      const impBoost = (row.importance || 3) / 5;
-      const score = similarity * 0.6 + timeDecay * 0.2 + impBoost * 0.2;
-      scored.push({ memory: row, score });
+    // キャッシュ未初期化時はPhase 3.5ハイブリッド検索（BM25 + Semantic + Graph RRF統合）
+    const hybridResults = await hybridSearch(query, 'memories', 'user_id', userId, topK);
+    if (hybridResults.length > 0) {
+      const db = getDB();
+      const results: MemorySearchResult[] = [];
+      for (const r of hybridResults) {
+        const full = await db.prepare('SELECT * FROM memories WHERE id = ?').get(r.id) as Memory;
+        if (full) results.push({ memory: full, score: r.score });
+      }
+      return results;
     }
 
-    scored.sort((a, b) => b.score - a.score);
-    return scored.slice(0, topK);
+    // ハイブリッド検索が空の場合のフォールバック
+    const db = getDB();
+    const fallback = await db.prepare(
+      "SELECT * FROM memories WHERE user_id = ? AND updated_at >= NOW() - INTERVAL '60 days' ORDER BY importance DESC, updated_at DESC LIMIT ?"
+    ).all(userId, topK) as Memory[];
+    return fallback.map(m => ({ memory: m, score: 0.5 }));
   } catch (err) {
     logger.warn('意味検索失敗、キーワード検索にフォールバック', { err: err instanceof Error ? err.message : String(err) });
     return keywordSearchFallback(userId, query, topK);

@@ -453,6 +453,15 @@ export async function completePendingDeploy(): Promise<void> {
       ).catch(() => {});
     }
 
+    // ナレッジグラフ記録（Phase 4.5: バックグラウンド）
+    if (updatedConv) {
+      import('./knowledgeGraph').then(({ recordDeployToGraph }) =>
+        recordDeployToGraph(updatedConv, true).catch(err =>
+          logger.warn('ナレッジグラフ記録失敗', { err: err instanceof Error ? err.message : String(err) })
+        )
+      ).catch(() => {});
+    }
+
     // レトロスペクティブ（バックグラウンド）
     if (updatedConv) {
       import('./retrospective').then(({ runRetrospective }) =>
@@ -489,6 +498,15 @@ export async function completePendingDeploy(): Promise<void> {
           logger.warn('レトロスペクティブ失敗（デプロイ失敗時）', { err: err instanceof Error ? err.message : String(err) })
         )
       ).catch(err => logger.warn('レトロスペクティブimport失敗', { err: err instanceof Error ? err.message : String(err) }));
+    }
+
+    // ナレッジグラフ記録（Phase 4.5: 失敗時もバックグラウンドで記録）
+    if (failedConv) {
+      import('./knowledgeGraph').then(({ recordDeployToGraph }) =>
+        recordDeployToGraph(failedConv, false).catch(err =>
+          logger.warn('ナレッジグラフ記録失敗', { err: err instanceof Error ? err.message : String(err) })
+        )
+      ).catch(() => {});
     }
 
     // ロールバック後に再起動が必要（コードを元に戻したので）

@@ -2,7 +2,9 @@ import { getDB } from '../../db/database';
 import { logger } from '../../utils/logger';
 import { embed, embedBatch, embedQuery, cosineSimilarity, embeddingToSql, parseEmbedding } from '../../memory/embedding';
 import { getAgentCache, addToAgentCache, removeFromAgentCache, isCacheInitialized } from '../../memory/embeddingCache';
+import { hybridSearch } from '../../memory/hybridSearch';
 import { callClaude } from '../../claude/client';
+import { detectContradiction } from '../../memory/contradictionDetector';
 import * as crypto from 'crypto';
 
 export type AgentRole = 'pm' | 'engineer' | 'reviewer' | 'deployer';
@@ -84,6 +86,24 @@ export async function saveAgentMemoryWithEmbedding(
     logger.warn('Agent embedding取得失敗（テキストのみ保存）', {
       agent, key, err: err instanceof Error ? err.message : String(err),
     });
+  }
+
+  // Phase 2.5: 矛盾検出（embedding がある場合のみ）
+  if (embeddingSql) {
+    try {
+      const contradiction = await detectContradiction(
+        'agent_memories', content, embeddingSql, 'agent', agent,
+      );
+      if (contradiction.hasContradiction) {
+        logger.info('矛盾検出・上書き', {
+          agent, type, key,
+          contradictedId: contradiction.contradictedId,
+          explanation: contradiction.explanation,
+        });
+      }
+    } catch (err) {
+      logger.warn('矛盾検出スキップ', { err: err instanceof Error ? err.message : String(err) });
+    }
   }
 
   await db.prepare(`
@@ -205,26 +225,26 @@ export async function searchAgentMemories(
       return results;
     }
 
-    // キャッシュ未初期化時はDB直接
-    const db = getDB();
-    const rows = await db.prepare(
-      'SELECT * FROM agent_memories WHERE agent = ? AND embedding IS NOT NULL'
-    ).all(agent) as AgentMemory[];
-
-    const scored: AgentMemorySearchResult[] = [];
-    for (const row of rows) {
-      if (!row.embedding) continue;
-      const memVec = parseEmbedding(row.embedding);
-      const similarity = cosineSimilarity(queryVec, memVec);
-      const daysSince = (Date.now() - new Date(row.updated_at).getTime()) / (1000 * 60 * 60 * 24);
-      const timeDecay = Math.exp(-daysSince / 30);
-      const impBoost = (row.importance || 3) / 5;
-      const score = similarity * 0.6 + timeDecay * 0.2 + impBoost * 0.2;
-      scored.push({ memory: row, score });
+    // キャッシュ未初期化時はPhase 3.5ハイブリッド検索（BM25 + Semantic + Graph RRF統合）
+    const hybridResults = await hybridSearch(query, 'agent_memories', 'agent', agent, topK);
+    if (hybridResults.length > 0) {
+      const db = getDB();
+      const results: AgentMemorySearchResult[] = [];
+      for (const r of hybridResults) {
+        const full = await db.prepare('SELECT * FROM agent_memories WHERE id = ?').get(r.id) as AgentMemory;
+        if (full) {
+          results.push({ memory: full, score: r.score });
+        }
+      }
+      return results;
     }
 
-    scored.sort((a, b) => b.score - a.score);
-    return scored.slice(0, topK);
+    // ハイブリッド検索が空の場合のフォールバック（embedding APIダウン等）
+    const db = getDB();
+    const fallback = await db.prepare(
+      "SELECT * FROM agent_memories WHERE agent = ? AND updated_at >= NOW() - INTERVAL '30 days' ORDER BY importance DESC, updated_at DESC LIMIT ?"
+    ).all(agent, topK) as AgentMemory[];
+    return fallback.map(m => ({ memory: m, score: 0.5 }));
   } catch (err) {
     logger.warn('エージェント意味検索失敗、フォールバック', {
       agent, err: err instanceof Error ? err.message : String(err),
