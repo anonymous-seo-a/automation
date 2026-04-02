@@ -5,6 +5,8 @@ import { config } from '../config';
 import { listAgents } from '../agents/router';
 import { renderPage } from './views';
 import { setupLiveRoutes } from './liveView';
+import { mindmapApiRouter } from './mindmapApi';
+import { mindmapViewRouter } from './mindmapView';
 
 export const adminRouter = Router();
 
@@ -299,3 +301,7 @@ adminRouter.get('/knowledge', (_req: Request, res: Response) => {
   `).all() as Array<Record<string, unknown>>;
   res.send(renderPage('knowledge', { items }));
 });
+
+// マインドマップ — API を先にマウントして '/mindmap' に吸われないようにする
+adminRouter.use('/mindmap/api', mindmapApiRouter);
+adminRouter.use('/mindmap', mindmapViewRouter);
