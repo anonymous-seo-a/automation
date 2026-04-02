@@ -187,7 +187,8 @@ body{
   box-shadow:0 0 16px rgba(59,130,246,0.2);
 }
 .pipe-step.completed{background:rgba(16,185,129,0.15);color:#6ee7b7}
-.pipe-step.failed-step{background:rgba(239,68,68,0.15);color:#fca5a5}
+.pipe-step.failed-step{background:rgba(239,68,68,0.15);color:#fca5a5;font-weight:700;box-shadow:0 0 16px rgba(239,68,68,0.15)}
+.pipe-step.stuck-step{background:rgba(251,191,36,0.2);color:#fde68a;font-weight:700;box-shadow:0 0 16px rgba(251,191,36,0.15)}
 .pipe-arrow{color:#334155;font-size:13px;flex-shrink:0}
 
 /* ── Agent Desks Grid ── */
@@ -466,6 +467,7 @@ const state = {
   connected: false,
   currentConv: null,
   currentPhase: null,
+  lastNormalPhase: null,
   agents: { pm:'idle', engineer:'idle', reviewer:'idle', deployer:'idle' },
   chatMessages: [],
 };
@@ -525,12 +527,22 @@ function handleEvent(evt) {
       if (d.phase === 'testing') setAgentActive('deployer');
       if (d.phase === 'deployed') setAllIdle();
       if (d.phase === 'failed') setAllIdle();
+      if (d.phase === 'stuck') {
+        setAgentStatus('pm', 'warning', 'ユーザーに相談中');
+        ['engineer','reviewer','deployer'].forEach(a => setAgentStatus(a, 'idle', '待機中'));
+      }
       break;
 
-    case 'agent_activity':
-      setAgentStatus(agent, d.status === 'idle' ? 'idle' : 'active', d.message || '');
+    case 'agent_activity': {
+      // 3状態: idle / active / warning / error をそのまま反映
+      const agentStatus = d.status === 'idle' ? 'idle'
+        : d.status === 'error' ? 'error'
+        : d.status === 'warning' ? 'warning'
+        : 'active';
+      setAgentStatus(agent, agentStatus, d.message || '');
       if (d.file) setAgentDetail(agent, '<span class="file-tag">' + esc(d.file) + '</span>');
       break;
+    }
 
     case 'agent_message':
       setAgentStatus(agent, 'active', d.message || '');
@@ -571,6 +583,24 @@ function handleEvent(evt) {
         ['pm','engineer','reviewer','deployer'].forEach(a => setAgentStatus(a, 'active', '診断会議参加中'));
       } else if (d.recommendation) {
         setAgentStatus('pm', 'active', '診断結果: ' + d.recommendation);
+        if (d.rootCause) setAgentDetail('pm', '<div class="code-preview">' + esc(String(d.rootCause).slice(0,200)) + '</div>');
+      }
+      break;
+
+    case 'escalation':
+      setAgentStatus('pm', 'warning', 'ユーザーにエスカレーション中');
+      if (d.file) setAgentDetail('pm', '<span class="file-tag">' + esc(d.file) + '</span> ' + esc(d.reason || ''));
+      break;
+
+    case 'batch_start':
+      setAgentStatus('engineer', 'active', 'バッチ' + (d.batchIndex || '') + ' 並列実行中 (' + (d.count || '') + '件)');
+      break;
+
+    case 'batch_complete':
+      if (d.failed > 0) {
+        setAgentStatus('engineer', 'warning', 'バッチ' + (d.batchIndex || '') + ' 完了 (' + d.failed + '件失敗)');
+      } else {
+        setAgentStatus('engineer', 'active', 'バッチ' + (d.batchIndex || '') + ' 完了 ✓');
       }
       break;
   }
@@ -614,6 +644,10 @@ function setAgentDetail(agent, html) {
 
 // ── Pipeline ──
 function setPhase(phase, topic) {
+  // stuck/failedの場合、直前の正常フェーズを記憶
+  if (phase !== 'stuck' && phase !== 'failed' && PHASE_ORDER.includes(phase)) {
+    state.lastNormalPhase = phase;
+  }
   state.currentPhase = phase;
   if (topic) {
     state.currentConv = { topic, status: phase };
@@ -622,30 +656,29 @@ function setPhase(phase, topic) {
 
   // Update task bar
   const bar = $('task-bar');
-  if (phase && phase !== 'deployed' && phase !== 'failed') {
-    bar.classList.remove('hidden');
-    const st = $('task-status');
-    st.textContent = PHASE_LABELS[phase] || phase;
-    st.className = 'task-status' + (phase === 'deployed' ? ' deployed' : phase === 'failed' ? ' failed' : phase === 'stuck' ? ' stuck' : '');
-  } else if (phase === 'deployed' || phase === 'failed') {
-    bar.classList.remove('hidden');
-    const st = $('task-status');
-    st.textContent = PHASE_LABELS[phase] || phase;
-    st.className = 'task-status' + (phase === 'deployed' ? ' deployed' : ' failed');
-  }
+  bar.classList.remove('hidden');
+  const st = $('task-status');
+  st.textContent = PHASE_LABELS[phase] || phase;
+  st.className = 'task-status' + (phase === 'deployed' ? ' deployed' : phase === 'failed' ? ' failed' : phase === 'stuck' ? ' stuck' : '');
 
   // Update pipeline steps
-  const idx = PHASE_ORDER.indexOf(phase);
+  // stuck/failedは正常フェーズのステップを色変え（黄/赤）で表現
+  const isStuck = phase === 'stuck';
+  const isFailed = phase === 'failed';
+  const effectivePhase = (isStuck || isFailed) ? (state.lastNormalPhase || 'implementing') : phase;
+  const idx = PHASE_ORDER.indexOf(effectivePhase);
+
   document.querySelectorAll('.pipe-step').forEach(el => {
     const stepPhase = el.dataset.phase;
     const stepIdx = PHASE_ORDER.indexOf(stepPhase);
-    el.classList.remove('active', 'completed', 'failed-step');
-    if (phase === 'failed' || phase === 'stuck') {
-      if (stepIdx < idx) el.classList.add('completed');
-      else if (stepPhase === phase) el.classList.add('failed-step');
-    } else {
-      if (stepIdx < idx) el.classList.add('completed');
-      else if (stepIdx === idx) el.classList.add('active');
+    el.classList.remove('active', 'completed', 'failed-step', 'stuck-step');
+
+    if (stepIdx < idx) {
+      el.classList.add('completed');
+    } else if (stepIdx === idx) {
+      if (isStuck) el.classList.add('stuck-step');
+      else if (isFailed) el.classList.add('failed-step');
+      else el.classList.add('active');
     }
   });
 }
@@ -684,6 +717,8 @@ function formatChatText(evt) {
   const d = evt.data || {};
   switch (evt.type) {
     case 'phase_change':
+      if (d.phase === 'stuck') return '<span class="tag tag-error">⚠️ スタック</span> ' + esc(String(d.reason || '').slice(0,80));
+      if (d.phase === 'failed') return '<span class="tag tag-error">❌ 失敗</span> ' + esc(String(d.reason || '').slice(0,80));
       return '<span class="tag tag-deploy">' + (PHASE_LABELS[d.phase] || d.phase) + '</span> フェーズに移行' + (d.topic ? ' - ' + esc(d.topic) : '');
     case 'agent_activity':
       return esc(d.message || d.status || '');
@@ -703,7 +738,14 @@ function formatChatText(evt) {
       return '<span class="tag tag-deploy">デプロイ</span> 開始...';
     case 'diagnosis':
       if (d.status === 'meeting') return '<span class="tag tag-diagnosis">チーム診断</span> 会議開始';
-      return '<span class="tag tag-diagnosis">診断結果</span> ' + esc(d.recommendation || '') + ' - ' + esc(String(d.rootCause || '').slice(0,60));
+      return '<span class="tag tag-diagnosis">診断結果</span> ' + esc(d.recommendation || '') + (d.rootCause ? ' - 原因: ' + esc(String(d.rootCause).slice(0,60)) : '');
+    case 'escalation':
+      return '<span class="tag tag-error">⚠️ エスカレーション</span> ' + esc(d.reason || '') + (d.file ? ' (' + esc(d.file) + ')' : '');
+    case 'batch_start':
+      return '<span class="tag tag-build">バッチ' + (d.batchIndex || '') + '</span> 並列実行開始 (' + (d.count || '') + '件)';
+    case 'batch_complete':
+      if (d.failed > 0) return '<span class="tag tag-error">バッチ' + (d.batchIndex || '') + '</span> ' + d.succeeded + '件成功 / ' + d.failed + '件失敗';
+      return '<span class="tag tag-build">バッチ' + (d.batchIndex || '') + '</span> 完了 ✓ (' + (d.succeeded || '') + '件)';
     default:
       return esc(JSON.stringify(d).slice(0, 100));
   }

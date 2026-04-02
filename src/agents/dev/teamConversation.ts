@@ -102,7 +102,7 @@ export async function runConsensus(
   const allOpinions = log.map(e => `[${e.role}] ${e.message}`).join('\n');
   const { text: decision } = await callClaude({
     system: await buildAgentPersonality('pm'),
-    messages: [{ role: 'user', content: `全員の意見が出揃いました。\n\n${allOpinions}\n\n最終判断とその理由を述べてください。` }],
+    messages: [{ role: 'user', content: `全員の意見が出揃いました。\n\n${allOpinions}\n\n最終判断とその理由を述べてください。\n\n重要: チーム内で解決が困難で、ユーザー(Daiki)の判断が必要な場合は、結論を「ESCALATE:」から始めてその理由を書いてください。例: 「ESCALATE: 仕様の解釈が分かれており、ユーザー確認が必要」\nチーム内で解決可能なら、ESCALATEは不要です。具体的な解決策を述べてください。` }],
     model: 'default',
   });
   log.push({ role: 'pm', message: decision, timestamp: now() });

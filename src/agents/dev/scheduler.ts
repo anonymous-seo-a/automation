@@ -6,6 +6,7 @@ export interface SchedulerSubtask {
   action: 'create' | 'update';
   description: string;
   depends_on: number[];
+  difficulty: 'simple' | 'moderate' | 'complex';
 }
 
 export interface ExecutionBatch {

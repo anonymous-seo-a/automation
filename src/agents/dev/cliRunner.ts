@@ -14,15 +14,20 @@ export interface CLIResult {
  * Claude CLIを非対話モード (-p) で実行する。
  * CLIがファイル読み書き・ビルドチェックまで自律実行する。
  */
-export function runClaudeCLI(prompt: string, timeoutMs = 300_000): Promise<CLIResult> {
+export function runClaudeCLI(
+  prompt: string,
+  model: 'sonnet' | 'opus' = 'sonnet',
+  timeoutMs = 300_000,
+): Promise<CLIResult> {
   return new Promise((resolve) => {
-    logger.info('Claude CLI実行開始', { promptLength: prompt.length });
+    logger.info('Claude CLI実行開始', { promptLength: prompt.length, model });
 
     const child: ChildProcess = execFile('npx', [
       '-y', '@anthropic-ai/claude-code',
       '-p',
       '--output-format', 'text',
       '--dangerously-skip-permissions',
+      '--model', model === 'opus' ? 'claude-opus-4-6' : 'claude-sonnet-4-6',
       prompt,
     ], {
       cwd: PROJECT_ROOT,

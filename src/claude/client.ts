@@ -8,15 +8,37 @@ const MAX_RETRIES = 4;
 const RETRY_DELAYS = [2000, 5000, 15000, 30000]; // 通常リトライ
 const OVERLOAD_RETRY_DELAYS = [5000, 15000, 45000, 90000]; // 529（サーバー過負荷）専用: より長いバックオフ
 
-interface ClaudeMessage {
+// ── メッセージ型定義 ──
+
+/** テキストのみのcontent */
+interface TextContent {
+  type: 'text';
+  text: string;
+}
+
+/** 画像（base64）のcontent */
+interface ImageContent {
+  type: 'image';
+  source: {
+    type: 'base64';
+    media_type: 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
+    data: string; // base64エンコード済み
+  };
+}
+
+type ContentBlock = TextContent | ImageContent;
+
+/** messagesの1エントリ。contentがstringならテキストのみ、配列なら複合（テキスト+画像） */
+export interface ClaudeMessage {
   role: 'user' | 'assistant';
-  content: string;
+  content: string | ContentBlock[];
 }
 
 interface ClaudeResponse {
   content: Array<{ type: string; text?: string }>;
   usage: { input_tokens: number; output_tokens: number };
   model: string;
+  stop_reason?: string;
 }
 
 function isRetryable(status: number): boolean {
@@ -34,6 +56,8 @@ export async function callClaude(params: {
   maxTokens?: number;
   taskId?: string;
   timeoutMs?: number;
+  /** web_searchツールを有効にする */
+  enableWebSearch?: boolean;
 }): Promise<{ text: string; usage: { input: number; output: number } }> {
 
   if (await isOverBudget()) {
@@ -46,6 +70,11 @@ export async function callClaude(params: {
 
   // Opusモデルはデフォルトで長めのタイムアウトを使用
   const defaultTimeout = params.model === 'opus' ? OPUS_TIMEOUT_MS : API_TIMEOUT_MS;
+
+  // web_searchツール
+  const tools = params.enableWebSearch
+    ? [{ type: 'web_search_20250305', name: 'web_search', max_uses: 3 }]
+    : undefined;
 
   let lastError: Error | null = null;
   let retryDelayOverride: number | null = null;
@@ -62,10 +91,20 @@ export async function callClaude(params: {
     }
 
     try {
-      logger.info('Claude API呼び出し', { model, taskId: params.taskId, attempt });
+      logger.info('Claude API呼び出し', { model, taskId: params.taskId, attempt, webSearch: !!params.enableWebSearch });
 
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), params.timeoutMs || defaultTimeout);
+
+      const body: Record<string, unknown> = {
+        model,
+        max_tokens: params.maxTokens || 4096,
+        system: params.system || undefined,
+        messages: params.messages,
+      };
+      if (tools) {
+        body.tools = tools;
+      }
 
       let response: Response;
       try {
@@ -76,12 +115,7 @@ export async function callClaude(params: {
             'x-api-key': config.claude.apiKey,
             'anthropic-version': '2023-06-01',
           },
-          body: JSON.stringify({
-            model,
-            max_tokens: params.maxTokens || 4096,
-            system: params.system || undefined,
-            messages: params.messages,
-          }),
+          body: JSON.stringify(body),
           signal: controller.signal,
         });
       } finally {
@@ -120,6 +154,10 @@ export async function callClaude(params: {
       if (!data.content || !Array.isArray(data.content)) {
         throw new Error(`Claude API レスポンス形式が不正: content配列がありません`);
       }
+
+      // web_searchツール使用時: stop_reason === 'tool_use' なら自動的にツール結果を返してループ
+      // Claude APIのweb_searchは server-side tool なので、クライアント側でのツール結果送信は不要
+      // レスポンスのcontent配列にtextブロックとweb_search結果が混在する
 
       const text = data.content
         .filter(c => c.type === 'text' && c.text)

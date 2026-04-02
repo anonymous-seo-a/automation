@@ -152,3 +152,88 @@ export function getHearingRound(id: string): number {
     return 0;
   }
 }
+
+// ============================================================
+// 過去開発履歴参照 (D4)
+// ============================================================
+
+export interface DeployedProject {
+  id: string;
+  topic: string;
+  requirements: string | null;
+  generated_files: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/** 直近のデプロイ済み開発を取得 */
+export function getDeployedConversations(limit: number = 5): DeployedProject[] {
+  const db = getDB();
+  return db.prepare(`
+    SELECT id, topic, requirements, generated_files, created_at, updated_at
+    FROM dev_conversations
+    WHERE status = 'deployed'
+    ORDER BY updated_at DESC
+    LIMIT ?
+  `).all(limit) as DeployedProject[];
+}
+
+/** ファイルパスで関連する過去開発を検索（エンジニア/レビュアー用オンデマンド） */
+export function searchDeployedByFilePath(filePath: string, limit: number = 3): DeployedProject[] {
+  const db = getDB();
+  // generated_files はJSON配列。部分一致で検索
+  return db.prepare(`
+    SELECT id, topic, requirements, generated_files, created_at, updated_at
+    FROM dev_conversations
+    WHERE status = 'deployed'
+      AND generated_files LIKE ?
+    ORDER BY updated_at DESC
+    LIMIT ?
+  `).all(`%${filePath}%`, limit) as DeployedProject[];
+}
+
+/** トピックのキーワードで過去開発を検索 */
+export function searchDeployedByKeyword(keyword: string, limit: number = 5): DeployedProject[] {
+  const db = getDB();
+  return db.prepare(`
+    SELECT id, topic, requirements, generated_files, created_at, updated_at
+    FROM dev_conversations
+    WHERE status = 'deployed'
+      AND (topic LIKE ? OR requirements LIKE ?)
+    ORDER BY updated_at DESC
+    LIMIT ?
+  `).all(`%${keyword}%`, `%${keyword}%`, limit) as DeployedProject[];
+}
+
+/** 過去開発履歴のサマリーテキストを構築（PM/分身用） */
+export function buildDevHistorySummary(limit: number = 5): string {
+  const projects = getDeployedConversations(limit);
+  if (projects.length === 0) return '';
+
+  const lines = projects.map((p, i) => {
+    const date = p.updated_at.slice(0, 10);
+    let files = '';
+    try {
+      const arr = JSON.parse(p.generated_files) as string[];
+      files = arr.map(f => f.split('/').pop()).join(', ');
+    } catch {
+      files = '(不明)';
+    }
+    return `${i + 1}. [${date}] ${p.topic} → ${files}`;
+  });
+
+  return `## 過去の開発実績（直近${projects.length}件）\n` + lines.join('\n');
+}
+
+/** 特定ファイルに関連する過去開発のコンテキストを構築（エンジニア/レビュアー用） */
+export function buildRelatedDevContext(filePath: string): string {
+  const related = searchDeployedByFilePath(filePath);
+  if (related.length === 0) return '';
+
+  const lines = related.map(p => {
+    const date = p.updated_at.slice(0, 10);
+    return `- [${date}] ${p.topic}`;
+  });
+
+  return `## このファイルに関連する過去の開発\n` + lines.join('\n');
+}

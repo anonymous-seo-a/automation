@@ -1,5 +1,6 @@
 import { Router, Request, Response } from 'express';
 import * as line from '@line/bot-sdk';
+import { Readable } from 'stream';
 import { config } from '../config';
 import { isAuthorizedUser } from './auth';
 import { sendLineMessage, setActiveSendTo } from './sender';
@@ -16,7 +17,37 @@ import { consolidateKnowledge, applyPendingUpdate } from '../knowledge/consolida
 import { extractDaikiEvaluation } from '../agents/dev/teamEvaluation';
 import { getTeamConversations } from '../agents/dev/teamConversation';
 import { getDB } from '../db/database';
+import { getDetailedBudgetReport } from '../claude/budgetTracker';
 import { logger, dbLog } from '../utils/logger';
+
+// ── LINE Blob Client（画像ダウンロード用） ──
+const blobClient = new line.messagingApi.MessagingApiBlobClient({
+  channelAccessToken: config.line.channelAccessToken,
+});
+
+/** ReadableストリームをBufferに変換 */
+async function streamToBuffer(stream: Readable): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks);
+}
+
+/** LINE画像メッセージをbase64データとして取得 */
+export async function downloadLineImage(messageId: string): Promise<{ base64: string; mediaType: 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp' }> {
+  const stream = await blobClient.getMessageContent(messageId);
+  const buffer = await streamToBuffer(stream);
+  const base64 = buffer.toString('base64');
+
+  // LINEの画像は基本的にJPEG。マジックバイトで判定
+  let mediaType: 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp' = 'image/jpeg';
+  if (buffer[0] === 0x89 && buffer[1] === 0x50) mediaType = 'image/png';
+  else if (buffer[0] === 0x47 && buffer[1] === 0x49) mediaType = 'image/gif';
+  else if (buffer[0] === 0x52 && buffer[1] === 0x49) mediaType = 'image/webp';
+
+  return { base64, mediaType };
+}
 
 /**
  * プラットフォーム間のユーザーID統一。
@@ -48,7 +79,6 @@ webhookRouter.post(
       const events = (req.body?.events || []) as line.WebhookEvent[];
       for (const event of events) {
         if (event.type !== 'message') continue;
-        if (event.message.type !== 'text') continue;
 
         const userId = event.source.userId;
         if (!userId || !isAuthorizedUser(userId)) {
@@ -56,9 +86,27 @@ webhookRouter.post(
           continue;
         }
 
-        const text = event.message.text.trim();
-        dbLog('info', 'webhook', `受信: ${text.slice(0, 100)}`, { userId });
-        await handleMessage(userId, text);
+        // テキストメッセージ
+        if (event.message.type === 'text') {
+          const text = event.message.text.trim();
+          dbLog('info', 'webhook', `受信: ${text.slice(0, 100)}`, { userId });
+          await handleMessage(userId, text);
+          continue;
+        }
+
+        // 画像メッセージ
+        if (event.message.type === 'image') {
+          dbLog('info', 'webhook', '画像受信', { userId, messageId: event.message.id });
+          try {
+            const { base64, mediaType } = await downloadLineImage(event.message.id);
+            dbLog('info', 'webhook', `画像ダウンロード完了: ${mediaType}, ${Math.round(base64.length * 3 / 4 / 1024)}KB`, { userId });
+            await handleImageMessage(userId, base64, mediaType);
+          } catch (imgErr) {
+            logger.error('画像処理エラー', { err: imgErr instanceof Error ? imgErr.message : String(imgErr) });
+            await sendLineMessage(userId, '画像の読み取りに失敗しました。もう一度送っていただけますか？');
+          }
+          continue;
+        }
       }
     } catch (err) {
       logger.error('Webhook処理エラー', { err });
@@ -69,6 +117,35 @@ webhookRouter.post(
 /** 脱出意図の検出（最優先で処理） */
 function wantsToExit(text: string): boolean {
   return /リセット|reset|キャンセル|やめ|中止|中断|ストップ|stop|もういい|いらない|別の話|終わり|終了/i.test(text);
+}
+
+/** 画像メッセージの処理（LINE/Telegram共通） */
+export async function handleImageMessage(
+  userId: string,
+  base64: string,
+  mediaType: 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp',
+  caption?: string,
+): Promise<void> {
+  const dbId = getCanonicalUserId(userId);
+  setActiveSendTo(userId);
+
+  saveMessage(dbId, 'user', caption ? `[画像] ${caption}` : '[画像を送信]');
+
+  try {
+    const response = await generateResponse(
+      caption || 'この画像について説明してください。',
+      undefined,
+      dbId,
+      { base64, mediaType },
+    );
+    await sendLineMessage(userId, response);
+    saveMessage(dbId, 'assistant', response);
+    extractAndSaveMemories(dbId, caption || '[画像]', response).catch(() => {});
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    logger.error('画像応答生成エラー', { err: errMsg, userId });
+    await sendLineMessage(userId, 'すみません、画像の分析でエラーが発生しました。');
+  }
 }
 
 export async function handleMessage(userId: string, text: string): Promise<void> {
@@ -83,6 +160,15 @@ export async function handleMessage(userId: string, text: string): Promise<void>
 
   if (text === 'ping') {
     await sendLineMessage(userId, 'pong');
+    return;
+  }
+
+  // ★ API使用量コマンド
+  if (/^(API使用量|api使用量|予算|budget)$/i.test(text)) {
+    saveMessage(dbId, 'user', text);
+    const report = await getDetailedBudgetReport();
+    await sendLineMessage(userId, report);
+    saveMessage(dbId, 'assistant', report);
     return;
   }
 
@@ -219,8 +305,21 @@ export async function handleMessage(userId: string, text: string): Promise<void>
       dbLog('info', 'webhook', 'defining中だが無関係 → 通常応答');
     }
 
-    // ★ hearing / stuck / implementing / testing: responderに判断を委ねる（DEV_AGENTトリガー経由）
-    // （セーフワードなし → 自動ルーティング → 全てresponderが判定）
+    // ★ stuck: ユーザーのアクション指示は直接devAgentへ（responder経由だと届かない）
+    if (activeDevConv && activeDevConv.status === 'stuck') {
+      dbLog('info', 'webhook', `ルーティング → stuck応答: "${text.slice(0, 30)}"`);
+      await devAgent.handleMessage(userId, text);
+      return;
+    }
+
+    // ★ hearing: ユーザー応答は直接devAgentへ
+    if (activeDevConv && activeDevConv.status === 'hearing') {
+      dbLog('info', 'webhook', `ルーティング → hearing応答: "${text.slice(0, 30)}"`);
+      await devAgent.handleMessage(userId, text);
+      return;
+    }
+
+    // ★ implementing / testing: 実装中メッセージはdevAgentに渡す（「実装中です」と返す処理はdevAgent側）
 
     // ★ 新規開発依頼（正規表現で即マッチ）
     if (!activeDevConv && isDevRequest(text)) {

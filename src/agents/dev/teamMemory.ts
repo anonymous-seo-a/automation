@@ -269,10 +269,19 @@ export function recordTestLearning(
   checkAndRecordPattern(agent, `test_${testStage}_fail`, error.slice(0, 100));
 }
 
-/** 差し戻し修正時の学習記録 */
-export function recordRejectLearning(agent: AgentRole, issue: string, fix: string): void {
+/** 差し戻し修正時の学習記録（ERL式ヒューリスティック形式）
+ *  ナラティブ形式で「いつ・何が起きて・どうすべきだったか」を記録 */
+export function recordRejectLearning(agent: AgentRole, issue: string, fix: string, filePath?: string): void {
   const key = `reject_fix_${errorKey(issue)}`;
-  const content = `指摘: ${issue.slice(0, 200)}\n修正: ${fix.slice(0, 200)}`;
+  // ERL式: トリガー条件 + 失敗パターン + 推奨アクションの構造化ヒューリスティック
+  const fileHint = filePath ? `\nファイル: ${filePath}` : '';
+  const content = [
+    `【過去の失敗経験】`,
+    `状況: ${fileHint ? filePath + ' の実装中に' : '実装中に'}レビュアーから差し戻された`,
+    `指摘内容: ${issue.slice(0, 300)}`,
+    `教訓: ${fix.slice(0, 300)}`,
+    `→ 同様のファイルを実装する際は、この指摘を事前に確認してから実装を開始すること`,
+  ].join('\n');
   saveAgentMemory(agent, 'learning', key, content, 'review_reject');
   embedAndUpdateAsync(agent, 'learning', key, content);
   checkAndRecordPattern(agent, 'review_reject', issue.slice(0, 100));
@@ -352,20 +361,58 @@ function extractErrorType(error: string): string {
   return 'unknown_error';
 }
 
-/** 繰り返しパターンの検出・記録（importance: 5で保存） */
+/** 繰り返しパターンの検出・記録（importance: 5で保存）
+ *  意味検索で類似の過去学習を探し、閾値以上の類似度のものが2件以上あればパターン化 */
 export function checkAndRecordPattern(agent: AgentRole, errorType: string, details: string): void {
+  // 非同期でセマンティック検索を実行（呼び出し元をブロックしない）
+  checkAndRecordPatternAsync(agent, errorType, details).catch(err => {
+    logger.warn('パターン検出失敗', { agent, errorType, err: err instanceof Error ? err.message : String(err) });
+  });
+}
+
+async function checkAndRecordPatternAsync(agent: AgentRole, errorType: string, details: string): Promise<void> {
+  const SIMILARITY_THRESHOLD = 0.4; // この閾値以上を「類似」とみなす
+  const MIN_OCCURRENCES = 2;        // パターン化に必要な最小出現数
+
   try {
+    // 意味検索で類似の学習記録を探す
+    const query = `${errorType}: ${details}`;
+    const results = await searchAgentMemories(agent, query, 10);
+
+    // learning タイプのみ、かつ閾値以上の類似度のものをカウント
+    const similar = results.filter(r =>
+      r.memory.type === 'learning' && r.score >= SIMILARITY_THRESHOLD
+    );
+
+    if (similar.length >= MIN_OCCURRENCES) {
+      // 既にパターンとして記録済みか確認
+      const existingPattern = getDB().prepare(
+        "SELECT id FROM agent_memories WHERE agent = ? AND type = 'pattern' AND key = ?"
+      ).get(agent, `recurring_${errorType}`) as { id: number } | undefined;
+
+      const content = `繰り返し発生(${similar.length}回検出): ${errorType}\n直近: ${details}\n類似事例: ${similar.slice(0, 3).map(r => r.memory.content.slice(0, 80)).join(' / ')}\n→ 実装前に事前確認すること`;
+
+      if (existingPattern) {
+        // 既存パターンを更新（最新情報で上書き）
+        getDB().prepare(
+          'UPDATE agent_memories SET content = ?, importance = 5, updated_at = CURRENT_TIMESTAMP WHERE id = ?'
+        ).run(content, existingPattern.id);
+      } else {
+        saveAgentMemory(agent, 'pattern', `recurring_${errorType}`, content, 'auto_detect', 5);
+      }
+      logger.info('パターン検出', { agent, errorType, similarCount: similar.length });
+    }
+  } catch {
+    // embedding未対応時はキーワードフォールバック（従来動作）
     const existing = getDB().prepare(
       `SELECT COUNT(*) as cnt FROM agent_memories WHERE agent = ? AND type = 'learning' AND key LIKE ?`
     ).get(agent, `%${errorType}%`) as { cnt: number };
 
-    if (existing.cnt >= 2) {
+    if (existing.cnt >= MIN_OCCURRENCES) {
       saveAgentMemory(agent, 'pattern', `recurring_${errorType}`,
         `繰り返し発生(${existing.cnt}回): ${errorType}\n直近: ${details}\n→ 実装前に事前確認すること`,
         'auto_detect', 5);
     }
-  } catch (err) {
-    logger.warn('パターン検出失敗', { agent, errorType, err: err instanceof Error ? err.message : String(err) });
   }
 }
 
@@ -504,17 +551,20 @@ export async function consolidateAgentMemories(agent: AgentRole): Promise<void> 
 
     const db = getDB();
 
-    // 1. delete_keysの記憶を削除
+    // 1. delete_keysの記憶を削除（キャッシュも同期）
     if (result.delete_keys?.length > 0) {
       for (const key of result.delete_keys) {
+        // DELETE前にIDを取得（DELETE後ではレコードが消えておりIDが取れない）
+        const row = db.prepare(
+          'SELECT id FROM agent_memories WHERE agent = ? AND key = ?'
+        ).get(agent, key) as { id: number } | undefined;
+
         const deleted = db.prepare(
           "DELETE FROM agent_memories WHERE agent = ? AND type = 'learning' AND key = ?"
         ).run(agent, key);
-        if (deleted.changes > 0 && isCacheInitialized()) {
-          const row = db.prepare(
-            'SELECT id FROM agent_memories WHERE agent = ? AND key = ?'
-          ).get(agent, key) as { id: number } | undefined;
-          if (row) removeFromAgentCache(agent, row.id);
+
+        if (deleted.changes > 0 && row && isCacheInitialized()) {
+          removeFromAgentCache(agent, row.id);
         }
       }
       logger.info('エージェント記憶削除', { agent, count: result.delete_keys.length });

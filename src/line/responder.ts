@@ -1,12 +1,26 @@
-import { callClaude } from '../claude/client';
+import { callClaude, ClaudeMessage } from '../claude/client';
 import { getStatusReport } from '../queue/taskQueue';
 import { getBudgetReport } from '../claude/budgetTracker';
 import { getRecentHistory } from './messageHistory';
 import { buildSmartContext } from '../memory/store';
 import { buildBunshinPrompt } from './bunshinPrompt';
 import { buildSelfAwarenessContext } from '../github/client';
+import { buildDevHistorySummary } from '../agents/dev/conversation';
 import { config } from '../config';
 import { logger } from '../utils/logger';
+
+/** 開発に関する質問か判定（過去開発履歴を注入するため） */
+function isDevRelatedQuery(text: string): boolean {
+  const keywords = [
+    '何作った', '何を作った', '何開発した', '何を開発した',
+    '最近の開発', '開発履歴', '開発実績', '過去の開発',
+    '前に作った', '前作った', '作ったもの', '開発したもの',
+    '何を実装', '何実装した', '実装一覧', '機能一覧',
+    'どんな機能', 'どの機能', '何がある', '何ができ',
+  ];
+  const lower = text.toLowerCase();
+  return keywords.some(kw => lower.includes(kw));
+}
 
 /** ユーザーがシステム自身について質問しているか判定 */
 function isSelfReferentialQuery(text: string): boolean {
@@ -31,10 +45,16 @@ export interface ResponderContext {
   rawContext?: string;
 }
 
+export interface ImageData {
+  base64: string;
+  mediaType: 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
+}
+
 export async function generateResponse(
   userMessage: string,
   context?: ResponderContext,
   userId?: string,
+  image?: ImageData,
 ): Promise<string> {
   try {
     let contextBlock = '';
@@ -63,7 +83,7 @@ export async function generateResponse(
     }
 
     // 会話履歴を構築
-    const messages: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+    const messages: ClaudeMessage[] = [];
 
     if (userId) {
       const history = getRecentHistory(userId);
@@ -74,8 +94,18 @@ export async function generateResponse(
       }
     }
 
-    // 現在のメッセージを追加
-    messages.push({ role: 'user', content: userMessage });
+    // 現在のメッセージを追加（画像がある場合は複合contentブロック）
+    if (image) {
+      messages.push({
+        role: 'user',
+        content: [
+          { type: 'image', source: { type: 'base64', media_type: image.mediaType, data: image.base64 } },
+          { type: 'text', text: userMessage },
+        ],
+      });
+    } else {
+      messages.push({ role: 'user', content: userMessage });
+    }
 
     // 記憶コンテキストを追加（意味検索で関連記憶のみ注入）
     let memoryContext = '';
@@ -97,6 +127,14 @@ export async function generateResponse(
       }
     }
 
+    // 開発に関する質問には過去開発履歴を注入
+    if (isDevRelatedQuery(userMessage)) {
+      const devHistory = buildDevHistorySummary(10);
+      if (devHistory) {
+        contextBlock += `\n${devHistory}`;
+      }
+    }
+
     // 分身プロンプト構築（ナレッジ + 記憶を注入）
     const systemPrompt = buildBunshinPrompt(memoryContext) + contextBlock;
 
@@ -104,6 +142,7 @@ export async function generateResponse(
       system: systemPrompt,
       messages,
       model: 'default',
+      enableWebSearch: true,
     });
 
     return text;

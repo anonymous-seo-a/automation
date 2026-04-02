@@ -72,6 +72,36 @@ export function isAuthorizedTelegramUser(chatId: number | string): boolean {
   return String(chatId) === config.telegram.allowedChatId;
 }
 
+/** Telegram のファイルをダウンロードしてbase64変換 */
+export async function downloadTelegramFile(fileId: string): Promise<{ base64: string; mediaType: 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp' }> {
+  // Step 1: getFile でファイルパスを取得
+  const fileRes = await fetch(`${API_BASE}/getFile`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ file_id: fileId }),
+  });
+  if (!fileRes.ok) throw new Error(`Telegram getFile failed: ${fileRes.status}`);
+  const fileData = await fileRes.json() as { ok: boolean; result: { file_path: string } };
+  if (!fileData.ok || !fileData.result?.file_path) throw new Error('Telegram getFile: no file_path');
+
+  // Step 2: ファイル本体をダウンロード
+  const downloadUrl = `https://api.telegram.org/file/bot${config.telegram.botToken}/${fileData.result.file_path}`;
+  const dlRes = await fetch(downloadUrl);
+  if (!dlRes.ok) throw new Error(`Telegram file download failed: ${dlRes.status}`);
+
+  const arrayBuffer = await dlRes.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
+  const base64 = buffer.toString('base64');
+
+  // マジックバイトでmediaType判定
+  let mediaType: 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp' = 'image/jpeg';
+  if (buffer[0] === 0x89 && buffer[1] === 0x50) mediaType = 'image/png';
+  else if (buffer[0] === 0x47 && buffer[1] === 0x49) mediaType = 'image/gif';
+  else if (buffer[0] === 0x52 && buffer[1] === 0x49) mediaType = 'image/webp';
+
+  return { base64, mediaType };
+}
+
 function splitMessage(text: string): string[] {
   if (text.length <= MAX_MESSAGE_LENGTH) return [text];
   const chunks: string[] = [];
