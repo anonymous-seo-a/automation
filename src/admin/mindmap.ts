@@ -2,7 +2,11 @@ import { Router, Request, Response } from 'express';
 import { getDB } from '../db/database';
 import { config } from '../config';
 import { logger } from '../utils/logger';
-import { cosineSimilarity, parseEmbedding } from '../memory/embedding';
+import { cosineSimilarity } from '../memory/embedding';
+
+function parseEmbedding(raw: string): number[] {
+  return JSON.parse(raw) as number[];
+}
 import { renderPage } from './views';
 
 export const mindmapRouter = Router();
