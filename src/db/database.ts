@@ -1,6 +1,11 @@
 import pg from 'pg';
 import { config } from '../config';
 
+// PostgreSQLのTIMESTAMPTZ/TIMESTAMPをDateではなくISO文字列で返す
+// （SQLiteと同じ文字列形式を維持し、既存コードの.slice()等を壊さない）
+pg.types.setTypeParser(1114, (val: string) => val); // timestamp without tz
+pg.types.setTypeParser(1184, (val: string) => val); // timestamp with tz
+
 let pool: pg.Pool | null = null;
 
 function getPool(): pg.Pool {

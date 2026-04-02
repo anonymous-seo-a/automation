@@ -211,7 +211,7 @@ export async function buildDevHistorySummary(limit: number = 5): Promise<string>
   if (projects.length === 0) return '';
 
   const lines = projects.map((p, i) => {
-    const date = p.updated_at.slice(0, 10);
+    const date = String(p.updated_at).slice(0, 10);
     let files = '';
     try {
       const arr = JSON.parse(p.generated_files) as string[];
@@ -231,7 +231,7 @@ export async function buildRelatedDevContext(filePath: string): Promise<string> 
   if (related.length === 0) return '';
 
   const lines = related.map(p => {
-    const date = p.updated_at.slice(0, 10);
+    const date = String(p.updated_at).slice(0, 10);
     return `- [${date}] ${p.topic}`;
   });
 

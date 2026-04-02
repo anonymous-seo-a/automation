@@ -229,7 +229,7 @@ export async function handleMessage(userId: string, text: string): Promise<void>
       } else {
         const lines = logs.map((log: any) => {
           const participants = JSON.parse(log.participants).join(',');
-          const created = log.created_at?.slice(0, 16) || '';
+          const created = log.created_at ? String(log.created_at).slice(0, 16) : '';
           const decision = log.decision ? `\n  → ${log.decision.slice(0, 60)}` : '';
           return `[${log.conversation_type}] ${participants} (${created})${decision}`;
         });
