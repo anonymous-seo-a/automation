@@ -5,6 +5,7 @@ import { config } from '../config';
 import { listAgents } from '../agents/router';
 import { renderPage } from './views';
 import { setupLiveRoutes } from './liveView';
+import { memoryMapRouter } from './memoryMap';
 
 export const adminRouter = Router();
 
@@ -14,6 +15,9 @@ adminRouter.use(express.json());
 
 // ライブオフィスビュー
 setupLiveRoutes(adminRouter);
+
+// 記憶マインドマップ
+adminRouter.use('/memory-map', memoryMapRouter);
 
 // ダッシュボードトップ
 adminRouter.get('/', (_req: Request, res: Response) => {
