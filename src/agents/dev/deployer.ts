@@ -444,6 +444,15 @@ export async function completePendingDeploy(): Promise<void> {
       `詳細: ${detailUrl}`
     ).catch(err => logger.warn('デプロイ成功通知失敗', { err: err instanceof Error ? err.message : String(err) }));
 
+    // 手続き記憶の抽出（Phase 1: バックグラウンド）
+    if (updatedConv) {
+      import('./proceduralMemory').then(({ extractProcedure }) =>
+        extractProcedure(updatedConv).catch(err =>
+          logger.warn('手続き記憶抽出失敗', { err: err instanceof Error ? err.message : String(err) })
+        )
+      ).catch(() => {});
+    }
+
     // レトロスペクティブ（バックグラウンド）
     if (updatedConv) {
       import('./retrospective').then(({ runRetrospective }) =>
@@ -461,6 +470,11 @@ export async function completePendingDeploy(): Promise<void> {
     // ロールバック
     await rollbackGit(pending.branchName);
     await updateConversationStatus(pending.convId, 'failed');
+
+    // 手続き記憶の失敗記録（Phase 1）
+    import('./proceduralMemory').then(({ updateProcedureOutcome }) =>
+      updateProcedureOutcome(pending.convId, false).catch(() => {})
+    ).catch(() => {});
 
     const failUrl = `${config.admin.baseUrl}/admin/dev/${pending.convId}`;
     await sendLineMessage(pending.userId,

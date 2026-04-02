@@ -55,6 +55,7 @@ import { classifyError, categoryLabel } from './errorClassifier';
 import { runTeamDiagnosis, DiagnosisResult } from './teamDiagnosis';
 import { emitDevEvent } from '../../events/devEvents';
 import { buildExecutionBatches, formatBatchPlan } from './scheduler';
+import { findRelevantProcedures, extractProcedure, updateProcedureOutcome } from './proceduralMemory';
 import { getMonthlySpend } from '../../claude/budgetTracker';
 import { config } from '../../config';
 
@@ -1589,6 +1590,12 @@ ${acSection}
 ## 全体の要件定義
 ${conv.requirements}
 `;
+
+    // 手続き記憶: 類似タスクの成功手順を注入（Phase 1）
+    const proceduralCtx = await findRelevantProcedures(`${subtask.description} ${subtask.path}`);
+    if (proceduralCtx) {
+      prompt += `\n${proceduralCtx}\n`;
+    }
 
     // 過去開発で同じファイルを触った実績があれば参照情報として注入
     const relatedDev = await buildRelatedDevContext(subtask.path);

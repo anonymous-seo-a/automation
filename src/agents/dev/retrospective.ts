@@ -76,6 +76,14 @@ export async function runRetrospective(conv: DevConversation): Promise<void> {
     // 保存
     await saveTeamConversation('retrospective', ['pm', 'engineer', 'reviewer', 'deployer'], log, conv.id, pmSummary);
 
+    // 手続き記憶の抽出（Phase 1）— デプロイ成功のconvから開発手順を蒸留
+    try {
+      const { extractProcedure } = await import('./proceduralMemory');
+      await extractProcedure(conv);
+    } catch (err) {
+      dbLog('warn', 'retro', `手続き記憶抽出失敗: ${err instanceof Error ? err.message : String(err)}`, { convId: conv.id });
+    }
+
     // エピソード→意味記憶の自動昇格チェック
     try {
       const { promoteRecurringLearnings } = await import('./teamMemory');
