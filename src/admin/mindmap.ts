@@ -2,7 +2,7 @@ import { Router, Request, Response } from 'express';
 import { getDB } from '../db/database';
 import { config } from '../config';
 import { logger } from '../utils/logger';
-import { cosineSimilarity, parseEmbedding } from '../memory/embedding';
+import { cosineSimilarity, bufferToEmbedding } from '../memory/embedding';
 import { renderPage } from './views';
 
 export const mindmapRouter = Router();
@@ -44,7 +44,7 @@ function computeSimilarityLinks(
   for (const row of rows) {
     if (row.embedding && typeof row.embedding === 'string' && row.embedding.length > 2) {
       try {
-        const vec = parseEmbedding(row.embedding);
+        const vec = JSON.parse(row.embedding) as number[];
         withEmbedding.push({ id: row.id, vec });
       } catch {
         // skip invalid

@@ -19,7 +19,7 @@ setupLiveRoutes(adminRouter);
 
 // マインドマップ（ビュー + API）
 adminRouter.use('/mindmap', mindmapViewRouter);
-adminRouter.use('/mindmap', mindmapApiRouter);
+adminRouter.use('/mindmap/api', mindmapApiRouter);
 
 // ダッシュボードトップ
 adminRouter.get('/', (_req: Request, res: Response) => {
