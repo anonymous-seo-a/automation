@@ -49,7 +49,7 @@ export async function updateKnowledge(
 
   await db.prepare(`
     UPDATE knowledge
-    SET content = ?, version = version + 1, updated_at = NOW()
+    SET content = ?, version = knowledge.version + 1, updated_at = NOW()
     WHERE id = ?
   `).run(newContent, id);
 }

@@ -21,7 +21,7 @@ export async function loadKnowledgeFiles(dir: string): Promise<void> {
     VALUES (?, ?, ?, ?, 1)
     ON CONFLICT(id) DO UPDATE SET
       content = excluded.content,
-      version = version + 1,
+      version = knowledge.version + 1,
       updated_at = NOW()
   `);
 
