@@ -1,4 +1,4 @@
-import { execFile, ChildProcess } from 'child_process';
+import { spawn, ChildProcess } from 'child_process';
 import path from 'path';
 import { config } from '../../config';
 import { logger } from '../../utils/logger';
@@ -13,6 +13,7 @@ export interface CLIResult {
 /**
  * Claude CLIを非対話モード (-p) で実行する。
  * CLIがファイル読み書き・ビルドチェックまで自律実行する。
+ * プロンプトはstdin経由で渡す（コマンドライン引数長制限を回避）。
  */
 export function runClaudeCLI(
   prompt: string,
@@ -22,28 +23,46 @@ export function runClaudeCLI(
   return new Promise((resolve) => {
     logger.info('Claude CLI実行開始', { promptLength: prompt.length, model });
 
-    const child: ChildProcess = execFile('npx', [
+    const child: ChildProcess = spawn('npx', [
       '-y', '@anthropic-ai/claude-code',
       '-p',
       '--output-format', 'text',
       '--dangerously-skip-permissions',
       '--model', model === 'opus' ? 'claude-opus-4-6' : 'claude-sonnet-4-6',
-      prompt,
     ], {
       cwd: PROJECT_ROOT,
       env: {
         ...process.env,
         ANTHROPIC_API_KEY: config.claude.apiKey,
       },
-      timeout: timeoutMs,
-      maxBuffer: 10 * 1024 * 1024, // 10MB
-    }, (error, stdout, stderr) => {
-      if (error) {
-        // タイムアウト時は子プロセスを確実にkill（孤児プロセス防止）
-        if (child.pid && error.message?.includes('TIMEOUT')) {
-          try { process.kill(child.pid, 'SIGKILL'); } catch { /* already dead */ }
-        }
-        logger.warn('Claude CLI実行エラー', { err: error.message.slice(0, 300) });
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    let stdout = '';
+    let stderr = '';
+
+    child.stdout?.on('data', (chunk: Buffer) => {
+      stdout += chunk.toString();
+    });
+
+    child.stderr?.on('data', (chunk: Buffer) => {
+      stderr += chunk.toString();
+    });
+
+    // タイムアウト管理
+    const timer = setTimeout(() => {
+      try { child.kill('SIGKILL'); } catch { /* already dead */ }
+      logger.warn('Claude CLI タイムアウト', { timeoutMs });
+      resolve({
+        success: false,
+        output: (stdout + '\n' + stderr).trim().slice(-3000),
+      });
+    }, timeoutMs);
+
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      if (code !== 0) {
+        logger.warn('Claude CLI実行エラー', { code, err: (stderr || stdout).slice(0, 300) });
         resolve({
           success: false,
           output: (stdout + '\n' + stderr).trim().slice(-3000),
@@ -56,5 +75,18 @@ export function runClaudeCLI(
         });
       }
     });
+
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      logger.warn('Claude CLI起動失敗', { err: err.message });
+      resolve({
+        success: false,
+        output: err.message,
+      });
+    });
+
+    // プロンプトをstdinに書き込んで閉じる
+    child.stdin?.write(prompt);
+    child.stdin?.end();
   });
 }
