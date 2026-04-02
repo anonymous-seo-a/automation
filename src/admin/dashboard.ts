@@ -6,6 +6,7 @@ import { listAgents } from '../agents/router';
 import { renderPage } from './views';
 import { setupLiveRoutes } from './liveView';
 import { mindmapApiRouter } from './mindmapApi';
+import { mindmapViewRouter } from './mindmapView';
 
 export const adminRouter = Router();
 
@@ -16,7 +17,8 @@ adminRouter.use(express.json());
 // ライブオフィスビュー
 setupLiveRoutes(adminRouter);
 
-// マインドマップAPI
+// マインドマップ（ビュー + API）
+adminRouter.use('/mindmap', mindmapViewRouter);
 adminRouter.use('/mindmap', mindmapApiRouter);
 
 // ダッシュボードトップ
