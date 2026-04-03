@@ -57,4 +57,7 @@ export const config = {
     password: process.env.ADMIN_PASSWORD || 'mothership2026',
     baseUrl: process.env.ADMIN_BASE_URL || 'https://bot.anonymous-seo.jp',
   },
+  cli: {
+    authMode: (process.env.CLI_AUTH_MODE || 'api') as 'subscription' | 'api',
+  },
 } as const;

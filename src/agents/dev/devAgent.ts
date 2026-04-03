@@ -59,10 +59,10 @@ import { findRelevantProcedures, extractProcedure, updateProcedureOutcome } from
 import { getMonthlySpend } from '../../claude/budgetTracker';
 import { config } from '../../config';
 
-const MAX_BUILD_RETRIES = 5;
-const MAX_TEST_FIX_RETRIES = 5;
+const MAX_BUILD_RETRIES = 3;
+const MAX_TEST_FIX_RETRIES = 3;
 const MAX_HEARING_ROUNDS = 3;
-const MAX_REVIEW_RETRIES = 3;
+const MAX_REVIEW_RETRIES = 2;
 const MAX_ENGINEER_PARSE_RETRIES = 3;
 const MAX_DIAGNOSIS_ROUNDS = 2;   // チーム診断→リトライの最大サイクル数
 const MAX_STUCK_DIALOGUE = 5;     // stuck時のPM対話の最大ラウンド数
@@ -455,7 +455,7 @@ export class DevAgent implements Agent {
       messages: [
         { role: 'user', content: `${codebaseCtx}\n\n${conversationCtx}\n\n開発依頼: ${initialMessage}\n\nヒアリングログ:\n${JSON.stringify(hearingLog)}\n\n現在のヒアリング回数: 1/${MAX_HEARING_ROUNDS}` },
       ],
-      model: 'opus',
+      model: 'default',
     });
 
     dbLog('info', 'dev-agent', `[PM] ヒアリング応答: ${text.slice(0, 100)}`, { convId: conv.id });
@@ -496,7 +496,7 @@ export class DevAgent implements Agent {
       messages: [
         { role: 'user', content: `${codebaseCtx}\n\n${conversationCtx}\n\n開発依頼: ${conv.topic}\n\nヒアリングログ:\n${JSON.stringify(hearingLog)}\n\nユーザーの最新回答: ${userReply}\n\n現在のヒアリング回数: ${round}/${MAX_HEARING_ROUNDS}` },
       ],
-      model: 'opus',
+      model: 'default',
     });
 
     dbLog('info', 'dev-agent', `[PM] ヒアリング応答: ${text.slice(0, 100)}`, { convId: conv.id });
@@ -561,7 +561,7 @@ export class DevAgent implements Agent {
       messages: [
         { role: 'user', content: `${codebaseCtx}\n\n開発依頼: ${conv.topic}\n\nヒアリング内容:\n${JSON.stringify(hearingLog)}` },
       ],
-      model: 'opus',
+      model: 'default',
     });
 
     // PM Self-Refine: 要件定義書の自己批評（AC粒度・登録漏れ・テスト方法の具体性を検証）
@@ -646,7 +646,7 @@ ${rawRequirements}
         messages: [
           { role: 'user', content: `${codebaseCtx}\n\n元の要件:\n${requirements}\n\n修正指示: ${userReply}` },
         ],
-        model: 'opus',
+        model: 'default',
       });
 
       await setRequirements(conv.id, text);
@@ -1271,7 +1271,7 @@ ${rawRequirements}
         messages: [
           { role: 'user', content: `${codebaseCtx}\n\n以下の要件をサブタスクに分解してください:\n\n${conv.requirements}${retryHint}` },
         ],
-        model: 'opus',
+        model: 'default',
       });
 
       const parsed = safeParseJson(text);
@@ -1299,8 +1299,8 @@ ${rawRequirements}
   // ========================================
 
   /** サブタスクの難易度に応じてCLIモデルを選択 */
-  private selectModel(subtask: Subtask): 'sonnet' | 'opus' {
-    if (subtask.difficulty === 'complex') return 'opus';
+  private selectModel(_subtask: Subtask): 'sonnet' | 'opus' {
+    // コスト最適化: 常にSonnetで開始。Opusは最終エスカレーション時のみ
     return 'sonnet';
   }
 
@@ -1542,8 +1542,8 @@ ${currentRejectReason.slice(0, 500)}
       }
       previousRejectReason = currentRejectReason;
 
-      // Sonnetで2回連続失敗 → Opusにエスカレート
-      if (reviewRetry >= 2 && model === 'sonnet') {
+      // 最終リトライのみOpusにエスカレート（コスト最適化）
+      if (reviewRetry >= MAX_REVIEW_RETRIES && model === 'sonnet') {
         model = 'opus';
         dbLog('info', 'dev-agent', `[エンジニア] Sonnetで2回失敗 → Opusにエスカレート: ${subtask.path}`, { convId: conv.id });
         emitDevEvent({ type: 'agent_activity', convId: conv.id, agent: 'engineer', data: { status: 'thinking', message: `Opusにアップグレード: ${subtask.path}` } });
@@ -2064,7 +2064,7 @@ ${conv.requirements}
             `## 重要\n- 既存ファイルのimportパスや型定義に合わせてください\n- 存在しないモジュールをimportしないでください\n\n` +
             `全ファイルをまとめて修正してください。出力形式:\n{"files": [{"path": "...", "content": "...", "action": "..."}]}`,
         }],
-        model: 'opus',
+        model: 'default',
         maxTokens: 16384,
       });
 
@@ -2175,7 +2175,7 @@ ${conv.requirements}
             `## 重要\n- ランタイムエラー（起動時に落ちる原因）を特定して修正してください\n- importの不整合、未定義変数、型ミスマッチ等を確認\n- NODE_ENV=test時はLINE/Telegram送信がスキップされます\n\n` +
             `全ファイルをまとめて修正してください。出力形式:\n{"files": [{"path": "...", "content": "...", "action": "..."}]}`,
         }],
-        model: 'opus',
+        model: 'default',
         maxTokens: 16384,
       });
 
