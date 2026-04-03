@@ -561,7 +561,7 @@ export class DevAgent implements Agent {
       messages: [
         { role: 'user', content: `${codebaseCtx}\n\n開発依頼: ${conv.topic}\n\nヒアリング内容:\n${JSON.stringify(hearingLog)}` },
       ],
-      model: 'default',
+      model: 'opus',
     });
 
     // PM Self-Refine: 要件定義書の自己批評（AC粒度・登録漏れ・テスト方法の具体性を検証）
@@ -1271,7 +1271,7 @@ ${rawRequirements}
         messages: [
           { role: 'user', content: `${codebaseCtx}\n\n以下の要件をサブタスクに分解してください:\n\n${conv.requirements}${retryHint}` },
         ],
-        model: 'default',
+        model: 'opus',
       });
 
       const parsed = safeParseJson(text);
