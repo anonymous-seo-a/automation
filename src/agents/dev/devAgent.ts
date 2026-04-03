@@ -1299,8 +1299,8 @@ ${rawRequirements}
   // ========================================
 
   /** サブタスクの難易度に応じてCLIモデルを選択 */
-  private selectModel(_subtask: Subtask): 'sonnet' | 'opus' {
-    // コスト最適化: 常にSonnetで開始。Opusは最終エスカレーション時のみ
+  private selectModel(subtask: Subtask): 'sonnet' | 'opus' {
+    if (subtask.difficulty === 'complex') return 'opus';
     return 'sonnet';
   }
 
@@ -1542,8 +1542,8 @@ ${currentRejectReason.slice(0, 500)}
       }
       previousRejectReason = currentRejectReason;
 
-      // 最終リトライのみOpusにエスカレート（コスト最適化）
-      if (reviewRetry >= MAX_REVIEW_RETRIES && model === 'sonnet') {
+      // Sonnetで2回連続失敗 → Opusにエスカレート
+      if (reviewRetry >= 2 && model === 'sonnet') {
         model = 'opus';
         dbLog('info', 'dev-agent', `[エンジニア] Sonnetで2回失敗 → Opusにエスカレート: ${subtask.path}`, { convId: conv.id });
         emitDevEvent({ type: 'agent_activity', convId: conv.id, agent: 'engineer', data: { status: 'thinking', message: `Opusにアップグレード: ${subtask.path}` } });
